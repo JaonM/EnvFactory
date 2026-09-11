@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import re
+import unicodedata
 
 
 class NodeType(str, Enum):
@@ -33,6 +35,10 @@ class SceneNode:
     """A node representing a task scenario."""
 
     name: str
+    words: tuple[str, ...] = ()
+    urls: tuple[str, ...] = ()
+    expanded: bool = False
+    expanded_words: tuple[str, ...] = ()
 
     @property
     def node_type(self) -> NodeType:
@@ -48,6 +54,13 @@ class TaskTypeNode:
     @property
     def node_type(self) -> NodeType:
         return NodeType.TASK_TYPE
+
+
+def normalize_scene_name(name: str) -> str:
+    """Return a stable key used to merge equivalent scene names."""
+
+    normalized = unicodedata.normalize("NFKC", name).strip().casefold()
+    return re.sub(r"\s+", " ", normalized)
 
 
 @dataclass(frozen=True)

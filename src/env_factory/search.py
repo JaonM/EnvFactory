@@ -30,7 +30,7 @@ class SearchResult:
         score = value.get("score")
         return cls(
             title=str(value.get("title", "")),
-            url=str(value.get("url", "")),
+            url=str(value.get("url") or ""),
             content=str(value.get("content", "")),
             engine=str(value.get("engine", "")),
             score=float(score) if score is not None else None,
@@ -45,6 +45,7 @@ class SearchResponse:
     results: tuple[SearchResult, ...]
     suggestions: tuple[str, ...] = ()
     answers: tuple[str, ...] = ()
+    unresponsive_engines: tuple[tuple[str, str], ...] = ()
 
 
 class SearXNGClient:
@@ -117,13 +118,37 @@ class SearXNGClient:
         if not isinstance(raw_results, list):
             raise SearchError("SearXNG response field 'results' must be a list")
 
+        results = [
+            SearchResult.from_dict(item)
+            for item in raw_results
+            if isinstance(item, dict)
+        ]
+        for infobox in payload.get("infoboxes", []):
+            if not isinstance(infobox, dict) or not infobox.get("content"):
+                continue
+            urls = infobox.get("urls", [])
+            first_url = ""
+            if isinstance(urls, list) and urls and isinstance(urls[0], dict):
+                first_url = str(urls[0].get("url") or "")
+            results.append(
+                SearchResult(
+                    title=str(infobox.get("infobox") or infobox.get("id") or ""),
+                    url=first_url,
+                    content=str(infobox["content"]),
+                    engine=str(infobox.get("engine") or "infobox"),
+                )
+            )
+
+        raw_unresponsive = payload.get("unresponsive_engines", [])
+        unresponsive = tuple(
+            (str(item[0]), str(item[1]))
+            for item in raw_unresponsive
+            if isinstance(item, list) and len(item) >= 2
+        )
         return SearchResponse(
             query=str(payload.get("query", query)),
-            results=tuple(
-                SearchResult.from_dict(item)
-                for item in raw_results
-                if isinstance(item, dict)
-            ),
+            results=tuple(results),
             suggestions=tuple(str(item) for item in payload.get("suggestions", []) if item),
             answers=tuple(str(item) for item in payload.get("answers", []) if item),
+            unresponsive_engines=unresponsive,
         )
