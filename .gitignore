@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local SearXNG secrets and runtime data
+searxng/.env
