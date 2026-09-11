@@ -7,6 +7,7 @@ from .knowledge_graph import (
     TaskType,
     TaskTypeNode,
 )
+from .search import SearchError, SearchResponse, SearchResult, SearXNGClient
 from .task import Task
 
 __all__ = [
@@ -15,6 +16,10 @@ __all__ = [
     "NodeType",
     "SceneNode",
     "SceneRelation",
+    "SearchError",
+    "SearchResponse",
+    "SearchResult",
+    "SearXNGClient",
     "Task",
     "TaskType",
     "TaskTypeNode",
