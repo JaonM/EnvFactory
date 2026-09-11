@@ -9,6 +9,19 @@ search:
     - html
     - json
 
+outgoing:
+  request_timeout: 3.0
+  max_request_timeout: 8.0
+  pool_connections: 20
+
+engines:
+  - name: brave
+    disabled: true
+  - name: duckduckgo
+    disabled: true
+  - name: google cse
+    disabled: true
+
 server:
   limiter: false
   public_instance: false
