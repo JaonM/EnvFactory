@@ -64,3 +64,24 @@ WIKIPEDIA_DUMP_DB=data/wikipedia.sqlite3
 ```
 
 配置本地索引后，构建流程不再请求在线 Wikipedia API，直接使用 SQLite FTS5 检索页面正文。数据 dump 体积较大，下载和索引耗时取决于网络与磁盘性能。
+
+## 生成长程任务
+
+从 `SAME_EVENT_ELEMENT` 关系中随机抽取指定跳数的路径，并使用 LLM 生成任务描述：
+
+```bash
+./scripts/generate_task.sh --hops 3 --task-type Event
+```
+
+`--task-type` 支持 `QA`、`Event`、`Coding`、`Chat`、`Research`；省略时随机选择。
+`--hops 3` 表示每个任务随机选择 1、2 或 3 跳路径。
+`--environment-mode` 支持 `complete`、`incomplete`、`random`，默认使用 `random` 随机生成任务环境。
+任务生成完成后，会继续根据任务描述和环境生成 `rule-based/model-based` 观测指标，写入 `Task.metrics`。
+默认输出到 `output/tasks.jsonl`，每行一个 JSON 任务；可通过 `--output` 指定其他文件。
+使用 `--count N` 可批量生成 N 个任务；数量大于 1 时输出 JSON 数组。
+
+输出示例：
+
+```json
+{"task":"帮我挑选一套合适尺码的衣服并完成购买"}
+```
