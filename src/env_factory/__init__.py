@@ -24,7 +24,8 @@ from .scene_relation import (
 )
 from .deepseek import DeepSeekClient, DeepSeekError, DeepSeekResponse
 from .llm import LLMClient, LLMError, LLMResponse
-from .search import SearchError, SearchResponse, SearchResult, SearXNGClient
+from .wikipedia import WikipediaClient, WikipediaError, WikipediaResponse, WikipediaResult
+from .wikipedia_dump import LocalWikipediaClient, WikipediaDumpIndexer
 from .task import Task
 
 __all__ = [
@@ -52,10 +53,12 @@ __all__ = [
     "SceneRelationExtraction",
     "SceneRelationExtractionError",
     "normalize_scene_name",
-    "SearchError",
-    "SearchResponse",
-    "SearchResult",
-    "SearXNGClient",
+    "WikipediaClient",
+    "WikipediaError",
+    "WikipediaResponse",
+    "WikipediaResult",
+    "LocalWikipediaClient",
+    "WikipediaDumpIndexer",
     "Task",
     "TaskType",
     "TaskTypeNode",

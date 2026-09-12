@@ -90,7 +90,7 @@ class Neo4jGraphStore:
         with self.driver.session(database=self.database) as session:
             session.run(
                 "MERGE (scene:Scene {id: $id}) "
-                "SET scene.name = $name, scene.words = $words, scene.urls = $urls, "
+                "SET scene.name = $name, scene.words = $words, "
                 "scene.expanded = coalesce(scene.expanded, false) OR $expanded, "
                 "scene.expanded_words = CASE WHEN $expanded THEN "
                 "reduce(result = coalesce(scene.expanded_words, []), word IN $expanded_words | "
@@ -99,7 +99,6 @@ class Neo4jGraphStore:
                 id=normalize_scene_name(node.name),
                 name=node.name,
                 words=list(node.words),
-                urls=list(node.urls),
                 expanded=node.expanded,
                 expanded_words=[normalize_scene_name(word) for word in node.expanded_words],
             ).consume()
@@ -120,7 +119,7 @@ class Neo4jGraphStore:
         with self.driver.session(database=self.database) as session:
             result = session.run(
                 "MATCH (scene:Scene) "
-                "RETURN scene.name AS name, scene.words AS words, scene.urls AS urls, "
+                "RETURN scene.name AS name, scene.words AS words, "
                 "coalesce(scene.expanded, false) AS expanded, "
                 "coalesce(scene.expanded_words, []) AS expanded_words"
             )
@@ -128,7 +127,6 @@ class Neo4jGraphStore:
                 SceneNode(
                     name=str(record["name"]),
                     words=tuple(str(word) for word in (record["words"] or [])),
-                    urls=tuple(str(url) for url in (record["urls"] or [])),
                     expanded=bool(record["expanded"]),
                     expanded_words=tuple(
                         str(word) for word in (record["expanded_words"] or [])
@@ -180,16 +178,14 @@ class KnowledgeGraphBuilder:
         name: str,
         *,
         words: Iterable[str] = (),
-        urls: Iterable[str] = (),
         expanded: bool = False,
         expanded_words: Iterable[str] = (),
     ) -> SceneNode:
-        """Add a scene or merge its words and URLs into an existing scene."""
+        """Add a scene or merge its words into an existing scene."""
 
         if not name.strip():
             raise ValueError("scene name must not be empty")
         words = tuple(words)
-        urls = tuple(urls)
         expanded_words = tuple(expanded_words)
         raw_id = self.canonicalizer(name)
         scene_id = self._aliases.get(raw_id, raw_id)
@@ -206,14 +202,13 @@ class KnowledgeGraphBuilder:
         existing = self._scenes.get(scene_id)
         if existing is None:
             node = SceneNode(
-                name=name.strip(), words=tuple(words), urls=tuple(urls), expanded=expanded
-                , expanded_words=tuple(expanded_words)
+                name=name.strip(), words=tuple(words), expanded=expanded,
+                expanded_words=tuple(expanded_words)
             )
         else:
             node = SceneNode(
                 name=existing.name,
                 words=tuple(dict.fromkeys((*existing.words, *words))),
-                urls=tuple(dict.fromkeys((*existing.urls, *urls))),
                 expanded=existing.expanded or expanded,
                 expanded_words=tuple(dict.fromkeys((*existing.expanded_words, *expanded_words))),
             )

@@ -6,7 +6,7 @@ project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 
 if [[ ! -f .env ]]; then
-  echo "未找到 .env，请先复制 .env.example 并配置 Neo4j、SearXNG 和 LLM 参数。" >&2
+  echo "未找到 .env，请先复制 .env.example 并配置 Neo4j、Wikipedia 和 LLM 参数。" >&2
   exit 1
 fi
 

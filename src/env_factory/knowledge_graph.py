@@ -25,9 +25,9 @@ class TaskType(str, Enum):
 
     QA = "QA"
     EVENT = "Event"
-    CODING = "Coding"
+    # CODING = "Coding"
     CHAT = "Chat"
-    RESEARCH = "Research"
+    # RESEARCH = "Research"
 
 
 @dataclass(frozen=True)
@@ -36,7 +36,6 @@ class SceneNode:
 
     name: str
     words: tuple[str, ...] = ()
-    urls: tuple[str, ...] = ()
     expanded: bool = False
     expanded_words: tuple[str, ...] = ()
 

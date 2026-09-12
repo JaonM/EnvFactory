@@ -11,7 +11,8 @@ from env_factory import (
     GraphExpansionConfig,
     LLMClient,
     Neo4jGraphStore,
-    SearXNGClient,
+    WikipediaClient,
+    LocalWikipediaClient,
     SeedGraphExpander,
 )
 
@@ -24,6 +25,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scene-nodes", type=int, default=1000)
     parser.add_argument("--max-search-requests", type=int, default=500)
     parser.add_argument("--term-batch-size", type=int, default=16)
+    parser.add_argument("--max-terms-per-seed", type=int, default=30)
+    parser.add_argument("--merge-batch-size", type=int, default=50)
+    parser.add_argument("--relation-batch-size", type=int, default=40)
     parser.add_argument("--relation-candidate-limit", type=int, default=20)
     parser.add_argument("--max-workers", type=int, default=2, help="搜索 API 并发数")
     return parser.parse_args()
@@ -81,11 +85,19 @@ def main() -> None:
         max_search_requests=args.max_search_requests,
         max_rounds=args.rounds or 3,
         term_batch_size=args.term_batch_size,
+        max_terms_per_seed=args.max_terms_per_seed,
+        merge_batch_size=args.merge_batch_size,
+        relation_batch_size=args.relation_batch_size,
         relation_candidate_limit=args.relation_candidate_limit,
     )
 
     llm = LLMClient.from_env("LLM", timeout=float(os.getenv("LLM_TIMEOUT", "60")))
-    search = SearXNGClient(timeout=float(os.getenv("SEARXNG_TIMEOUT", "10")))
+    dump_db = os.getenv("WIKIPEDIA_DUMP_DB")
+    search = (
+        LocalWikipediaClient(dump_db)
+        if dump_db
+        else WikipediaClient(timeout=float(os.getenv("WIKIPEDIA_TIMEOUT", "10")))
+    )
     expander = SeedGraphExpander(
         search,
         llm,

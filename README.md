@@ -2,7 +2,7 @@
 
 ## 构建知识图谱
 
-先确认 Neo4j 和本地 SearXNG 已启动，并在项目根目录配置 `.env`：
+先确认 Neo4j 可访问，并在项目根目录配置 `.env`：
 
 ```bash
 cp .env.example .env
@@ -18,8 +18,9 @@ LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=your-model
 LLM_TIMEOUT=60
-SEARXNG_URL=http://localhost:8080
-SEARXNG_TIMEOUT=10
+WIKIPEDIA_API_URL=https://zh.wikipedia.org/w/api.php
+WIKIPEDIA_TIMEOUT=10
+# WIKIPEDIA_DUMP_DB=data/wikipedia.sqlite3
 NEO4J_DATABASE=neo4j
 GRAPH_SEEDS_FILE=examples/scene_seeds.txt
 LOG_LEVEL=INFO
@@ -45,4 +46,21 @@ LOG_LEVEL=INFO
   --max-workers 2
 ```
 
-脚本会并发搜索，批量调用 LLM 抽取词语，增量合并 scene 节点和关系，最后写入 Neo4j。`task_type` 节点默认写入全部枚举值。
+脚本会并发调用 Wikipedia Action API，批量调用 LLM 抽取词语，增量合并 scene 节点和关系，最后写入 Neo4j。`task_type` 节点默认写入全部枚举值。
+
+### 大规模构建
+
+大规模任务建议先下载并建立本地索引：
+
+```bash
+./scripts/download_wikipedia_dump.sh
+./scripts/index_wikipedia_dump.sh data/zhwiki-latest-pages-articles-multistream.xml.bz2
+```
+
+然后在 `.env` 中配置：
+
+```dotenv
+WIKIPEDIA_DUMP_DB=data/wikipedia.sqlite3
+```
+
+配置本地索引后，构建流程不再请求在线 Wikipedia API，直接使用 SQLite FTS5 检索页面正文。数据 dump 体积较大，下载和索引耗时取决于网络与磁盘性能。

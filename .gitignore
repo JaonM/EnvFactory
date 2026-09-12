@@ -9,8 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-# Local SearXNG secrets and runtime data
-searxng/.env
-
 # Local project secrets
 .env
+
+# Local Wikipedia dumps and indexes
+data/

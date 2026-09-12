@@ -1,7 +1,7 @@
 """Seed-based knowledge graph expansion using search and an LLM."""
 
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
@@ -10,10 +10,10 @@ import re
 from typing import Any
 
 from .graph_builder import KnowledgeGraphBuilder, Neo4jGraphStore
-from .knowledge_graph import SceneNode, TaskType
+from .knowledge_graph import SceneNode, SceneRelation, TaskType
 from .llm import LLMClient
-from .search import SearchError, SearchResponse, SearchResult, SearXNGClient
-from .scene_relation import LLMSceneRelationExtractor
+from .wikipedia import WikipediaError, WikipediaResponse, WikipediaResult, WikipediaClient
+from .scene_relation import LLMSceneRelationExtractor, SceneRelationExtraction
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class SearchExpansion:
 
     seed: str
     terms: tuple[str, ...]
-    results: tuple[SearchResult, ...]
+    results: tuple[WikipediaResult, ...]
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,6 @@ class SceneWordGroup:
 
     name: str
     words: tuple[str, ...]
-    urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -53,6 +52,9 @@ class GraphExpansionConfig:
     max_search_requests: int = 500
     max_rounds: int = 3
     term_batch_size: int = 16
+    max_terms_per_seed: int = 30
+    merge_batch_size: int = 50
+    relation_batch_size: int = 40
     relation_candidate_limit: int = 20
 
     def __post_init__(self) -> None:
@@ -64,6 +66,12 @@ class GraphExpansionConfig:
             raise ValueError("max_rounds must be greater than zero")
         if self.term_batch_size <= 0:
             raise ValueError("term_batch_size must be greater than zero")
+        if self.max_terms_per_seed <= 0:
+            raise ValueError("max_terms_per_seed must be greater than zero")
+        if self.merge_batch_size <= 0:
+            raise ValueError("merge_batch_size must be greater than zero")
+        if self.relation_batch_size <= 0:
+            raise ValueError("relation_batch_size must be greater than zero")
         if self.relation_candidate_limit <= 0:
             raise ValueError("relation_candidate_limit must be greater than zero")
 
@@ -87,7 +95,7 @@ class SeedGraphExpander:
 
     def __init__(
         self,
-        search: SearXNGClient,
+        search: WikipediaClient,
         llm: LLMClient,
         *,
         max_workers: int = 8,
@@ -102,7 +110,7 @@ class SeedGraphExpander:
         self.max_workers = max_workers
         self.results_per_seed = results_per_seed
         self.config = config or GraphExpansionConfig()
-        self._search_cache: dict[str, SearchResponse] = {}
+        self._search_cache: dict[str, WikipediaResponse] = {}
         self._term_cache: dict[str, tuple[str, ...]] = {}
 
     def initialize(self, seed_words: Iterable[str] = DEFAULT_SCENE_SEEDS) -> tuple[str, ...]:
@@ -120,6 +128,7 @@ class SeedGraphExpander:
         rounds: int | None = None,
         skip_seed_words: Iterable[str] = (),
         existing_scenes: Iterable[SceneNode] = (),
+        checkpoint: Callable[[tuple[SceneWordGroup, ...], tuple[Any, ...], set[str]], None] | None = None,
     ) -> tuple[KnowledgeGraphBuilder, tuple[SceneWordGroup, ...]]:
         """Expand seed scenes and return an in-memory builder plus semantic groups."""
 
@@ -133,13 +142,14 @@ class SeedGraphExpander:
         if not terms:
             logger.info("没有待扩展的种子词，结束构建")
             return KnowledgeGraphBuilder(), ()
-        existing_groups = tuple(
+        existing_groups = self._coalesce_existing_groups(
+            tuple(
             SceneWordGroup(
                 scene.name,
                 scene.words,
-                scene.urls,
             )
             for scene in existing_scenes
+            )
         )
         all_terms_seen = terms
         urls_by_term: dict[str, set[str]] = defaultdict(set)
@@ -151,6 +161,8 @@ class SeedGraphExpander:
         relation_edges = []
         search_requests = 0
         searched_terms: set[str] = set()
+        if checkpoint is not None:
+            checkpoint(groups, tuple(relation_edges), searched_terms)
 
         expansions = None
         for round_index in range(rounds):
@@ -169,9 +181,6 @@ class SeedGraphExpander:
                 expansions = self._search_seeds(terms, max_requests=remaining_requests)
             search_requests += len(expansions)
             searched_terms.update(expansion.seed.casefold() for expansion in expansions)
-            for expansion in expansions:
-                for result in expansion.results:
-                    urls_by_term[expansion.seed].add(result.url)
             discovered = tuple(
                 dict.fromkeys(
                     term
@@ -188,7 +197,7 @@ class SeedGraphExpander:
             all_terms_seen = tuple(dict.fromkeys((*all_terms_seen, *discovered)))
             groups = self._merge_terms(discovered, groups, urls_by_term)
             groups = groups[: self.config.max_scene_nodes]
-            scene_nodes = tuple(SceneNode(group.name, group.words, group.urls) for group in groups)
+            scene_nodes = tuple(SceneNode(group.name, group.words) for group in groups)
             new_scene_names = tuple(
                 group.name for group in groups if group.name not in known_scene_names
             )
@@ -197,6 +206,8 @@ class SeedGraphExpander:
                 "第 %d 轮节点合并完成：scene 节点=%d，新增 scene 节点=%d",
                 round_index + 1, len(groups), len(new_scene_names),
             )
+            if checkpoint is not None:
+                checkpoint(groups, tuple(relation_edges), searched_terms)
 
             terms = tuple(term for term in discovered if term not in previous_terms)
             next_expansions = None
@@ -220,6 +231,22 @@ class SeedGraphExpander:
                 break
             expansions = next_expansions
 
+        builder = self._build_builder(groups, relation_edges, searched_terms)
+        logger.info(
+            "图谱构建完成：scene 节点=%d，关系=%d，搜索请求=%d",
+            len(builder.scenes()), len(builder.edges()), search_requests,
+        )
+        return builder, groups
+
+    def _build_builder(
+        self,
+        groups: tuple[SceneWordGroup, ...],
+        relation_edges: Iterable[Any],
+        searched_terms: set[str],
+    ) -> KnowledgeGraphBuilder:
+        # LLM grouping can produce overlapping groups within the same round.
+        # Normalize all groups before feeding them to the strict builder.
+        groups = self._coalesce_existing_groups(groups)
         builder = KnowledgeGraphBuilder()
         for group in groups:
             expanded = any(
@@ -232,17 +259,80 @@ class SeedGraphExpander:
             builder.add_scene(
                 group.name,
                 words=group.words,
-                urls=group.urls,
                 expanded=expanded,
                 expanded_words=expanded_words,
             )
-        for edge in relation_edges:
-            builder.add_relation(edge.source, edge.target, edge.relation)
-        logger.info(
-            "图谱构建完成：scene 节点=%d，关系=%d，搜索请求=%d",
-            len(builder.scenes()), len(builder.edges()), search_requests,
+        # LLM relation batches may disagree about the same pair. Keep the
+        # stronger directed hierarchy relation deterministically and skip a
+        # conflicting same-event classification without aborting the build.
+        relation_edges = sorted(
+            relation_edges,
+            key=lambda edge: 0 if edge.relation is SceneRelation.HIERARCHY else 1,
         )
-        return builder, groups
+        for edge in relation_edges:
+            try:
+                builder.add_relation(edge.source, edge.target, edge.relation)
+            except ValueError as exc:
+                if "cannot have both hierarchy and same_event_element" not in str(exc):
+                    raise
+                logger.warning(
+                    "关系冲突，跳过后续关系：%s -[%s]-> %s",
+                    edge.source, edge.relation.value, edge.target,
+                )
+        return builder
+
+    @staticmethod
+    def _coalesce_existing_groups(
+        groups: tuple[SceneWordGroup, ...],
+    ) -> tuple[SceneWordGroup, ...]:
+        """Coalesce historical Scene nodes that share an alias.
+
+        Older runs could persist two nodes before semantic grouping completed.
+        Treat connected name/word aliases as one in-memory node so a dirty
+        graph does not abort the next incremental build.
+        """
+
+        if len(groups) < 2:
+            return groups
+        parent = list(range(len(groups)))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        owner: dict[str, int] = {}
+        for index, group in enumerate(groups):
+            for word in (group.name, *group.words):
+                key = word.casefold().strip()
+                if key in owner:
+                    union(index, owner[key])
+                else:
+                    owner[key] = index
+
+        merged: dict[int, SceneWordGroup] = {}
+        for index, group in enumerate(groups):
+            root = find(index)
+            previous = merged.get(root)
+            if previous is None:
+                merged[root] = group
+                continue
+            merged[root] = SceneWordGroup(
+                previous.name,
+                tuple(dict.fromkeys((*previous.words, group.name, *group.words))),
+            )
+        if len(merged) != len(groups):
+            logger.warning(
+                "发现历史 Scene 别名冲突，已在本次构建中合并：原节点=%d，合并后=%d",
+                len(groups), len(merged),
+            )
+        return tuple(merged.values())
 
     def expand_and_build(
         self,
@@ -265,12 +355,27 @@ class SeedGraphExpander:
                 else (scene.name, *scene.words)
             )
         }
+        def checkpoint(
+            groups: tuple[SceneWordGroup, ...],
+            relation_edges: tuple[Any, ...],
+            searched_terms: set[str],
+        ) -> None:
+            snapshot = self._build_builder(groups, relation_edges, searched_terms)
+            snapshot.build(store, task_types=task_types)
+            logger.info(
+                "图谱构建检查点已写入：scene 节点=%d，关系=%d",
+                len(snapshot.scenes()), len(snapshot.edges()),
+            )
+
         builder, groups = self.expand(
             seed_words,
             rounds=rounds,
             skip_seed_words=expanded_words,
             existing_scenes=existing_scenes,
+            checkpoint=checkpoint,
         )
+        # Final idempotent write ensures the latest expanded state and all
+        # relations are persisted even when no intermediate checkpoint ran.
         builder.build(store, task_types=task_types)
         return builder, groups
 
@@ -293,13 +398,7 @@ class SeedGraphExpander:
                 if response is None:
                     response = self.search.search(seed, language="zh-CN")
                     self._search_cache[seed] = response
-                if response.unresponsive_engines:
-                    logger.warning(
-                        "搜索引擎异常（种子=%s）：%s",
-                        seed,
-                        ", ".join(f"{name}({reason})" for name, reason in response.unresponsive_engines),
-                    )
-            except SearchError:
+            except WikipediaError:
                 logger.warning("搜索失败，跳过当前种子词：%s", seed)
                 return SearchExpansion(seed, (), ())
             results = response.results[: self.results_per_seed]
@@ -333,6 +432,23 @@ class SeedGraphExpander:
     ):
         """Use lexical retrieval to shrink relation context before the LLM call."""
 
+        if not candidate_names:
+            return self.relation_extractor.extract((), candidate_names=())
+
+        all_edges = []
+        for start in range(0, len(candidate_names), self.config.relation_batch_size):
+            candidate_batch = candidate_names[start : start + self.config.relation_batch_size]
+            extraction = self._extract_relations_chunk(scenes, candidate_batch)
+            all_edges.extend(extraction.edges)
+        return SceneRelationExtraction(tuple(all_edges))
+
+    def _extract_relations_chunk(
+        self,
+        scenes: tuple[SceneNode, ...],
+        candidate_names: tuple[str, ...],
+    ):
+        """Extract one bounded relation batch."""
+
         candidates = {name for name in candidate_names}
         candidate_nodes = [scene for scene in scenes if scene.name in candidates]
         other_nodes = [scene for scene in scenes if scene.name not in candidates]
@@ -350,14 +466,14 @@ class SeedGraphExpander:
         )
         context = tuple(candidate_nodes + scored[: self.config.relation_candidate_limit])
         logger.debug(
-            "增量关系抽取：新增节点=%d，关系上下文节点=%d",
+            "增量关系抽取分片：新增节点=%d，关系上下文节点=%d",
             len(candidate_nodes), len(context),
         )
         extraction = self.relation_extractor.extract(context, candidate_names=candidate_names)
         logger.info("增量关系抽取完成：新增节点=%d，抽取关系=%d", len(candidate_nodes), len(extraction.edges))
         return extraction
 
-    def _extract_terms(self, seed: str, response: SearchResponse) -> tuple[str, ...]:
+    def _extract_terms(self, seed: str, response: WikipediaResponse) -> tuple[str, ...]:
         material = "\n".join(
             f"标题: {result.title}\n摘要: {result.content}\nURL: {result.url}"
             for result in response.results[: self.results_per_seed]
@@ -376,12 +492,14 @@ class SeedGraphExpander:
             terms = payload["terms"]
             if not isinstance(terms, list) or not all(isinstance(term, str) for term in terms):
                 raise TypeError
-            return tuple(dict.fromkeys(term.strip() for term in terms if term.strip()))
+            return tuple(dict.fromkeys(term.strip() for term in terms if term.strip()))[
+                : self.config.max_terms_per_seed
+            ]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise GraphExpansionError(f"invalid term extraction for seed: {seed}") from exc
 
     def _extract_terms_batch(
-        self, items: tuple[tuple[str, tuple[SearchResult, ...]], ...]
+        self, items: tuple[tuple[str, tuple[WikipediaResult, ...]], ...]
     ) -> dict[str, tuple[str, ...]]:
         pending = []
         extracted: dict[str, tuple[str, ...]] = {}
@@ -413,7 +531,9 @@ class SeedGraphExpander:
                 '\n请批量处理所有输入项，输出：{"items":[{"seed":"种子词","terms":["词语"]}]}',
                 thinking=False,
                 temperature=0.0,
-                max_tokens=2_000,
+                # A batch response contains one item per seed. 2k tokens is
+                # easily exhausted by 16 seeds and leaves invalid JSON.
+                max_tokens=max(2_000, min(8_000, 500 * len(batch))),
                 response_format="json_object",
             )
             try:
@@ -430,10 +550,34 @@ class SeedGraphExpander:
                 }
                 for seed, _, cache_key in batch:
                     terms = by_seed.get(seed, ())
-                    extracted[seed] = terms
+                    extracted[seed] = terms[: self.config.max_terms_per_seed]
                     self._term_cache[cache_key] = terms
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
-                raise GraphExpansionError("invalid batch term extraction response") from exc
+                # Do not lose an entire search round when a provider truncates
+                # a large JSON response. Retry only this batch item-by-item;
+                # successful items are cached as usual and later runs avoid
+                # paying for them again.
+                logger.warning(
+                    "批量术语抽取响应无效，降级为逐种子抽取：种子数=%d，finish_reason=%s",
+                    len(batch), getattr(response, "finish_reason", None),
+                )
+                for seed, material, cache_key in batch:
+                    try:
+                        terms = self._extract_terms(
+                            seed,
+                            WikipediaResponse(
+                                query=seed,
+                                results=tuple(
+                                    WikipediaResult(title=title, content=content, url=url)
+                                    for title, content, url in material
+                                ),
+                            ),
+                        )
+                    except (json.JSONDecodeError, KeyError, TypeError, GraphExpansionError):
+                        logger.warning("术语抽取失败，跳过种子词：%s", seed)
+                        terms = ()
+                    extracted[seed] = terms[: self.config.max_terms_per_seed]
+                    self._term_cache[cache_key] = terms
         return extracted
 
     def _merge_terms(
@@ -442,14 +586,34 @@ class SeedGraphExpander:
         existing_groups: tuple[SceneWordGroup, ...],
         urls_by_term: dict[str, set[str]],
     ) -> tuple[SceneWordGroup, ...]:
-        if not new_terms:
-            return tuple(
-                SceneWordGroup(group.name, group.words, tuple(sorted({*group.urls, *(url for word in group.words for url in urls_by_term.get(word, set()))})))
-                for group in existing_groups
+        """Merge terms in bounded chunks to keep prompts and JSON responses small."""
+
+        groups = existing_groups
+        for start in range(0, len(new_terms), self.config.merge_batch_size):
+            batch = new_terms[start : start + self.config.merge_batch_size]
+            groups = self._merge_terms_chunk(batch, groups, urls_by_term)
+            logger.debug(
+                "语义合并分片完成：分片=%d，输入词=%d，当前节点=%d",
+                start // self.config.merge_batch_size + 1,
+                len(batch),
+                len(groups),
             )
+        return groups
+
+    def _merge_terms_chunk(
+        self,
+        new_terms: tuple[str, ...],
+        existing_groups: tuple[SceneWordGroup, ...],
+        urls_by_term: dict[str, set[str]],
+    ) -> tuple[SceneWordGroup, ...]:
+        if not new_terms:
+            return existing_groups
+        # Only send likely matching existing groups. Sending the complete graph
+        # makes the prompt grow with every round and causes response truncation.
+        candidate_groups = self._select_merge_candidates(new_terms, existing_groups)
         merge_prompt = json.dumps(
             {
-                "existing_groups": [group.__dict__ for group in existing_groups],
+                "existing_groups": [group.__dict__ for group in candidate_groups],
                 "new_terms": list(new_terms),
             },
             ensure_ascii=False,
@@ -493,7 +657,6 @@ class SeedGraphExpander:
                     SceneWordGroup(
                         term,
                         (term,),
-                        tuple(sorted(urls_by_term.get(term, set()))),
                     )
                     for term in new_terms
                 )
@@ -534,11 +697,9 @@ class SeedGraphExpander:
                 )
             if existing:
                 words = tuple(dict.fromkeys((*existing.words, *matched)))
-                urls = tuple(sorted({*existing.urls, *(url for word in words for url in urls_by_term.get(word, set()))}))
-                groups.append(SceneWordGroup(existing.name, words, urls))
+                groups.append(SceneWordGroup(existing.name, words))
             else:
-                urls = tuple(sorted({url for word in matched for url in urls_by_term.get(word, set())}))
-                groups.append(SceneWordGroup(name, matched, urls))
+                groups.append(SceneWordGroup(name, matched))
 
         updates = {group.name.casefold(): group for group in groups}
         groups = [updates.pop(group.name.casefold(), group) for group in existing_groups]
@@ -546,8 +707,25 @@ class SeedGraphExpander:
         assigned_names = {word.casefold() for group in groups for word in group.words}
         for term in new_terms:
             if term.casefold() not in assigned_names:
-                groups.append(SceneWordGroup(term, (term,), tuple(sorted(urls_by_term.get(term, set())))))
+                groups.append(SceneWordGroup(term, (term,)))
         return tuple(groups)
+
+    @staticmethod
+    def _select_merge_candidates(
+        new_terms: tuple[str, ...], existing_groups: tuple[SceneWordGroup, ...],
+        limit: int = 50,
+    ) -> tuple[SceneWordGroup, ...]:
+        if len(existing_groups) <= limit:
+            return existing_groups
+        term_chars = set("".join(new_terms))
+        ranked = sorted(
+            existing_groups,
+            key=lambda group: len(
+                term_chars & set("".join((group.name, *group.words)))
+            ),
+            reverse=True,
+        )
+        return tuple(ranked[:limit])
 
     @staticmethod
     def _parse_json(content: str) -> Any:
