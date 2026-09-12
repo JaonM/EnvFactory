@@ -135,6 +135,29 @@ class Neo4jGraphStore:
                 for record in result
             )
 
+    def random_scene_event_path(self, hops: int) -> tuple[SceneNode, ...]:
+        """Return a random simple path of exactly ``hops`` event-element hops."""
+
+        if hops <= 0 or hops > 20:
+            raise ValueError("hops must be between 1 and 20")
+        with self.driver.session(database=self.database) as session:
+            record = session.run(
+                "MATCH p=(start:Scene)-[:SAME_EVENT_ELEMENT*1..20]-(end:Scene) "
+                "WHERE length(p) = $hops AND all(node IN nodes(p) "
+                "WHERE single(other IN nodes(p) WHERE other = node)) "
+                "RETURN [node IN nodes(p) | {name: node.name, words: node.words}] AS path "
+                "ORDER BY rand() LIMIT 1",
+                hops=hops,
+            ).single()
+        if record is None:
+            return ()
+        return tuple(
+            SceneNode(
+                name=str(item["name"]),
+                words=tuple(str(word) for word in (item.get("words") or [])),
+            )
+            for item in record["path"]
+        )
     def upsert_task_type(self, node: TaskTypeNode) -> None:
         with self.driver.session(database=self.database) as session:
             session.run(

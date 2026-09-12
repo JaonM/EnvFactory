@@ -25,9 +25,9 @@ class TaskType(str, Enum):
 
     QA = "QA"
     EVENT = "Event"
-    # CODING = "Coding"
+    CODING = "Coding"
     CHAT = "Chat"
-    # RESEARCH = "Research"
+    RESEARCH = "Research"
 
 
 @dataclass(frozen=True)
