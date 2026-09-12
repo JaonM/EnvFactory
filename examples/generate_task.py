@@ -1,6 +1,7 @@
 """Generate one long-horizon task from the Scene graph."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="从知识图谱生成长程任务")
     parser.add_argument("--hops", type=int, default=3, help="随机路径最大跳数，实际范围为 1 到该值")
     parser.add_argument("--count", type=int, default=1, help="生成任务数量")
+    parser.add_argument("--max-workers", type=int, default=4, help="任务生成并发数")
     parser.add_argument(
         "--output",
         type=Path,
@@ -34,21 +36,35 @@ def main() -> None:
     args = parser.parse_args()
     if args.count <= 0:
         parser.error("--count 必须大于 0")
+    if args.max_workers <= 0:
+        parser.error("--max-workers 必须大于 0")
     load_dotenv()
     llm = LLMClient.from_env("LLM", timeout=float(os.getenv("LLM_TIMEOUT", "60")))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     with Neo4jGraphStore(database=os.getenv("NEO4J_DATABASE", "neo4j")) as store:
         generator = TaskGenerator(store, llm)
-        tasks = []
-        for _ in range(args.count):
-            task = generator.generate(args.hops, args.task_type, args.environment_mode)
-            tasks.append(
-                {"task": task.desc, "environment": task.env, "metrics": task.metrics}
-            )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as output_file:
-        for task in tasks:
-            output_file.write(json.dumps(task, ensure_ascii=False) + "\n")
-    print(f"已生成 {len(tasks)} 个任务：{args.output}")
+        with args.output.open("a", encoding="utf-8") as output_file:
+            with ThreadPoolExecutor(max_workers=min(args.max_workers, args.count)) as executor:
+                futures = [
+                    executor.submit(
+                        generator.generate,
+                        args.hops,
+                        args.task_type,
+                        args.environment_mode,
+                    )
+                    for _ in range(args.count)
+                ]
+                for future in as_completed(futures):
+                    task = future.result()
+                    output_file.write(
+                        json.dumps(
+                            {"task": task.desc, "environment": task.env, "metrics": task.metrics},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    output_file.flush()
+    print(f"已生成 {args.count} 个任务：{args.output}")
 
 
 if __name__ == "__main__":
