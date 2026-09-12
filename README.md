@@ -77,7 +77,7 @@ WIKIPEDIA_DUMP_DB=data/wikipedia.sqlite3
 `--hops 3` 表示每个任务随机选择 1、2 或 3 跳路径。
 `--environment-mode` 支持 `complete`、`incomplete`、`random`，默认使用 `random` 随机生成任务环境。
 任务生成完成后，会继续根据任务描述和环境生成 `rule-based/model-based` 观测指标，写入 `Task.metrics`。
-默认输出到 `output/tasks.jsonl`，每行一个 JSON 任务；可通过 `--output` 指定其他文件。
+默认以追加方式输出到 `output/tasks.jsonl`，每生成一个任务立即写入一行 JSON；可通过 `--output` 指定其他文件。任务默认并发生成 4 个，可通过 `--max-workers` 调整并发数。
 使用 `--count N` 可批量生成 N 个任务；数量大于 1 时输出 JSON 数组。
 
 输出示例：
