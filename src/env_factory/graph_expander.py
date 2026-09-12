@@ -1,6 +1,5 @@
 """Seed-based knowledge graph expansion using search and an LLM."""
 
-from collections import defaultdict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -152,9 +151,8 @@ class SeedGraphExpander:
             )
         )
         all_terms_seen = terms
-        urls_by_term: dict[str, set[str]] = defaultdict(set)
         groups: tuple[SceneWordGroup, ...] = self._merge_terms(
-            terms, existing_groups, urls_by_term
+            terms, existing_groups
         )
         known_scene_names: set[str] = set()
         known_scene_names.update(group.name for group in existing_groups)
@@ -195,7 +193,7 @@ class SeedGraphExpander:
             )
             previous_terms = set(all_terms_seen)
             all_terms_seen = tuple(dict.fromkeys((*all_terms_seen, *discovered)))
-            groups = self._merge_terms(discovered, groups, urls_by_term)
+            groups = self._merge_terms(discovered, groups)
             groups = groups[: self.config.max_scene_nodes]
             scene_nodes = tuple(SceneNode(group.name, group.words) for group in groups)
             new_scene_names = tuple(
@@ -475,7 +473,7 @@ class SeedGraphExpander:
 
     def _extract_terms(self, seed: str, response: WikipediaResponse) -> tuple[str, ...]:
         material = "\n".join(
-            f"标题: {result.title}\n摘要: {result.content}\nURL: {result.url}"
+            f"标题: {result.title}\n摘要: {result.content}"
             for result in response.results[: self.results_per_seed]
         )
         if not material:
@@ -504,7 +502,7 @@ class SeedGraphExpander:
         pending = []
         extracted: dict[str, tuple[str, ...]] = {}
         for seed, results in items:
-            material = tuple((result.title, result.content, result.url) for result in results)
+            material = tuple((result.title, result.content) for result in results)
             cache_key = json.dumps([seed, material], ensure_ascii=False, sort_keys=True)
             if cache_key in self._term_cache:
                 extracted[seed] = self._term_cache[cache_key]
@@ -518,8 +516,8 @@ class SeedGraphExpander:
                     {
                         "seed": seed,
                         "results": [
-                            {"title": title, "content": content, "url": url}
-                            for title, content, url in material
+                            {"title": title, "content": content}
+                            for title, content in material
                         ],
                     }
                     for seed, material, _ in batch
@@ -568,8 +566,8 @@ class SeedGraphExpander:
                             WikipediaResponse(
                                 query=seed,
                                 results=tuple(
-                                    WikipediaResult(title=title, content=content, url=url)
-                                    for title, content, url in material
+                                    WikipediaResult(title=title, content=content, url="")
+                                    for title, content in material
                                 ),
                             ),
                         )
@@ -584,14 +582,13 @@ class SeedGraphExpander:
         self,
         new_terms: tuple[str, ...],
         existing_groups: tuple[SceneWordGroup, ...],
-        urls_by_term: dict[str, set[str]],
     ) -> tuple[SceneWordGroup, ...]:
         """Merge terms in bounded chunks to keep prompts and JSON responses small."""
 
         groups = existing_groups
         for start in range(0, len(new_terms), self.config.merge_batch_size):
             batch = new_terms[start : start + self.config.merge_batch_size]
-            groups = self._merge_terms_chunk(batch, groups, urls_by_term)
+            groups = self._merge_terms_chunk(batch, groups)
             logger.debug(
                 "语义合并分片完成：分片=%d，输入词=%d，当前节点=%d",
                 start // self.config.merge_batch_size + 1,
@@ -604,7 +601,6 @@ class SeedGraphExpander:
         self,
         new_terms: tuple[str, ...],
         existing_groups: tuple[SceneWordGroup, ...],
-        urls_by_term: dict[str, set[str]],
     ) -> tuple[SceneWordGroup, ...]:
         if not new_terms:
             return existing_groups
