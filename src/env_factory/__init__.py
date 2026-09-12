@@ -22,7 +22,6 @@ from .scene_relation import (
     SceneRelationExtraction,
     SceneRelationExtractionError,
 )
-from .deepseek import DeepSeekClient, DeepSeekError, DeepSeekResponse
 from .llm import LLMClient, LLMError, LLMResponse
 from .wikipedia import WikipediaClient, WikipediaError, WikipediaResponse, WikipediaResult
 from .wikipedia_dump import LocalWikipediaClient, WikipediaDumpIndexer
@@ -30,9 +29,6 @@ from .task import Task
 
 __all__ = [
     "DEFAULT_KNOWLEDGE_GRAPH_SCHEMA",
-    "DeepSeekClient",
-    "DeepSeekError",
-    "DeepSeekResponse",
     "LLMClient",
     "LLMError",
     "LLMResponse",
