@@ -2,11 +2,13 @@
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+import logging
 import os
+import random
 from typing import Any
 
 from dotenv import load_dotenv
-from neo4j import Driver, GraphDatabase
+from neo4j import Driver, GraphDatabase, Query
 
 from .knowledge_graph import (
     SceneNode,
@@ -18,6 +20,8 @@ from .knowledge_graph import (
 
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -44,9 +48,13 @@ class Neo4jGraphStore:
         password: str | None = None,
         *,
         database: str = "neo4j",
+        path_query_timeout: float = 10.0,
         driver: Driver | None = None,
     ) -> None:
+        if path_query_timeout <= 0:
+            raise ValueError("path_query_timeout must be greater than zero")
         self.database = database
+        self.path_query_timeout = path_query_timeout
         self._owns_driver = driver is None
         self.driver = driver or GraphDatabase.driver(
             uri or os.getenv("NEO4J_URI", "bolt://localhost:7687"),
@@ -135,29 +143,72 @@ class Neo4jGraphStore:
                 for record in result
             )
 
-    def random_scene_event_path(self, hops: int) -> tuple[SceneNode, ...]:
-        """Return a random simple path of exactly ``hops`` event-element hops."""
+    def random_scene_event_path(self, hops: int, *, attempts: int = 8) -> tuple[SceneNode, ...]:
+        """Return a random Scene node or simple event-element path."""
 
-        if hops <= 0 or hops > 20:
-            raise ValueError("hops must be between 1 and 20")
+        if hops < 0 or hops > 20:
+            raise ValueError("hops must be between 0 and 20")
+        if attempts <= 0:
+            raise ValueError("attempts must be greater than zero")
+        logger.debug("开始随机抽取 Scene 路径：跳数=%d，最大尝试次数=%d", hops, attempts)
         with self.driver.session(database=self.database) as session:
-            record = session.run(
-                "MATCH p=(start:Scene)-[:SAME_EVENT_ELEMENT*1..20]-(end:Scene) "
-                "WHERE length(p) = $hops AND all(node IN nodes(p) "
-                "WHERE single(other IN nodes(p) WHERE other = node)) "
-                "RETURN [node IN nodes(p) | {name: node.name, words: node.words}] AS path "
-                "ORDER BY rand() LIMIT 1",
-                hops=hops,
-            ).single()
-        if record is None:
-            return ()
-        return tuple(
-            SceneNode(
-                name=str(item["name"]),
-                words=tuple(str(word) for word in (item.get("words") or [])),
-            )
-            for item in record["path"]
-        )
+            for _ in range(attempts):
+                total = session.run(
+                    "MATCH (scene:Scene) RETURN count(scene) AS total"
+                ).single()["total"]
+                if not total:
+                    logger.warning("随机抽取 Scene 路径失败：图谱中没有 Scene 节点")
+                    return ()
+                start = session.run(
+                    "MATCH (selected:Scene) "
+                    "RETURN selected.id AS id "
+                    "SKIP $offset LIMIT 1",
+                    offset=random.randrange(total),
+                ).single()
+                if start is None:
+                    logger.warning("随机抽取 Scene 路径失败：随机节点偏移无结果")
+                    return ()
+                if hops == 0:
+                    record = session.run(
+                        "MATCH (scene:Scene {id: $start_id}) "
+                        "RETURN scene.name AS name, scene.words AS words",
+                        start_id=start["id"],
+                    ).single()
+                    if record is not None:
+                        logger.debug("随机节点抽取完成：节点=%s", record["name"])
+                        return (SceneNode(
+                            name=str(record["name"]),
+                            words=tuple(str(word) for word in (record["words"] or [])),
+                        ),)
+                    continue
+                records = list(session.run(
+                    Query(
+                        f"MATCH p=(start:Scene {{id: $start_id}})-[:SAME_EVENT_ELEMENT*1..{hops}]-(end:Scene) "
+                        f"WHERE length(p) = {hops} AND all(node IN nodes(p) "
+                        "WHERE single(other IN nodes(p) WHERE other = node)) "
+                        "RETURN [node IN nodes(p) | {name: node.name, words: node.words}] AS path "
+                        "LIMIT 100",
+                        timeout=self.path_query_timeout,
+                    ),
+                    start_id=start["id"],
+                    hops=hops,
+                ))
+                if records:
+                    logger.debug(
+                        "随机路径候选抽取完成：跳数=%d，起点=%s，候选数=%d",
+                        hops,
+                        start["id"],
+                        len(records),
+                    )
+                    return tuple(
+                        SceneNode(
+                            name=str(item["name"]),
+                            words=tuple(str(word) for word in (item.get("words") or [])),
+                        )
+                        for item in random.choice(records)["path"]
+                    )
+        logger.info("未找到符合条件的 Scene 路径：跳数=%d，尝试次数=%d", hops, attempts)
+        return ()
     def upsert_task_type(self, node: TaskTypeNode) -> None:
         with self.driver.session(database=self.database) as session:
             session.run(

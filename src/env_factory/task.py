@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from .knowledge_graph import TaskType
+
 
 class TaskEnvironmentMode(str, Enum):
     """Controls how much environment information is generated for a task."""
@@ -20,3 +22,5 @@ class Task:
     desc: str
     env: list[Any]
     metrics: list[Any]
+    task_type: TaskType = TaskType.EVENT
+    environment_mode: TaskEnvironmentMode = TaskEnvironmentMode.RANDOM
