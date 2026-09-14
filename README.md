@@ -74,14 +74,18 @@ WIKIPEDIA_DUMP_DB=data/wikipedia.sqlite3
 ```
 
 `--task-type` 支持 `QA`、`Event`、`Coding`、`Chat`、`Research`；省略时随机选择。
-`--hops 3` 表示每个任务随机选择 1、2 或 3 跳路径。
+`--hops 3` 表示每个任务随机选择 0、1、2 或 3 跳路径；0 跳表示随机选择一个 Scene 节点。
 `--environment-mode` 支持 `complete`、`incomplete`、`random`，默认使用 `random` 随机生成任务环境。
+任务描述会随机选择表达风格和复杂度，避免机械罗列关键词；可通过 `--task-style` 固定表达风格。
 任务生成完成后，会继续根据任务描述和环境生成 `rule-based/model-based` 观测指标，写入 `Task.metrics`。
-默认以追加方式输出到 `output/tasks.jsonl`，每生成一个任务立即写入一行 JSON；可通过 `--output` 指定其他文件。任务默认并发生成 4 个，可通过 `--max-workers` 调整并发数。
-使用 `--count N` 可批量生成 N 个任务；数量大于 1 时输出 JSON 数组。
+默认以追加方式输出到 `output/tasks.jsonl`，每生成一个任务立即写入一行 JSON；可通过 `--output` 指定其他文件。任务默认并发生成 4 个，可通过 `--max-workers` 调整并发数。Neo4j 路径查询默认 10 秒超时，可通过 `--path-query-timeout` 调整。
+使用 `--count N` 可批量生成 N 个任务；所有任务均以 JSONL 方式逐行追加输出。
+
+任务环境不是普通背景文本，而是由 `user_profile`、`task_info`、`state`、`hidden_state`、`action`、`transition_rule` 和 `termination` 记录组成。每条记录包含 `description` 字段说明业务含义，并带有 `visibility`：`observable` 会放入 Agent 初始观测，`hidden` 只保留在沙箱内部，需要通过用户交互、工具调用或环境事件获取。至少保留状态、动作、状态转移和终止条件，供 Agent 执行和评估。
+观测指标包含 `id`、`type`、`scope`、`condition/criteria`、`reward`、`penalty`、`once` 和 `weight`，分别用于 step/state/terminal/trajectory 级别的奖励计算。
 
 输出示例：
 
 ```json
-{"task":"帮我挑选一套合适尺码的衣服并完成购买"}
+{"task":"帮我挑选一套合适尺码的衣服并完成购买","task_type":"Event","environment-mode":"complete","environment":[{"type":"state","field":"order_status","description":"当前订单状态","value":"pending","visibility":"observable"},{"type":"action","field":"submit_order","description":"提交订单","value":{"params":{}},"visibility":"observable"},{"type":"transition_rule","field":"submit_order_rule","description":"提交订单后的状态变化","value":{"when":"submit_order is called","effect":"order_status becomes submitted"},"visibility":"hidden"},{"type":"termination","field":"success","description":"任务成功条件","value":["order_status == submitted"],"visibility":"hidden"}],"metrics":[{"id":"task_success","type":"rule-based","scope":"terminal","condition":"order_status == submitted","reward":1.0,"penalty":0.0,"once":true,"rubric":"订单提交成功","weight":1.0}]}
 ```
