@@ -143,6 +143,35 @@ class Neo4jGraphStore:
                 for record in result
             )
 
+    def get_hierarchy_children(self, word: str, *, limit: int = 10) -> tuple[SceneNode, ...]:
+        """Return direct hierarchy children for a Scene name or alias."""
+
+        if not word.strip():
+            return ()
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
+        normalized = normalize_scene_name(word)
+        with self.driver.session(database=self.database) as session:
+            records = session.run(
+                "MATCH (parent:Scene)-[:HIERARCHY]->(child:Scene) "
+                "WHERE parent.id = $term OR parent.id = $normalized "
+                "OR $term IN coalesce(parent.words, []) "
+                "OR $normalized IN coalesce(parent.words, []) "
+                "RETURN child.name AS name, child.words AS words "
+                "LIMIT $limit",
+                term=word.strip(),
+                normalized=normalized,
+                limit=limit,
+            )
+            children = tuple(
+                SceneNode(
+                    name=str(record["name"]),
+                    words=tuple(str(value) for value in (record["words"] or [])),
+                )
+                for record in records
+            )
+        logger.debug("下位节点查询完成：关键词=%s，结果数=%d", word, len(children))
+        return children
     def random_scene_event_path(self, hops: int, *, attempts: int = 8) -> tuple[SceneNode, ...]:
         """Return a random Scene node or simple event-element path."""
 

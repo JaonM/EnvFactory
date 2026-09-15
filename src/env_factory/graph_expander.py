@@ -10,7 +10,7 @@ from typing import Any
 
 from .graph_builder import KnowledgeGraphBuilder, Neo4jGraphStore
 from .knowledge_graph import SceneNode, SceneRelation, TaskType
-from .llm import LLMClient
+from .llm import LLMClient, LLMError
 from .wikipedia import WikipediaError, WikipediaResponse, WikipediaResult, WikipediaClient
 from .scene_relation import LLMSceneRelationExtractor, SceneRelationExtraction
 
@@ -619,14 +619,18 @@ class SeedGraphExpander:
             "只返回包含新增词的分组，不要复述未变化的 existing_groups。"
             "每个新增词最多出现一次，保持输出简短。"
         )
-        llm_response = self.llm.complete(
-            merge_prompt,
-            system_prompt=merge_system_prompt,
-            thinking=False,
-            temperature=0.0,
-            max_tokens=4_000,
-            response_format="json_object",
-        )
+        try:
+            llm_response = self.llm.complete(
+                merge_prompt,
+                system_prompt=merge_system_prompt,
+                thinking=False,
+                temperature=0.0,
+                max_tokens=4_000,
+                response_format="json_object",
+            )
+        except LLMError as exc:
+            logger.warning("语义合并 LLM 调用失败，新增词降级为独立节点：%s", exc)
+            return self._standalone_groups(existing_groups, new_terms)
         try:
             payload = self._parse_json(llm_response.content)
             raw_groups = payload["groups"]
@@ -634,14 +638,18 @@ class SeedGraphExpander:
                 raise TypeError
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             logger.warning("语义合并响应格式异常，重试一次：%s", exc)
-            retry = self.llm.complete(
-                merge_prompt,
-                system_prompt=merge_system_prompt + "\n上次响应无效，请只输出合法 JSON。",
-                thinking=False,
-                temperature=0.0,
-                max_tokens=6_000,
-                response_format="json_object",
-            )
+            try:
+                retry = self.llm.complete(
+                    merge_prompt,
+                    system_prompt=merge_system_prompt + "\n上次响应无效，请只输出合法 JSON。",
+                    thinking=False,
+                    temperature=0.0,
+                    max_tokens=6_000,
+                    response_format="json_object",
+                )
+            except LLMError as retry_error:
+                logger.warning("语义合并重试调用失败，新增词降级为独立节点：%s", retry_error)
+                return self._standalone_groups(existing_groups, new_terms)
             try:
                 payload = self._parse_json(retry.content)
                 raw_groups = payload["groups"]
@@ -649,13 +657,7 @@ class SeedGraphExpander:
                     raise TypeError
             except (json.JSONDecodeError, KeyError, TypeError) as retry_error:
                 logger.error("语义合并重试失败，新增词降级为独立节点：%s", retry_error)
-                return tuple(existing_groups) + tuple(
-                    SceneWordGroup(
-                        term,
-                        (term,),
-                    )
-                    for term in new_terms
-                )
+                return self._standalone_groups(existing_groups, new_terms)
 
         normalized_terms = {term.casefold(): term for term in new_terms}
         existing_by_name = {group.name.casefold(): group for group in existing_groups}
@@ -705,6 +707,16 @@ class SeedGraphExpander:
             if term.casefold() not in assigned_names:
                 groups.append(SceneWordGroup(term, (term,)))
         return tuple(groups)
+
+    @staticmethod
+    def _standalone_groups(
+        existing_groups: tuple[SceneWordGroup, ...],
+        terms: tuple[str, ...],
+    ) -> tuple[SceneWordGroup, ...]:
+        return tuple(existing_groups) + tuple(
+            SceneWordGroup(term, (term,))
+            for term in terms
+        )
 
     @staticmethod
     def _select_merge_candidates(
