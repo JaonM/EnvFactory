@@ -100,6 +100,55 @@ run_agent_and_finalize() {
     fi
   done
 
+  if ! python3 - "$output_path/tools.json" "$output_path/task.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+tools_path = Path(sys.argv[1])
+task_path = Path(sys.argv[2])
+payload = json.loads(tools_path.read_text(encoding="utf-8"))
+tools = payload.get("tools") if isinstance(payload, dict) else None
+if not isinstance(tools, list) or not tools:
+    raise SystemExit("tools.json 必须包含非空 tools 数组")
+
+required = {"name", "description", "input_schema"}
+names = set()
+for index, tool in enumerate(tools):
+    if not isinstance(tool, dict) or not required.issubset(tool):
+        raise SystemExit(f"tools.json 第 {index + 1} 个工具缺少标准字段")
+    name = tool["name"]
+    schema = tool["input_schema"]
+    if not isinstance(name, str) or not name or name in names:
+        raise SystemExit(f"tools.json 工具名称无效或重复：{name!r}")
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise SystemExit(f"工具 {name} 的 input_schema 必须是 object schema")
+    if not isinstance(schema.get("properties"), dict):
+        raise SystemExit(f"工具 {name} 缺少 input_schema.properties")
+    if not isinstance(schema.get("required", []), list):
+        raise SystemExit(f"工具 {name} 的 input_schema.required 必须是数组")
+    if schema.get("additionalProperties") is not False:
+        raise SystemExit(f"工具 {name} 必须设置 additionalProperties=false")
+    names.add(name)
+
+task = json.loads(task_path.read_text(encoding="utf-8"))
+action_names = {
+    item.get("field")
+    for item in task.get("environment", [])
+    if item.get("type") == "action"
+}
+missing = sorted(name for name in action_names if name not in names)
+if missing:
+    raise SystemExit(f"tools.json 未暴露任务 action：{', '.join(missing)}")
+for required_name in ("ask_user", "reset", "get_observation", "get_reward"):
+    if required_name not in names:
+        raise SystemExit(f"tools.json 缺少运行时工具：{required_name}")
+PY
+  then
+    echo "Code Agent 生成的 tools.json 不符合标准工具 schema" >&2
+    return 5
+  fi
+
   if [[ "$runtime" == "auto" ]]; then
     if command -v container >/dev/null 2>&1; then runtime="container"
     elif command -v docker >/dev/null 2>&1; then runtime="docker"

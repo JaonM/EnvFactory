@@ -36,7 +36,7 @@ Code Agent 的职责是根据任务输入在独立目录中实际开发沙箱，
   --runtime docker
 ```
 
-脚本默认后台运行，使用 `--foreground` 等待完成。Agent 完成后，脚本校验 `spec.md`、工具定义、Dockerfile、构建脚本和运行脚本，并按参数构建镜像。
+脚本默认后台运行，使用 `--foreground` 等待完成。Agent 完成后，脚本校验 `spec.md`、标准 `tools.json`、Dockerfile、构建脚本和运行脚本，并按参数构建镜像。Agent 必须自行分析任务 action 的参数需求，任务输入不会提供参数 schema。
 
 Code Agent 的非交互调用方式：
 

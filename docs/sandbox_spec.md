@@ -21,6 +21,34 @@
 - `ask_user(prompt)`：向模拟用户提问，推进时间并返回用户消息
 - `reward()`：计算当前状态下的奖励明细
 
+## 工具定义
+
+工程必须生成 `tools.json` 供 RL Trainer 使用。每个工具至少包含标准函数工具字段：
+
+```json
+{
+  "name": "record_clothing_items",
+  "description": "记录用户提供的衣物信息",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "items": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "衣物名称或材质标签列表"
+      }
+    },
+    "required": ["items"],
+    "additionalProperties": false
+  },
+  "transport": "POST /v1/step",
+  "returns": {"observation": "object", "reward": "number", "done": "boolean"},
+  "visibility": "public"
+}
+```
+
+任务输入中的 `action` 只声明动作名称，不声明参数。Agent 必须结合动作描述、状态转移规则和终止条件推导参数，并在业务代码、测试和 `tools.json` 中保持一致。
+
 隐藏状态、转移规则、终止条件和内部业务数据不会出现在初始观测中。
 
 ## 持久化
