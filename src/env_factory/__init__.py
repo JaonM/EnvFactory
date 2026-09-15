@@ -25,7 +25,7 @@ from .scene_relation import (
 from .llm import LLMClient, LLMError, LLMResponse
 from .wikipedia import WikipediaClient, WikipediaError, WikipediaResponse, WikipediaResult
 from .wikipedia_dump import LocalWikipediaClient, WikipediaDumpIndexer
-from .task import Task, TaskEnvironmentMode
+from .task import Task
 from .task_generator import (
     TaskEnvironmentGenerator,
     TaskGenerationError,
@@ -62,7 +62,6 @@ __all__ = [
     "LocalWikipediaClient",
     "WikipediaDumpIndexer",
     "Task",
-    "TaskEnvironmentMode",
     "TaskEnvironmentGenerator",
     "TaskMetricsGenerator",
     "TaskGenerator",

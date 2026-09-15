@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 from env_factory import (
     LLMClient,
     Neo4jGraphStore,
-    TaskEnvironmentMode,
     TaskGenerationError,
     TaskGenerator,
     TaskType,
@@ -24,6 +23,12 @@ def main() -> None:
     parser.add_argument("--hops", type=int, default=3, help="随机路径最大跳数，实际范围为 0 到该值")
     parser.add_argument("--count", type=int, default=1, help="生成任务数量")
     parser.add_argument("--max-workers", type=int, default=4, help="任务生成并发数")
+    parser.add_argument(
+        "--hierarchy-child-limit",
+        type=int,
+        default=10,
+        help="每个路径关键词最多抽取的直接下位词数量，默认 10",
+    )
     parser.add_argument(
         "--path-query-timeout",
         type=float,
@@ -38,25 +43,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--task-type",
-        choices=[task_type.value for task_type in TaskType],
-        help="任务类型；不指定时随机选择",
+        help="任务类型；支持逗号分隔多选，例如 QA,Event；不指定时随机选择",
     )
     parser.add_argument(
         "--task-style",
         choices=TaskGenerator.STYLES,
         help="任务表达风格；不指定时随机选择",
     )
-    parser.add_argument(
-        "--environment-mode",
-        choices=[mode.value for mode in TaskEnvironmentMode],
-        default=TaskEnvironmentMode.RANDOM.value,
-        help="任务环境完整度",
-    )
     args = parser.parse_args()
     if args.count <= 0:
         parser.error("--count 必须大于 0")
     if args.max_workers <= 0:
         parser.error("--max-workers 必须大于 0")
+    if args.hierarchy_child_limit <= 0:
+        parser.error("--hierarchy-child-limit 必须大于 0")
     if args.path_query_timeout <= 0:
         parser.error("--path-query-timeout 必须大于 0")
     load_dotenv()
@@ -70,7 +70,12 @@ def main() -> None:
         database=os.getenv("NEO4J_DATABASE", "neo4j"),
         path_query_timeout=args.path_query_timeout,
     ) as store:
-        generator = TaskGenerator(store, llm)
+        generator = TaskGenerator(
+            store,
+            llm,
+            hierarchy_child_limit=args.hierarchy_child_limit,
+            hierarchy_workers=args.max_workers,
+        )
         with args.output.open("a", encoding="utf-8") as output_file:
             with ThreadPoolExecutor(max_workers=min(args.max_workers, args.count)) as executor:
                 def generate_one(index: int):
@@ -78,7 +83,6 @@ def main() -> None:
                     return generator.generate(
                         args.hops,
                         args.task_type,
-                        args.environment_mode,
                         args.task_style,
                     )
 
@@ -109,7 +113,8 @@ def main() -> None:
                             {
                                 "task": task.desc,
                                 "task_type": task.task_type.value,
-                                "environment-mode": task.environment_mode.value,
+                                "complexity": task.complexity,
+                                "complexity_features": task.complexity_features,
                                 "environment": task.env,
                                 "metrics": task.metrics,
                             },

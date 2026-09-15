@@ -52,12 +52,25 @@ def load_seed_words() -> tuple[str, ...]:
 def seed_file_path() -> Path:
     seed_file = os.getenv("GRAPH_SEEDS_FILE")
     if not seed_file:
-        raise ValueError("GRAPH_SEEDS_FILE is not configured in .env")
-    path = Path(seed_file)
+        raise ValueError(
+            "未找到 GRAPH_SEEDS_FILE 配置。原因：.env 中没有配置种子文件路径；"
+            "请新增 GRAPH_SEEDS_FILE=data/scene_seeds.txt"
+        )
+    configured_path = Path(seed_file).expanduser()
+    path = configured_path
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     if not path.is_file():
-        raise FileNotFoundError(f"seed file does not exist: {path}")
+        reason = "路径不存在"
+        if path.exists():
+            reason = "路径存在但不是普通文件"
+        raise FileNotFoundError(
+            f"种子文件读取失败：{path}\n"
+            f"原因：{reason}；GRAPH_SEEDS_FILE 当前配置为 {seed_file!r}，"
+            f"相对路径会基于项目根目录 {PROJECT_ROOT} 解析。\n"
+            "修复：确认文件存在，或在 .env 中设置 GRAPH_SEEDS_FILE=data/scene_seeds.txt。"
+        )
+    logging.getLogger(__name__).info("读取种子文件：%s", path)
     return path
 
 
@@ -73,7 +86,10 @@ def append_seed_words(words: tuple[str, ...]) -> int:
 
 
 def main() -> None:
-    load_dotenv(PROJECT_ROOT / ".env")
+    # The project .env is the source of truth for graph construction.  In
+    # particular, this prevents an old exported GRAPH_SEEDS_FILE from
+    # silently overriding the repository configuration.
+    load_dotenv(PROJECT_ROOT / ".env", override=True)
     logging.basicConfig(
         level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
