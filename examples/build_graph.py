@@ -21,15 +21,50 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="构建并持久化任务知识图谱")
-    parser.add_argument("--rounds", type=int, default=None, help="最大扩展轮次")
-    parser.add_argument("--max-scene-nodes", type=int, default=1000)
-    parser.add_argument("--max-search-requests", type=int, default=500)
-    parser.add_argument("--term-batch-size", type=int, default=16)
-    parser.add_argument("--max-terms-per-seed", type=int, default=30)
-    parser.add_argument("--merge-batch-size", type=int, default=50)
-    parser.add_argument("--relation-batch-size", type=int, default=40)
-    parser.add_argument("--relation-candidate-limit", type=int, default=20)
-    parser.add_argument("--max-workers", type=int, default=2, help="搜索 API 并发数")
+    parser.add_argument("--rounds", type=int, default=None, help="最大扩展轮次，默认使用配置值 3")
+    parser.add_argument(
+        "--max-scene-nodes",
+        type=int,
+        default=1000,
+        help="最多保留的 Scene 节点数量，默认 1000",
+    )
+    parser.add_argument(
+        "--max-search-requests",
+        type=int,
+        default=500,
+        help="本轮最多发起的 Wikipedia 搜索请求数，默认 500",
+    )
+    parser.add_argument(
+        "--term-batch-size",
+        type=int,
+        default=16,
+        help="每次交给 LLM 抽取术语的种子词数量，默认 16",
+    )
+    parser.add_argument(
+        "--max-terms-per-seed",
+        type=int,
+        default=30,
+        help="每个种子词最多抽取的术语数量，默认 30",
+    )
+    parser.add_argument(
+        "--merge-batch-size",
+        type=int,
+        default=50,
+        help="每批参与语义合并的新术语数量，默认 50",
+    )
+    parser.add_argument(
+        "--relation-batch-size",
+        type=int,
+        default=40,
+        help="每批进行关系抽取的新 Scene 节点数量，默认 40",
+    )
+    parser.add_argument(
+        "--relation-candidate-limit",
+        type=int,
+        default=20,
+        help="关系抽取时为每批新增节点保留的候选上下文节点数，默认 20",
+    )
+    parser.add_argument("--max-workers", type=int, default=2, help="搜索 API 并发数，默认 2")
     return parser.parse_args()
 
 

@@ -20,9 +20,9 @@ from env_factory import (
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="从知识图谱生成长程任务")
-    parser.add_argument("--hops", type=int, default=3, help="随机路径最大跳数，实际范围为 0 到该值")
-    parser.add_argument("--count", type=int, default=1, help="生成任务数量")
-    parser.add_argument("--max-workers", type=int, default=4, help="任务生成并发数")
+    parser.add_argument("--hops", type=int, default=3, help="随机路径最大跳数，实际范围为 0 到该值，默认 3")
+    parser.add_argument("--count", type=int, default=1, help="生成任务数量，默认 1")
+    parser.add_argument("--max-workers", type=int, default=4, help="任务生成并发数，默认 4")
     parser.add_argument(
         "--hierarchy-child-limit",
         type=int,
@@ -33,7 +33,7 @@ def main() -> None:
         "--path-query-timeout",
         type=float,
         default=10.0,
-        help="Neo4j 随机路径查询超时时间（秒）",
+        help="Neo4j 随机路径查询超时时间（秒），默认 10.0",
     )
     parser.add_argument(
         "--output",
@@ -43,12 +43,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--task-type",
-        help="任务类型；支持逗号分隔多选，例如 QA,Event；不指定时随机选择",
+        help="任务类型；支持逗号分隔多选，例如 QA,Event；默认从全部类型随机选择",
     )
     parser.add_argument(
         "--task-style",
         choices=TaskGenerator.STYLES,
-        help="任务表达风格；不指定时随机选择",
+        help="任务表达风格；默认随机选择",
     )
     args = parser.parse_args()
     if args.count <= 0:

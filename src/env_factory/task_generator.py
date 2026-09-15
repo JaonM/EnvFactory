@@ -238,9 +238,9 @@ class TaskEnvironmentGenerator:
 {{complexity_features}}
 
 # 输出格式
-JSON 格式输出，每条记录只包含 type、field、description、value。例如：[{"type":"user_profile","field":"interest","description":"用户兴趣","value":"服装"},{"type":"task_info","field":"goal","description":"任务目标","value":"提交订单"},{"type":"state","field":"status","description":"当前订单状态","value":"pending"},{"type":"action","field":"submit","description":"提交订单","value":{"params":{}}},{"type":"transition_rule","field":"submit_rule","description":"提交后的状态变化","value":{"when":"submit is called","effect":"status becomes submitted"}},{"type":"termination","field":"success","description":"成功条件","value":["status == submitted"]}]
+JSON 格式输出，每条记录只包含 type、field、description、value。例如：[{"type":"user_profile","field":"interest","description":"用户兴趣","value":"服装"},{"type":"task_info","field":"goal","description":"任务目标","value":"提交订单"},{"type":"state","field":"status","description":"当前订单状态","value":"pending"},{"type":"action","field":"submit","description":"提交订单","value":"submit_order"},{"type":"transition_rule","field":"submit_rule","description":"提交后的状态变化","value":{"when":"submit is called","effect":"status becomes submitted"}},{"type":"termination","field":"success","description":"成功条件","value":["status == submitted"]}]
 
-user_profile 只能基于候选下位词生成兴趣、知识背景或偏好，不得从任务描述臆造姓名、年龄、住址等个人事实；没有足够候选信息时省略具体个人事实。state 是当前状态，hidden_state 是 Agent 初始不可见但环境内部使用的状态，action 是 Agent 可执行的动作及参数，transition_rule 定义动作或时间如何改变状态，termination 定义可判定的 success/failure 条件。hidden、transition_rule 和 termination 记录不应直接暴露给 Agent。value 可以是数字、布尔值、字符串、数组或对象，不能使用空泛描述；未知信息直接省略，不得输出 null、空字符串、空数组或空对象。最多 30 条，确保 JSON 完整。
+user_profile 只能基于候选下位词生成兴趣、知识背景或偏好，不得从任务描述臆造姓名、年龄、住址等个人事实；没有足够候选信息时省略具体个人事实。state 是当前状态，hidden_state 是 Agent 初始不可见但环境内部使用的状态，action 是 Agent 可执行的动作名称；action 记录不要生成 params、参数 schema 或参数字段，动作参数由沙箱工具定义和 Agent 调用时校验。transition_rule 定义动作或时间如何改变状态，termination 定义可判定的 success/failure 条件。hidden、transition_rule 和 termination 记录不应直接暴露给 Agent。value 可以是数字、布尔值、字符串、数组或对象，不能使用空泛描述；未知信息直接省略，不得输出 null、空字符串、空数组或空对象。最多 30 条，确保 JSON 完整。
 
 只输出合法 JSON，不要解释。"""
 
