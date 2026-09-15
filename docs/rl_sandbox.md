@@ -36,7 +36,7 @@ Code Agent 的职责是根据任务输入在独立目录中实际开发沙箱，
   --runtime docker
 ```
 
-脚本默认后台运行，使用 `--foreground` 等待完成。Agent 完成后，脚本校验 `spec.md`、标准 `tools.json`、Dockerfile、构建脚本和运行脚本，并按参数构建镜像。Agent 必须自行分析任务 action 的参数需求，任务输入不会提供参数 schema。
+脚本默认后台运行，使用 `--foreground` 等待完成。Agent 完成后，脚本校验 `spec.md`、包含 `llm_tools` 和 `trainer_actions` 的标准 `tools.json`、Dockerfile、构建脚本和运行脚本，并按参数构建镜像。Agent 必须自行分析任务 action 的参数需求，任务输入不会提供参数 schema。
 
 Code Agent 的非交互调用方式：
 
@@ -90,4 +90,4 @@ GET  /v1/reward
 
 每个动作都会推进离散时间，动作导致的状态修改会写入 SQLite。Agent 只能通过观测和工具结果获得允许暴露的信息，隐藏状态不会直接返回。
 
-完整动作参数、返回结构和 HTTP 映射位于生成工程的 `tools.json`。
+LLM 工具、Trainer 动作接口、调用映射、参数、返回结构和 HTTP 映射位于生成工程的 `tools.json`。LLM 只使用 `llm_tools`，RL Trainer 使用 `trainer_actions` 和 `trainer_control` 与沙箱交互。

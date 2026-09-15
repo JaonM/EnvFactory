@@ -21,9 +21,15 @@
 - `ask_user(prompt)`：向模拟用户提问，推进时间并返回用户消息
 - `reward()`：计算当前状态下的奖励明细
 
-## 工具定义
+## 工具与动作接口
 
-工程必须生成 `tools.json` 供 RL Trainer 使用。每个工具至少包含标准函数工具字段：
+工程必须生成 `tools.json`，明确区分 LLM 工具和 RL Trainer 动作接口：
+
+- `llm_tools`：暴露给 LLM，供 LLM 生成结构化工具调用。
+- `trainer_actions`：暴露给 RL Trainer，负责把 LLM 工具调用解析后真正执行到沙箱。
+- `trainer_control`：RL Trainer 控制沙箱生命周期和读取结果的接口，例如 `reset`、`get_observation`、`get_reward`。
+
+`llm_tools` 使用标准函数工具字段：
 
 ```json
 {
@@ -41,13 +47,31 @@
     "required": ["items"],
     "additionalProperties": false
   },
-  "transport": "POST /v1/step",
-  "returns": {"observation": "object", "reward": "number", "done": "boolean"},
-  "visibility": "public"
+  "visibility": "llm"
 }
 ```
 
-任务输入中的 `action` 只声明动作名称，不声明参数。Agent 必须结合动作描述、状态转移规则和终止条件推导参数，并在业务代码、测试和 `tools.json` 中保持一致。
+对应的 `trainer_actions` 示例：
+
+```json
+{
+  "name": "record_clothing_items",
+  "action_type": "record_clothing_items",
+  "description": "执行记录衣物动作",
+  "input_schema": {
+    "type": "object",
+    "properties": {"items": {"type": "array", "items": {"type": "string"}}},
+    "required": ["items"],
+    "additionalProperties": false
+  },
+  "transport": "POST /v1/step",
+  "request": {"action_type": "record_clothing_items", "params_from": "input"},
+  "returns": {"observation": "object", "reward": "number", "done": "boolean"},
+  "visibility": "trainer"
+}
+```
+
+LLM 工具必须通过 `trainer_action` 字段或根级 `mappings` 映射到可执行动作。任务输入中的 `action` 只声明动作名称，不声明参数。Agent 必须结合动作描述、状态转移规则和终止条件推导参数，并在业务代码、测试和两套接口定义中保持一致。
 
 隐藏状态、转移规则、终止条件和内部业务数据不会出现在初始观测中。
 

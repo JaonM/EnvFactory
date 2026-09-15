@@ -108,18 +108,21 @@ from pathlib import Path
 tools_path = Path(sys.argv[1])
 task_path = Path(sys.argv[2])
 payload = json.loads(tools_path.read_text(encoding="utf-8"))
-tools = payload.get("tools") if isinstance(payload, dict) else None
-if not isinstance(tools, list) or not tools:
-    raise SystemExit("tools.json 必须包含非空 tools 数组")
+llm_tools = payload.get("llm_tools") if isinstance(payload, dict) else None
+trainer_actions = payload.get("trainer_actions") if isinstance(payload, dict) else None
+if not isinstance(llm_tools, list) or not llm_tools:
+    raise SystemExit("tools.json 必须包含非空 llm_tools 数组")
+if not isinstance(trainer_actions, list) or not trainer_actions:
+    raise SystemExit("tools.json 必须包含非空 trainer_actions 数组")
 
 required = {"name", "description", "input_schema"}
-names = set()
-for index, tool in enumerate(tools):
+llm_names = set()
+for index, tool in enumerate(llm_tools):
     if not isinstance(tool, dict) or not required.issubset(tool):
         raise SystemExit(f"tools.json 第 {index + 1} 个工具缺少标准字段")
     name = tool["name"]
     schema = tool["input_schema"]
-    if not isinstance(name, str) or not name or name in names:
+    if not isinstance(name, str) or not name or name in llm_names:
         raise SystemExit(f"tools.json 工具名称无效或重复：{name!r}")
     if not isinstance(schema, dict) or schema.get("type") != "object":
         raise SystemExit(f"工具 {name} 的 input_schema 必须是 object schema")
@@ -129,7 +132,29 @@ for index, tool in enumerate(tools):
         raise SystemExit(f"工具 {name} 的 input_schema.required 必须是数组")
     if schema.get("additionalProperties") is not False:
         raise SystemExit(f"工具 {name} 必须设置 additionalProperties=false")
-    names.add(name)
+    if tool.get("visibility") != "llm":
+        raise SystemExit(f"LLM 工具 {name} 的 visibility 必须为 llm")
+    if not isinstance(tool.get("trainer_action"), str) or not tool["trainer_action"]:
+        raise SystemExit(f"LLM 工具 {name} 必须声明 trainer_action 映射")
+    llm_names.add(name)
+
+trainer_names = set()
+for index, action in enumerate(trainer_actions):
+    if not isinstance(action, dict) or not {"name", "action_type", "description", "input_schema"}.issubset(action):
+        raise SystemExit(f"trainer_actions 第 {index + 1} 项缺少标准字段")
+    name = action["name"]
+    schema = action["input_schema"]
+    if not isinstance(name, str) or not name or name in trainer_names:
+        raise SystemExit(f"Trainer 动作名称无效或重复：{name!r}")
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise SystemExit(f"Trainer 动作 {name} 的 input_schema 必须是 object schema")
+    if not isinstance(schema.get("properties"), dict) or not isinstance(schema.get("required", []), list):
+        raise SystemExit(f"Trainer 动作 {name} 的 input_schema 不完整")
+    if schema.get("additionalProperties") is not False:
+        raise SystemExit(f"Trainer 动作 {name} 必须设置 additionalProperties=false")
+    if action.get("visibility") != "trainer":
+        raise SystemExit(f"Trainer 动作 {name} 的 visibility 必须为 trainer")
+    trainer_names.add(name)
 
 task = json.loads(task_path.read_text(encoding="utf-8"))
 action_names = {
@@ -137,12 +162,21 @@ action_names = {
     for item in task.get("environment", [])
     if item.get("type") == "action"
 }
-missing = sorted(name for name in action_names if name not in names)
+missing = sorted(name for name in action_names if name not in trainer_names)
 if missing:
-    raise SystemExit(f"tools.json 未暴露任务 action：{', '.join(missing)}")
-for required_name in ("ask_user", "reset", "get_observation", "get_reward"):
-    if required_name not in names:
-        raise SystemExit(f"tools.json 缺少运行时工具：{required_name}")
+    raise SystemExit(f"tools.json 未暴露任务 trainer action：{', '.join(missing)}")
+missing_mappings = sorted(
+    tool["trainer_action"] for tool in llm_tools if tool["trainer_action"] not in trainer_names
+)
+if missing_mappings:
+    raise SystemExit(f"LLM 工具映射到不存在的 Trainer 动作：{', '.join(missing_mappings)}")
+for action in trainer_actions:
+    mapped = action.get("llm_tool")
+    if mapped is not None and mapped not in llm_names:
+        raise SystemExit(f"Trainer 动作 {action['name']} 映射到不存在的 LLM 工具：{mapped}")
+for required_name in ("ask_user",):
+    if required_name in action_names and required_name not in trainer_names:
+        raise SystemExit(f"tools.json 缺少 Trainer 动作：{required_name}")
 PY
   then
     echo "Code Agent 生成的 tools.json 不符合标准工具 schema" >&2
