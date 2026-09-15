@@ -2,8 +2,10 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from http.client import IncompleteRead
 import json
 import os
+import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -45,6 +47,7 @@ class LLMClient:
         model_env: str = "LLM_MODEL",
         default_params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        network_retries: int = 2,
     ) -> None:
         self.api_key = api_key or os.getenv(api_key_env)
         if not self.api_key:
@@ -57,7 +60,10 @@ class LLMClient:
             raise ValueError(f"{model_env} is not configured")
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
+        if network_retries < 0:
+            raise ValueError("network_retries must not be negative")
         self.timeout = timeout
+        self.network_retries = network_retries
         self.default_params = dict(default_params or {})
         self.headers = dict(headers or {})
 
@@ -95,27 +101,39 @@ class LLMClient:
         if isinstance(body.get("response_format"), str):
             body["response_format"] = {"type": body["response_format"]}
 
-        request = Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                **self.headers,
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                payload = json.load(response)
-        except HTTPError as exc:
-            detail = self._error_detail(exc)
-            raise LLMError(f"LLM returned HTTP {exc.code}: {detail}") from exc
-        except (URLError, TimeoutError, OSError) as exc:
-            raise LLMError(f"Unable to reach LLM at {self.base_url}") from exc
-        except json.JSONDecodeError as exc:
-            raise LLMError("LLM returned invalid JSON") from exc
+        request_data = json.dumps(body).encode("utf-8")
+        request_headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            **self.headers,
+        }
+        for attempt in range(self.network_retries + 1):
+            request = Request(
+                f"{self.base_url}/chat/completions",
+                data=request_data,
+                headers=request_headers,
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    payload = json.load(response)
+                break
+            except HTTPError as exc:
+                detail = self._error_detail(exc)
+                raise LLMError(f"LLM returned HTTP {exc.code}: {detail}") from exc
+            except (IncompleteRead, URLError, TimeoutError, OSError) as exc:
+                if attempt >= self.network_retries:
+                    raise LLMError(
+                        f"Unable to read a complete LLM response from {self.base_url} "
+                        f"after {attempt + 1} attempts"
+                    ) from exc
+                delay = 0.5 * (2**attempt)
+                time.sleep(delay)
+            except json.JSONDecodeError as exc:
+                raise LLMError("LLM returned invalid JSON") from exc
+        else:
+            raise LLMError("LLM request failed unexpectedly")
 
         try:
             choice = payload["choices"][0]
