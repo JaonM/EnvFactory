@@ -115,41 +115,41 @@ if not isinstance(llm_tools, list) or not llm_tools:
 if not isinstance(trainer_actions, list) or not trainer_actions:
     raise SystemExit("tools.json 必须包含非空 trainer_actions 数组")
 
-required = {"name", "description", "input_schema"}
+llm_mappings = payload.get("mappings") if isinstance(payload, dict) else None
+if not isinstance(llm_mappings, list):
+    raise SystemExit("tools.json 必须包含 mappings 数组")
+
 llm_names = set()
 for index, tool in enumerate(llm_tools):
-    if not isinstance(tool, dict) or not required.issubset(tool):
-        raise SystemExit(f"tools.json 第 {index + 1} 个工具缺少标准字段")
-    name = tool["name"]
-    schema = tool["input_schema"]
+    if not isinstance(tool, dict) or tool.get("type") != "function":
+        raise SystemExit(f"LLM 工具 {index + 1} 必须使用 type=function")
+    function = tool.get("function")
+    if not isinstance(function, dict) or not {"name", "description", "parameters"}.issubset(function):
+        raise SystemExit(f"LLM 工具 {index + 1} 缺少标准 function 字段")
+    name = function["name"]
+    schema = function["parameters"]
     if not isinstance(name, str) or not name or name in llm_names:
         raise SystemExit(f"tools.json 工具名称无效或重复：{name!r}")
     if not isinstance(schema, dict) or schema.get("type") != "object":
-        raise SystemExit(f"工具 {name} 的 input_schema 必须是 object schema")
+        raise SystemExit(f"工具 {name} 的 parameters 必须是 object schema")
     if not isinstance(schema.get("properties"), dict):
-        raise SystemExit(f"工具 {name} 缺少 input_schema.properties")
+        raise SystemExit(f"工具 {name} 缺少 parameters.properties")
     if not isinstance(schema.get("required", []), list):
-        raise SystemExit(f"工具 {name} 的 input_schema.required 必须是数组")
-    if schema.get("additionalProperties") is not False:
-        raise SystemExit(f"工具 {name} 必须设置 additionalProperties=false")
-    if tool.get("visibility") != "llm":
-        raise SystemExit(f"LLM 工具 {name} 的 visibility 必须为 llm")
-    if not isinstance(tool.get("trainer_action"), str) or not tool["trainer_action"]:
-        raise SystemExit(f"LLM 工具 {name} 必须声明 trainer_action 映射")
+        raise SystemExit(f"工具 {name} 的 parameters.required 必须是数组")
     llm_names.add(name)
 
 trainer_names = set()
 for index, action in enumerate(trainer_actions):
-    if not isinstance(action, dict) or not {"name", "action_type", "description", "input_schema"}.issubset(action):
+    if not isinstance(action, dict) or not {"name", "action_type", "description", "parameters"}.issubset(action):
         raise SystemExit(f"trainer_actions 第 {index + 1} 项缺少标准字段")
     name = action["name"]
-    schema = action["input_schema"]
+    schema = action["parameters"]
     if not isinstance(name, str) or not name or name in trainer_names:
         raise SystemExit(f"Trainer 动作名称无效或重复：{name!r}")
     if not isinstance(schema, dict) or schema.get("type") != "object":
-        raise SystemExit(f"Trainer 动作 {name} 的 input_schema 必须是 object schema")
+        raise SystemExit(f"Trainer 动作 {name} 的 parameters 必须是 object schema")
     if not isinstance(schema.get("properties"), dict) or not isinstance(schema.get("required", []), list):
-        raise SystemExit(f"Trainer 动作 {name} 的 input_schema 不完整")
+        raise SystemExit(f"Trainer 动作 {name} 的 parameters 不完整")
     if schema.get("additionalProperties") is not False:
         raise SystemExit(f"Trainer 动作 {name} 必须设置 additionalProperties=false")
     if action.get("visibility") != "trainer":
@@ -165,15 +165,15 @@ action_names = {
 missing = sorted(name for name in action_names if name not in trainer_names)
 if missing:
     raise SystemExit(f"tools.json 未暴露任务 trainer action：{', '.join(missing)}")
-missing_mappings = sorted(
-    tool["trainer_action"] for tool in llm_tools if tool["trainer_action"] not in trainer_names
-)
-if missing_mappings:
-    raise SystemExit(f"LLM 工具映射到不存在的 Trainer 动作：{', '.join(missing_mappings)}")
-for action in trainer_actions:
-    mapped = action.get("llm_tool")
-    if mapped is not None and mapped not in llm_names:
-        raise SystemExit(f"Trainer 动作 {action['name']} 映射到不存在的 LLM 工具：{mapped}")
+mapped_llm = set()
+for mapping in llm_mappings:
+    if not isinstance(mapping, dict) or not {"llm_tool", "trainer_action"}.issubset(mapping):
+        raise SystemExit("每个 mappings 项必须包含 llm_tool 和 trainer_action")
+    if mapping["llm_tool"] not in llm_names or mapping["trainer_action"] not in trainer_names:
+        raise SystemExit(f"无效的 LLM 工具映射：{mapping}")
+    mapped_llm.add(mapping["llm_tool"])
+if mapped_llm != llm_names:
+    raise SystemExit("每个 LLM 工具都必须有且只有一个 Trainer action 映射")
 for required_name in ("ask_user",):
     if required_name in action_names and required_name not in trainer_names:
         raise SystemExit(f"tools.json 缺少 Trainer 动作：{required_name}")

@@ -29,25 +29,26 @@
 - `trainer_actions`：暴露给 RL Trainer，负责把 LLM 工具调用解析后真正执行到沙箱。
 - `trainer_control`：RL Trainer 控制沙箱生命周期和读取结果的接口，例如 `reset`、`get_observation`、`get_reward`。
 
-`llm_tools` 使用标准函数工具字段：
+`llm_tools` 必须使用标准函数工具字段（与 LLM API 的 tools 参数一致）：
 
 ```json
 {
-  "name": "record_clothing_items",
-  "description": "记录用户提供的衣物信息",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "items": {
-        "type": "array",
-        "items": {"type": "string"},
-        "description": "衣物名称或材质标签列表"
-      }
-    },
-    "required": ["items"],
-    "additionalProperties": false
-  },
-  "visibility": "llm"
+  "type": "function",
+  "function": {
+    "name": "record_clothing_items",
+    "description": "记录用户提供的衣物信息",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "衣物名称或材质标签列表"
+        }
+      },
+      "required": ["items"]
+    }
+  }
 }
 ```
 
@@ -58,7 +59,7 @@
   "name": "record_clothing_items",
   "action_type": "record_clothing_items",
   "description": "执行记录衣物动作",
-  "input_schema": {
+  "parameters": {
     "type": "object",
     "properties": {"items": {"type": "array", "items": {"type": "string"}}},
     "required": ["items"],
@@ -71,7 +72,7 @@
 }
 ```
 
-LLM 工具必须通过 `trainer_action` 字段或根级 `mappings` 映射到可执行动作。任务输入中的 `action` 只声明动作名称，不声明参数。Agent 必须结合动作描述、状态转移规则和终止条件推导参数，并在业务代码、测试和两套接口定义中保持一致。
+LLM 工具必须通过根级 `mappings` 映射到可执行动作，例如 `{"llm_tool":"record_clothing_items","trainer_action":"record_clothing_items"}`。任务输入中的 `action` 只声明动作名称，不声明参数。Agent 必须结合动作描述、状态转移规则和终止条件推导参数，并在业务代码、测试和两套接口定义中保持一致。
 
 ### 参数设计原则
 
@@ -88,8 +89,7 @@ LLM 工具必须通过 `trainer_action` 字段或根级 `mappings` 映射到可�
 {
   "name": "identify_material",
   "description": "根据衣物标签或描述提交材质判断",
-  "trainer_action": "identify_material",
-  "input_schema": {
+  "parameters": {
     "type": "object",
     "properties": {
       "clothing_id": {"type": "integer", "description": "待识别衣物的 ID"},
