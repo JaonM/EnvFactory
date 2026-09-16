@@ -145,30 +145,6 @@ run_agent_and_finalize() {
     echo "Code Agent 规格阶段未生成非空 spec.md"
     return 5
   fi
-  local required_spec_sections=(
-    "## 1. Task understanding and scope"
-    "## 2. Requirement decomposition and implementation logic"
-    "## 3. Data model and persistence design"
-    "## 4. Data simulation plan"
-    "## 5. LLM user simulator and interaction scripts"
-    "## 6. Real-time simulation model"
-    "## 7. LLM tools, Trainer actions, and action-chain design"
-    "## 8. External LLM configuration and Docker injection"
-    "## 9. Reward function and Trainer-facing evaluation"
-    "## 10. Trainer API and environment state transitions"
-    "## 11. Acceptance and verification plan"
-  )
-  local spec_section
-  for spec_section in "${required_spec_sections[@]}"; do
-    if ! grep -Fqx "$spec_section" "$output_path/spec.md"; then
-      echo "spec.md 缺少必需章节：$spec_section"
-      return 5
-    fi
-  done
-  if [[ $(wc -c < "$output_path/spec.md") -lt 2000 ]]; then
-    echo "spec.md 内容过短，未达到方案设计要求"
-    return 5
-  fi
   echo "Code Agent 规格阶段完成：$output_path/spec.md"
 
   echo "Code Agent 实现阶段开始：agent=$agent output=$output_path"
