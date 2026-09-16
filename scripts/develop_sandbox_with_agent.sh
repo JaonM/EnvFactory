@@ -120,6 +120,15 @@ if not isinstance(llm_mappings, list):
     raise SystemExit("tools.json 必须包含 mappings 数组")
 
 llm_names = set()
+def has_internal_annotation(value):
+    if isinstance(value, str):
+        return "role=" in value or "hidden_state" in value
+    if isinstance(value, dict):
+        return any(has_internal_annotation(item) for item in value.values())
+    if isinstance(value, list):
+        return any(has_internal_annotation(item) for item in value)
+    return False
+
 for index, tool in enumerate(llm_tools):
     if not isinstance(tool, dict) or tool.get("type") != "function":
         raise SystemExit(f"LLM 工具 {index + 1} 必须使用 type=function")
@@ -136,6 +145,8 @@ for index, tool in enumerate(llm_tools):
         raise SystemExit(f"工具 {name} 缺少 parameters.properties")
     if not isinstance(schema.get("required", []), list):
         raise SystemExit(f"工具 {name} 的 parameters.required 必须是数组")
+    if has_internal_annotation(function):
+        raise SystemExit(f"LLM 工具 {name} 不得在 description 中包含内部 role/hidden_state 标记")
     llm_names.add(name)
 
 trainer_names = set()
