@@ -188,10 +188,13 @@ for index, plan in enumerate(plans):
     if not isinstance(steps, list) or not steps:
         raise SystemExit(f"任务 action {task_action} 必须至少包含一个执行步骤")
     for step in steps:
-        if not isinstance(step, dict) or step.get("type") not in {"trainer_action", "llm_generate"}:
+        if not isinstance(step, dict) or step.get("type") not in {"tool", "llm_generate"}:
             raise SystemExit(f"任务 action {task_action} 存在无效步骤类型")
-        if step["type"] == "trainer_action" and step.get("name") not in trainer_names:
-            raise SystemExit(f"任务 action {task_action} 引用了不存在的 Trainer 动作：{step.get('name')}")
+        if step["type"] == "tool":
+            if not {"llm_tool", "trainer_action"}.issubset(step):
+                raise SystemExit(f"任务 action {task_action} 的 tool 步骤必须包含 llm_tool 和 trainer_action")
+            if step["llm_tool"] not in llm_names or step["trainer_action"] not in trainer_names:
+                raise SystemExit(f"任务 action {task_action} 引用了不存在的工具或 Trainer 动作")
     planned_actions.add(task_action)
 if planned_actions != action_names:
     missing = sorted(action_names - planned_actions)
@@ -200,16 +203,20 @@ if planned_actions != action_names:
 
 mapped_llm = set()
 for mapping in llm_mappings:
-    if not isinstance(mapping, dict) or not {"llm_tool", "trainer_actions"}.issubset(mapping):
-        raise SystemExit("每个 mappings 项必须包含 llm_tool 和 trainer_actions")
+    if not isinstance(mapping, dict) or not {"llm_tool", "trainer_action"}.issubset(mapping):
+        raise SystemExit("每个 mappings 项必须包含 llm_tool 和 trainer_action")
     if mapping["llm_tool"] in mapped_llm:
         raise SystemExit(f"LLM 工具存在重复映射：{mapping['llm_tool']}")
-    mapped_actions = mapping["trainer_actions"]
-    if mapping["llm_tool"] not in llm_names or not isinstance(mapped_actions, list) or not mapped_actions or any(name not in trainer_names for name in mapped_actions):
+    if mapping["llm_tool"] not in llm_names or mapping["trainer_action"] not in trainer_names:
         raise SystemExit(f"无效的 LLM 工具映射：{mapping}")
     mapped_llm.add(mapping["llm_tool"])
 if mapped_llm != llm_names:
     raise SystemExit("每个 LLM 工具都必须有且只有一个 Trainer action 映射")
+mapping_by_llm = {mapping["llm_tool"]: mapping["trainer_action"] for mapping in llm_mappings}
+for plan in plans:
+    for step in plan["steps"]:
+        if step.get("type") == "tool" and mapping_by_llm[step["llm_tool"]] != step["trainer_action"]:
+            raise SystemExit(f"任务 action {plan['task_action']} 的工具映射与 mappings 不一致")
 for required_name in ("ask_user",):
     if required_name in action_names and required_name not in trainer_names:
         raise SystemExit(f"tools.json 缺少 Trainer 动作：{required_name}")
