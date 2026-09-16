@@ -90,4 +90,4 @@ GET  /v1/reward
 
 每个动作都会推进离散时间，动作导致的状态修改会写入 SQLite。Agent 只能通过观测和工具结果获得允许暴露的信息，隐藏状态不会直接返回。
 
-LLM 原子工具、Trainer 原子动作、调用映射、任务 action 执行计划、参数、返回结构和 HTTP 映射位于生成工程的 `tools.json`。LLM 只使用 `llm_tools`，RL Trainer 使用 `trainer_actions`、`task_action_plans` 和 `trainer_control` 与沙箱交互。一个任务 action 可以拆成串行、并行或混合步骤；每个 LLM 工具与一个 Trainer action 严格一一对应，LLM 每执行一个工具，Trainer 就执行对应的一个 action。最终文本可以由 `llm_generate` 直接生成，不需要伪造工具调用。LLM 工具描述只保留自然语言，参数角色等内部元数据不得写入 description。
+LLM 原子工具、Trainer 原子动作、调用映射、任务 action 执行计划、参数、返回结构和 HTTP 映射位于生成工程的 `tools.json`。LLM 只使用 `llm_tools`，RL Trainer 使用 `trainer_actions`、`task_action_plans` 和 `trainer_control` 与沙箱交互。一个任务 action 可以拆成串行、并行或混合步骤；每个 LLM 工具与一个 Trainer action 严格一一对应，LLM 每执行一个工具，Trainer 就执行对应的一个 action。`llm_generate` 只是计划标记，表示 LLM 根据当前上下文直接回复，不属于 LLM tool、Trainer action 或沙箱 API。LLM 工具描述只保留自然语言，参数角色等内部元数据不得写入 description。

@@ -169,6 +169,8 @@ for index, action in enumerate(trainer_actions):
         raise SystemExit(f"Trainer 动作 {name} 的 parameters 不完整")
     if action.get("visibility") not in {"trainer", "visible", "trainer-visible"}:
         raise SystemExit(f"Trainer 动作 {name} 的 visibility 必须为 trainer/visible")
+    if action.get("action_type") == "llm_generate":
+        raise SystemExit("llm_generate 只是执行计划标记，不能出现在 trainer_actions")
     trainer_names.add(name)
 
 task = json.loads(task_path.read_text(encoding="utf-8"))
@@ -204,6 +206,8 @@ for index, plan in enumerate(plans):
                 raise SystemExit(f"任务 action {task_action} 的 tool 步骤必须包含 llm_tool 和 trainer_action")
             if step["llm_tool"] not in llm_names or step["trainer_action"] not in trainer_names:
                 raise SystemExit(f"任务 action {task_action} 引用了不存在的工具或 Trainer 动作")
+        elif set(step) - {"type", "depends_on", "parallel_group"}:
+            raise SystemExit(f"任务 action {task_action} 的 llm_generate 步骤不能包含工具参数")
     planned_actions.add(task_action)
 if planned_actions != action_names:
     missing = sorted(action_names - planned_actions)
