@@ -1,8 +1,8 @@
 # Sandbox Developer Agent Task
 
-You are the sandbox developer agent. Work only inside the current task project directory.
+You are the sandbox implementation agent. Work only inside the current task project directory.
 
-Read `task.json` first. It contains `task`, `environment`, and `metrics`. Develop a runnable RL sandbox for this exact task; do not merely wrap or replay a prebuilt generic sandbox.
+Read `task.json` and the already-approved `spec.md` first. `spec.md` was produced and checked in a previous phase; implement exactly that design and update it only if a concrete implementation constraint requires an explicit correction. Develop a runnable RL sandbox for this exact task; do not merely wrap or replay a prebuilt generic sandbox.
 
 ## Required workflow
 

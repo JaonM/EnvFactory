@@ -36,7 +36,7 @@ Code Agent 的职责是根据任务输入在独立目录中实际开发沙箱，
   --runtime docker
 ```
 
-脚本默认后台运行，使用 `--foreground` 等待完成。Agent 完成后，脚本校验 `spec.md`、包含 `llm_tools` 和 `trainer_actions` 的标准 `tools.json`、Dockerfile、Docker 构建脚本和运行脚本，并按参数构建 Docker 镜像。流程成功完成后会在沙箱工程根目录生成 `OK` 文件；该文件表示 Agent 开发、文件校验和 Docker 镜像构建（如启用）均已完成。Agent 必须自行分析任务 action 的参数需求，任务输入不会提供参数 schema；识别类动作必须区分 Agent 的预测输入和环境返回的识别结果。
+脚本默认后台运行，使用 `--foreground` 等待完成。每个任务先由规格阶段 Agent 单独生成 `spec.md`，外层脚本确认其非空后，再启动实现阶段 Agent 读取 `spec.md` 开发沙箱。实现阶段结束后，脚本校验 `tools.json`、Dockerfile、Docker 构建脚本和运行脚本，并按参数构建 Docker 镜像。流程成功完成后会在沙箱工程根目录生成 `OK` 文件；该文件表示两个 Agent 阶段、文件校验和 Docker 镜像构建（如启用）均已完成。Agent 必须自行分析任务 action 的参数需求，任务输入不会提供参数 schema；识别类动作必须区分 Agent 的预测输入和环境返回的识别结果。
 
 输入为 task list 时，使用 `--max-concurrency N` 限制同时运行的 Code Agent 数量，默认并发数为 `2`；每个任务仍使用独立目录、日志和镜像 tag。
 

@@ -93,38 +93,68 @@ index = int(sys.argv[3])
 task = source[index] if isinstance(source, list) else source
 Path(sys.argv[2]).write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
+  cp "$project_dir/docs/sandbox_spec_prompt.md" "$task_output/SPEC_TASK.md"
   cp "$project_dir/docs/sandbox_agent_prompt.md" "$task_output/AGENT_TASK.md"
+  cat >> "$task_output/SPEC_TASK.md" <<EOF
+
+## Task-specific input
+
+The complete task input is in ./task.json. The specification output must be ./spec.md.
+The project output directory is: $task_output
+EOF
   cat >> "$task_output/AGENT_TASK.md" <<EOF
 
 ## Task-specific input
 
 The complete task input is in ./task.json. Do not modify its semantics.
-The project output directory is: $task_output
+The approved specification is in ./spec.md. The project output directory is: $task_output
 EOF
 }
 
-run_agent_and_finalize() {
-  echo "Code Agent 开发开始：agent=$agent output=$output_path"
-  set +e
+run_code_agent() {
+  local phase_prompt="$1"
   case "$agent" in
     codex)
-      (cd "$output_path" && codex exec --approve-for-me "$prompt")
+      (cd "$output_path" && codex exec --approve-for-me "$phase_prompt")
       ;;
     claude)
-      (cd "$output_path" && claude --dangerously-skip-permissions --print "$prompt")
+      (cd "$output_path" && claude --dangerously-skip-permissions --print "$phase_prompt")
       ;;
     opencode)
-      (cd "$output_path" && opencode run "$prompt")
+      (cd "$output_path" && opencode run "$phase_prompt")
       ;;
     *)
       echo "不支持的 agent：${agent}；可选值为 codex、claude、opencode"
       return 2
       ;;
   esac
+}
+
+run_agent_and_finalize() {
+  echo "Code Agent 规格阶段开始：agent=$agent output=$output_path"
+  set +e
+  spec_prompt="$(<"$output_path/SPEC_TASK.md")"
+  run_code_agent "$spec_prompt"
   agent_status=$?
   set -e
   if [[ "$agent_status" -ne 0 ]]; then
-    echo "Code Agent 失败，退出码：$agent_status"
+    echo "Code Agent 规格阶段失败，退出码：$agent_status"
+    return "$agent_status"
+  fi
+  if [[ ! -s "$output_path/spec.md" ]]; then
+    echo "Code Agent 规格阶段未生成非空 spec.md"
+    return 5
+  fi
+  echo "Code Agent 规格阶段完成：$output_path/spec.md"
+
+  echo "Code Agent 实现阶段开始：agent=$agent output=$output_path"
+  prompt="$(<"$output_path/AGENT_TASK.md")"
+  set +e
+  run_code_agent "$prompt"
+  agent_status=$?
+  set -e
+  if [[ "$agent_status" -ne 0 ]]; then
+    echo "Code Agent 实现阶段失败，退出码：$agent_status"
     return "$agent_status"
   fi
 
