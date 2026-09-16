@@ -19,8 +19,8 @@ usage() {
 默认后台运行，Agent 日志写入目标目录的 agent.log。
 
 选项：
-  --input FILE       任务 JSON，默认：examples/clothing_materials_task.json
-  --output DIR       Agent 工作目录，默认：output/sandbox/agent_clothing_materials_sandbox
+  --input FILE       任务 JSON 或 JSON task list，默认：examples/clothing_materials_task.json
+  --output DIR       单任务工作目录；输入为 list 时作为输出根目录，默认：output/sandbox/agent_clothing_materials_sandbox
   --agent NAME       codex、claude 或 opencode，默认：codex
   --runtime NAME     none、docker、container 或 auto，默认：none
   --tag NAME         镜像名称，默认：env-factory-agent-sandbox
@@ -48,21 +48,52 @@ input_path="$input"
 if [[ "$input_path" != /* ]]; then input_path="$project_dir/$input_path"; fi
 output_path="$output"
 if [[ "$output_path" != /* ]]; then output_path="$project_dir/$output_path"; fi
-mkdir -p "$output_path/data"
-rm -f "$output_path/OK"
-cp "$input_path" "$output_path/task.json"
-cp "$project_dir/docs/sandbox_agent_prompt.md" "$output_path/AGENT_TASK.md"
+root_output_path="$output_path"
 
-cat >> "$output_path/AGENT_TASK.md" <<EOF
+[[ -f "$input_path" ]] || { echo "任务输入不存在：$input_path" >&2; exit 3; }
+task_count="$(python3 - "$input_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if isinstance(value, list):
+    if not value:
+        raise SystemExit("任务 JSON list 不能为空")
+    if not all(isinstance(task, dict) for task in value):
+        raise SystemExit("任务 JSON list 的每一项必须是 object")
+    print(len(value))
+elif isinstance(value, dict):
+    print(1)
+else:
+    raise SystemExit("任务输入必须是 JSON object 或 JSON list")
+PY
+)" || exit 3
+
+prepare_task() {
+  local task_index="$1"
+  local task_output="$2"
+  mkdir -p "$task_output/data"
+  rm -f "$task_output/OK"
+  python3 - "$input_path" "$task_output/task.json" "$task_index" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+index = int(sys.argv[3])
+task = source[index] if isinstance(source, list) else source
+Path(sys.argv[2]).write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+  cp "$project_dir/docs/sandbox_agent_prompt.md" "$task_output/AGENT_TASK.md"
+  cat >> "$task_output/AGENT_TASK.md" <<EOF
 
 ## Task-specific input
 
 The complete task input is in ./task.json. Do not modify its semantics.
-The project output directory is: $output_path
+The project output directory is: $task_output
 EOF
-
-prompt="$(<"$output_path/AGENT_TASK.md")"
-export project_dir input output agent runtime tag start background input_path output_path prompt
+}
 
 run_agent_and_finalize() {
   echo "Code Agent 开发开始：agent=$agent output=$output_path"
@@ -251,16 +282,16 @@ PY
       touch "$output_path/OK"
       ;;
     docker)
-      build_args=(--context "$output_path" --tag "$tag")
+      build_args=(--context "$output_path" --tag "$current_tag")
       if [[ "$start" == "true" ]]; then build_args+=(--start); fi
       "$project_dir/scripts/build_docker_sandbox_image.sh" "${build_args[@]}"
       ;;
     container)
       command -v container >/dev/null 2>&1 || { echo "未找到 container CLI"; return 6; }
-      container build --tag "$tag" "$output_path"
+      container build --tag "$current_tag" "$output_path"
       touch "$output_path/OK"
       if [[ "$start" == "true" ]]; then
-        exec container run --rm --publish 8080:8080 --mount "type=bind,source=$(cd "$output_path/data" && pwd),target=/workspace/data" "$tag"
+        exec container run --rm --publish 8080:8080 --mount "type=bind,source=$(cd "$output_path/data" && pwd),target=/workspace/data" "$current_tag"
       fi
       ;;
     *)
@@ -272,14 +303,33 @@ PY
   echo "Code Agent 已完成沙箱开发：$output_path"
 }
 
-log_file="$output_path/agent.log"
-if [[ "$background" == "true" ]]; then
-  (run_agent_and_finalize) >"$log_file" 2>&1 </dev/null &
-  pid=$!
-  echo "Code Agent 已后台启动：PID=$pid"
-  echo "日志文件：$log_file"
-  echo "查看进程：ps -p $pid"
-  echo "查看日志：tail -f $log_file"
+start_task() {
+  local task_index="$1"
+  local task_output="$2"
+  output_path="$task_output"
+  current_tag="$tag"
+  if (( task_count > 1 )); then
+    current_tag="${tag}-task-$(printf '%03d' "$((task_index + 1))")"
+  fi
+  prepare_task "$task_index" "$output_path"
+  prompt="$(<"$output_path/AGENT_TASK.md")"
+  export project_dir agent runtime start background input_path output_path prompt current_tag
+  log_file="$output_path/agent.log"
+  if [[ "$background" == "true" ]]; then
+    (run_agent_and_finalize) >"$log_file" 2>&1 </dev/null &
+    pid=$!
+    echo "Code Agent 已后台启动：task=$((task_index + 1)) PID=$pid"
+    echo "日志文件：$log_file"
+  else
+    run_agent_and_finalize
+  fi
+}
+
+if (( task_count == 1 )); then
+  start_task 0 "$output_path"
 else
-  run_agent_and_finalize
+  mkdir -p "$root_output_path"
+  for (( index = 0; index < task_count; index++ )); do
+    start_task "$index" "$root_output_path/task_$(printf '%03d' "$((index + 1))")"
+  done
 fi
