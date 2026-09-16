@@ -95,8 +95,15 @@ PY
 prepare_task() {
   local task_index="$1"
   local task_output="$2"
+  rm -f \
+    "$task_output/OK" "$task_output/status.json" "$task_output/status.json.tmp" \
+    "$task_output/agent.log" "$task_output/SPEC_TASK.md" "$task_output/AGENT_TASK.md" \
+    "$task_output/spec.md" "$task_output/tools.json" "$task_output/Dockerfile" \
+    "$task_output/docker_build.sh" "$task_output/docker_run.sh" \
+    "$task_output/acceptance.sh" "$task_output/IMPLEMENTATION_REPORT.md" \
+    "$task_output/app.py"
+  rm -rf "$task_output/data" "$task_output/tests"
   mkdir -p "$task_output/data"
-  rm -f "$task_output/OK" "$task_output/status.json" "$task_output/status.json.tmp"
   python3 - "$input_path" "$task_output/task.json" "$task_index" <<'PY'
 import json
 import sys
@@ -210,10 +217,16 @@ run_agent_and_finalize_impl() {
     echo "移除不再使用的 Containerfile：$output_path/Containerfile"
     rm -f "$output_path/Containerfile"
   fi
-  required=(spec.md tools.json Dockerfile docker_build.sh docker_run.sh)
+  required=(spec.md tools.json Dockerfile docker_build.sh docker_run.sh acceptance.sh IMPLEMENTATION_REPORT.md)
   for file in "${required[@]}"; do
     if [[ ! -f "$output_path/$file" ]]; then
       echo "Code Agent 未生成必需文件：$output_path/$file"
+      return 5
+    fi
+  done
+  for file in acceptance.sh IMPLEMENTATION_REPORT.md; do
+    if [[ ! -s "$output_path/$file" ]]; then
+      echo "Code Agent 生成的文件为空：$output_path/$file"
       return 5
     fi
   done
@@ -358,6 +371,16 @@ PY
   then
     echo "Code Agent 生成的 tools.json 不符合标准工具 schema" >&2
     return 5
+  fi
+
+  echo "执行沙箱验收脚本：$output_path/acceptance.sh"
+  set +e
+  (cd "$output_path" && bash ./acceptance.sh)
+  acceptance_status=$?
+  set -e
+  if [[ "$acceptance_status" -ne 0 ]]; then
+    echo "沙箱验收失败，退出码：$acceptance_status" >&2
+    return "$acceptance_status"
   fi
 
   case "$runtime" in

@@ -14,7 +14,7 @@ Code Agent 的职责是根据任务输入在独立目录中实际开发沙箱，
 
 该命令默认后台运行，返回 Agent PID；开发输出和后续文件校验/镜像构建日志写入目标目录的 `agent.log`。需要当前终端等待完成时，增加 `--foreground`。
 
-支持 `codex`、`claude`、`opencode`。脚本会把任务复制到 Agent 工作目录，附加开发规范，然后在该目录内调用对应 CLI。Agent 必须生成 `spec.md`、业务状态机、工具接口、奖励函数、测试和容器文件；脚本会在 Agent 返回后检查必需文件。
+支持 `codex`、`claude`、`opencode`。脚本会把任务复制到 Agent 工作目录，附加开发规范，然后在该目录内调用对应 CLI。Agent 必须生成 `spec.md`、业务状态机、工具接口、奖励函数、测试、`acceptance.sh`、`IMPLEMENTATION_REPORT.md` 和容器文件；脚本会在 Agent 返回后执行验收脚本并检查必需文件。`spec.md` 不做文本事后门禁校验，但实现必须通过基于该方案的可执行验收。
 
 对应的 Agent 命令是非交互模式：
 
@@ -36,7 +36,7 @@ Code Agent 的职责是根据任务输入在独立目录中实际开发沙箱，
   --runtime docker
 ```
 
-脚本默认后台运行，使用 `--foreground` 等待完成。每个任务先由规格阶段 Agent 单独生成 `spec.md`，外层脚本确认其非空后，再启动实现阶段 Agent 读取 `spec.md` 开发沙箱。实现阶段结束后，脚本校验 `tools.json`、Dockerfile、Docker 构建脚本和运行脚本，并按参数构建 Docker 镜像。流程成功完成后会在沙箱工程根目录生成 `OK` 文件；该文件表示两个 Agent 阶段、文件校验和 Docker 镜像构建（如启用）均已完成。Agent 必须自行分析任务 action 的参数需求，任务输入不会提供参数 schema；识别类动作必须区分 Agent 的预测输入和环境返回的识别结果。
+脚本默认后台运行，使用 `--foreground` 等待完成。每个任务先由规格阶段 Agent 单独生成 `spec.md`，外层脚本确认其非空后，再启动实现阶段 Agent 读取 `spec.md` 开发沙箱。实现阶段结束后，脚本校验 `tools.json`、Dockerfile、Docker 构建脚本、运行脚本、实现报告和验收脚本，执行 `acceptance.sh`，并按参数构建 Docker 镜像。流程成功完成后会在沙箱工程根目录生成 `OK` 和 `status.json`；它们表示两个 Agent 阶段、文件校验、行为验收和 Docker 镜像构建（如启用）均已完成。Agent 必须自行分析任务 action 的参数需求，任务输入不会提供参数 schema；识别类动作必须区分 Agent 的预测输入和环境返回的识别结果。
 
 输入为 task list 时，使用 `--max-concurrency N` 限制同时运行的 Code Agent 数量，默认并发数为 `2`；每个任务仍使用独立目录、日志和镜像 tag。
 
