@@ -117,8 +117,13 @@ if not isinstance(trainer_actions, list) or not trainer_actions:
     raise SystemExit("tools.json 必须包含非空 trainer_actions 数组")
 
 llm_mappings = payload.get("mappings") if isinstance(payload, dict) else None
-if not isinstance(llm_mappings, list):
-    raise SystemExit("tools.json 必须包含 mappings 数组")
+if isinstance(llm_mappings, dict):
+    llm_mappings = [
+        {"llm_tool": llm_tool, "trainer_action": trainer_action}
+        for llm_tool, trainer_action in llm_mappings.items()
+    ]
+elif not isinstance(llm_mappings, list):
+    raise SystemExit("tools.json 必须包含 mappings 对象或数组")
 
 llm_names = set()
 def has_internal_annotation(value):
@@ -162,10 +167,8 @@ for index, action in enumerate(trainer_actions):
         raise SystemExit(f"Trainer 动作 {name} 的 parameters 必须是 object schema")
     if not isinstance(schema.get("properties"), dict) or not isinstance(schema.get("required", []), list):
         raise SystemExit(f"Trainer 动作 {name} 的 parameters 不完整")
-    if schema.get("additionalProperties") is not False:
-        raise SystemExit(f"Trainer 动作 {name} 必须设置 additionalProperties=false")
-    if action.get("visibility") != "trainer":
-        raise SystemExit(f"Trainer 动作 {name} 的 visibility 必须为 trainer")
+    if action.get("visibility") not in {"trainer", "visible", "trainer-visible"}:
+        raise SystemExit(f"Trainer 动作 {name} 的 visibility 必须为 trainer/visible")
     trainer_names.add(name)
 
 task = json.loads(task_path.read_text(encoding="utf-8"))
@@ -175,8 +178,14 @@ action_names = {
     if item.get("type") == "action"
 }
 plans = payload.get("task_action_plans") if isinstance(payload, dict) else None
-if not isinstance(plans, list):
-    raise SystemExit("tools.json 必须包含 task_action_plans 数组")
+if isinstance(plans, dict):
+    plans = [
+        {"task_action": task_action, **plan}
+        for task_action, plan in plans.items()
+        if isinstance(plan, dict)
+    ]
+elif not isinstance(plans, list):
+    raise SystemExit("tools.json 必须包含 task_action_plans 对象或数组")
 planned_actions = set()
 for index, plan in enumerate(plans):
     if not isinstance(plan, dict) or not {"task_action", "steps"}.issubset(plan):
