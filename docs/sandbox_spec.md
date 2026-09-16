@@ -73,6 +73,37 @@
 
 LLM 工具必须通过 `trainer_action` 字段或根级 `mappings` 映射到可执行动作。任务输入中的 `action` 只声明动作名称，不声明参数。Agent 必须结合动作描述、状态转移规则和终止条件推导参数，并在业务代码、测试和两套接口定义中保持一致。
 
+### 参数设计原则
+
+参数不是动作描述中所有名词的简单罗列。Agent 应先判断字段角色：
+
+- `selector/input`：Agent 已经知道、用于选择对象或提供证据的输入，例如 `clothing_id`、`basis`。
+- `claim/guess`：Agent 为获得奖励而提交的预测，例如 `predicted_material`；环境用隐藏真值校验它。
+- `result`：环境执行后返回的识别结果，不应作为识别动作的必填输入。
+- `hidden_ground_truth`：只存在于环境内部，不能进入 LLM 工具或 Trainer 动作的输入 schema。
+
+以“识别衣物材质”为例，推荐将动作设计为预测提交：
+
+```json
+{
+  "name": "identify_material",
+  "description": "根据衣物标签或描述提交材质判断",
+  "trainer_action": "identify_material",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "clothing_id": {"type": "integer", "description": "待识别衣物的 ID"},
+      "predicted_material": {"type": "string", "description": "Agent 判断的材质"},
+      "basis": {"type": "string", "description": "作出判断所依据的标签或描述"}
+    },
+    "required": ["clothing_id", "predicted_material"],
+    "additionalProperties": false
+  }
+}
+```
+
+这里 `predicted_material` 是 Agent 的提交内容，不是环境真值。环境应从隐藏业务数据读取真实材质，比较两者后返回验证结果和奖励。若动作语义是“查看/读取材质”而非“提交判断”，则输入只需要 `clothing_id`，材质应作为环境返回结果；不能为了填充 schema 再要求 Agent 输入材质。
+
 隐藏状态、转移规则、终止条件和内部业务数据不会出现在初始观测中。
 
 ## 持久化
