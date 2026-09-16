@@ -10,6 +10,7 @@ runtime="none"
 tag="env-factory-agent-sandbox"
 start="false"
 background="true"
+max_concurrency="2"
 
 usage() {
   cat <<'EOF'
@@ -24,6 +25,7 @@ usage() {
   --agent NAME       codex、claude 或 opencode，默认：codex
   --runtime NAME     none、docker、container 或 auto，默认：none
   --tag NAME         镜像名称，默认：env-factory-agent-sandbox
+  --max-concurrency N 并发开发任务数，默认：2
   --start            构建后立即启动容器，默认：不启动
   --foreground       前台等待 Agent 完成，默认：后台运行
   -h, --help         显示帮助
@@ -37,12 +39,18 @@ while [[ $# -gt 0 ]]; do
     --agent) agent="$2"; shift 2 ;;
     --runtime) runtime="$2"; shift 2 ;;
     --tag) tag="$2"; shift 2 ;;
+    --max-concurrency) max_concurrency="$2"; shift 2 ;;
     --start) start="true"; shift ;;
     --foreground) background="false"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if ! [[ "$max_concurrency" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--max-concurrency 必须是正整数：$max_concurrency" >&2
+  exit 2
+fi
 
 input_path="$input"
 if [[ "$input_path" != /* ]]; then input_path="$project_dir/$input_path"; fi
@@ -318,6 +326,7 @@ start_task() {
   if [[ "$background" == "true" ]]; then
     (run_agent_and_finalize) >"$log_file" 2>&1 </dev/null &
     pid=$!
+    task_pids+=("$pid")
     echo "Code Agent 已后台启动：task=$((task_index + 1)) PID=$pid"
     echo "日志文件：$log_file"
   else
@@ -325,11 +334,29 @@ start_task() {
   fi
 }
 
+task_pids=()
+wait_for_task_slot() {
+  while (( ${#task_pids[@]} >= max_concurrency )); do
+    pid="${task_pids[0]}"
+    set +e
+    wait "$pid"
+    task_status=$?
+    set -e
+    task_pids=("${task_pids[@]:1}")
+    if [[ "$task_status" -ne 0 ]]; then
+      echo "后台任务结束但未成功：PID=${pid}，退出码=${task_status}" >&2
+    fi
+  done
+}
+
 if (( task_count == 1 )); then
   start_task 0 "$output_path"
 else
   mkdir -p "$root_output_path"
   for (( index = 0; index < task_count; index++ )); do
+    if [[ "$background" == "true" ]]; then
+      wait_for_task_slot
+    fi
     start_task "$index" "$root_output_path/task_$(printf '%03d' "$((index + 1))")"
   done
 fi
