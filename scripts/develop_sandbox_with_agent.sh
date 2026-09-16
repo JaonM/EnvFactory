@@ -97,7 +97,7 @@ prepare_task() {
   local task_output="$2"
   rm -f \
     "$task_output/OK" "$task_output/status.json" "$task_output/status.json.tmp" \
-    "$task_output/agent.log" "$task_output/SPEC_TASK.md" "$task_output/AGENT_TASK.md" \
+    "$task_output/agent.log" "$task_output/TASK_PROMPT.md" "$task_output/SPEC_TASK.md" "$task_output/AGENT_TASK.md" \
     "$task_output/spec.md" "$task_output/tools.json" "$task_output/Dockerfile" \
     "$task_output/docker_build.sh" "$task_output/docker_run.sh" \
     "$task_output/acceptance.sh" "$task_output/IMPLEMENTATION_REPORT.md" \
@@ -114,29 +114,21 @@ index = int(sys.argv[3])
 task = source[index] if isinstance(source, list) else source
 Path(sys.argv[2]).write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
-  cp "$project_dir/docs/sandbox_spec_prompt.md" "$task_output/SPEC_TASK.md"
-  cp "$project_dir/docs/sandbox_spec_prompt.md" "$task_output/AGENT_TASK.md"
-  cat >> "$task_output/SPEC_TASK.md" <<EOF
+  write_task_prompt "phase1" "$task_output"
+}
 
-## Task-specific input
+write_task_prompt() {
+  local phase="$1"
+  local task_output="$2"
+  cp "$project_dir/docs/sandbox_spec_prompt.md" "$task_output/TASK_PROMPT.md"
+  cat >> "$task_output/TASK_PROMPT.md" <<EOF
 
 The complete task input is in ./task.json. The specification output must be ./spec.md.
 The project output directory is: $task_output
 
 ## Active phase
 
-Phase 1 is active. Write only ./spec.md and do not implement code, tests, tools, HTTP handlers, or Docker files.
-EOF
-  cat >> "$task_output/AGENT_TASK.md" <<EOF
-
-## Task-specific input
-
-The complete task input is in ./task.json. Do not modify its semantics.
-The approved specification is in ./spec.md. The project output directory is: $task_output
-
-## Active phase
-
-Phase 2 is active. Read ./spec.md and implement the complete sandbox now. Do not regenerate the specification unless a concrete implementation constraint requires a documented correction.
+$(if [[ "$phase" == "phase1" ]]; then echo "Phase 1 is active. Write only ./spec.md and do not implement code, tests, tools, HTTP handlers, or Docker files."; else echo "Phase 2 is active. Read ./spec.md and implement the complete sandbox now. Do not regenerate the specification unless a concrete implementation constraint requires a documented correction."; fi)
 EOF
 }
 
@@ -188,7 +180,7 @@ PY
 run_agent_and_finalize_impl() {
   echo "Code Agent 规格阶段开始：agent=$agent output=$output_path"
   set +e
-  spec_prompt="$(<"$output_path/SPEC_TASK.md")"
+  spec_prompt="$(<"$output_path/TASK_PROMPT.md")"
   run_code_agent "$spec_prompt"
   agent_status=$?
   set -e
@@ -203,7 +195,8 @@ run_agent_and_finalize_impl() {
   echo "Code Agent 规格阶段完成：$output_path/spec.md"
 
   echo "Code Agent 实现阶段开始：agent=$agent output=$output_path"
-  prompt="$(<"$output_path/AGENT_TASK.md")"
+  write_task_prompt "phase2" "$output_path"
+  prompt="$(<"$output_path/TASK_PROMPT.md")"
   set +e
   run_code_agent "$prompt"
   agent_status=$?
@@ -423,7 +416,7 @@ start_task() {
     current_tag="${tag}-task-$(printf '%03d' "$((task_index + 1))")"
   fi
   prepare_task "$task_index" "$output_path"
-  prompt="$(<"$output_path/AGENT_TASK.md")"
+  prompt="$(<"$output_path/TASK_PROMPT.md")"
   export project_dir agent runtime start background input_path output_path prompt current_tag
   log_file="$output_path/agent.log"
   if [[ "$background" == "true" ]]; then
