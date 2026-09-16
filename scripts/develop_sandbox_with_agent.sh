@@ -34,12 +34,21 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --input) input="$2"; shift 2 ;;
-    --output) output="$2"; shift 2 ;;
-    --agent) agent="$2"; shift 2 ;;
-    --runtime) runtime="$2"; shift 2 ;;
-    --tag) tag="$2"; shift 2 ;;
-    --max-concurrency) max_concurrency="$2"; shift 2 ;;
+    --input|--output|--agent|--runtime|--tag|--max-concurrency)
+      if (( $# < 2 )); then
+        echo "$1 需要提供参数值" >&2
+        exit 2
+      fi
+      case "$1" in
+        --input) input="$2" ;;
+        --output) output="$2" ;;
+        --agent) agent="$2" ;;
+        --runtime) runtime="$2" ;;
+        --tag) tag="$2" ;;
+        --max-concurrency) max_concurrency="$2" ;;
+      esac
+      shift 2
+      ;;
     --start) start="true"; shift ;;
     --foreground) background="false"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -49,6 +58,11 @@ done
 
 if ! [[ "$max_concurrency" =~ ^[1-9][0-9]*$ ]]; then
   echo "--max-concurrency 必须是正整数：$max_concurrency" >&2
+  exit 2
+fi
+
+if [[ "$start" == "true" && "$runtime" != "docker" ]]; then
+  echo "--start 仅在 --runtime docker 时可用" >&2
   exit 2
 fi
 
@@ -82,7 +96,7 @@ prepare_task() {
   local task_index="$1"
   local task_output="$2"
   mkdir -p "$task_output/data"
-  rm -f "$task_output/OK"
+  rm -f "$task_output/OK" "$task_output/status.json" "$task_output/status.json.tmp"
   python3 - "$input_path" "$task_output/task.json" "$task_index" <<'PY'
 import json
 import sys
@@ -138,7 +152,33 @@ run_code_agent() {
   esac
 }
 
-run_agent_and_finalize() {
+write_status() {
+  local status="$1"
+  local exit_code="$2"
+  local message="${3:-}"
+  python3 - "$output_path/status.json" "$status" "$exit_code" "$message" "$agent" "$runtime" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = {
+    "status": sys.argv[2],
+    "success": sys.argv[2] == "success",
+    "exit_code": int(sys.argv[3]),
+    "message": sys.argv[4],
+    "agent": sys.argv[5],
+    "runtime": sys.argv[6],
+    "finished_at": datetime.now(timezone.utc).isoformat(),
+}
+tmp = path.with_name(path.name + ".tmp")
+tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+tmp.replace(path)
+PY
+}
+
+run_agent_and_finalize_impl() {
   echo "Code Agent 规格阶段开始：agent=$agent output=$output_path"
   set +e
   spec_prompt="$(<"$output_path/SPEC_TASK.md")"
@@ -292,14 +332,18 @@ if planned_actions != action_names:
     raise SystemExit(f"task_action_plans 覆盖不完整，缺少={missing}，多余={extra}")
 
 mapped_llm = set()
+mapped_trainer = set()
 for mapping in llm_mappings:
     if not isinstance(mapping, dict) or not {"llm_tool", "trainer_action"}.issubset(mapping):
         raise SystemExit("每个 mappings 项必须包含 llm_tool 和 trainer_action")
     if mapping["llm_tool"] in mapped_llm:
         raise SystemExit(f"LLM 工具存在重复映射：{mapping['llm_tool']}")
+    if mapping["trainer_action"] in mapped_trainer:
+        raise SystemExit(f"Trainer 动作存在重复映射：{mapping['trainer_action']}")
     if mapping["llm_tool"] not in llm_names or mapping["trainer_action"] not in trainer_names:
         raise SystemExit(f"无效的 LLM 工具映射：{mapping}")
     mapped_llm.add(mapping["llm_tool"])
+    mapped_trainer.add(mapping["trainer_action"])
 if mapped_llm != llm_names:
     raise SystemExit("每个 LLM 工具都必须有且只有一个 Trainer action 映射")
 mapping_by_llm = {mapping["llm_tool"]: mapping["trainer_action"] for mapping in llm_mappings}
@@ -334,6 +378,19 @@ PY
   echo "Code Agent 已完成沙箱开发：$output_path"
 }
 
+run_agent_and_finalize() {
+  set +e
+  run_agent_and_finalize_impl
+  local exit_code=$?
+  set -e
+  if [[ "$exit_code" -eq 0 ]]; then
+    write_status "success" "$exit_code" "沙箱环境构建成功"
+  else
+    write_status "failed" "$exit_code" "沙箱环境构建失败，请查看 agent.log"
+  fi
+  return "$exit_code"
+}
+
 start_task() {
   local task_index="$1"
   local task_output="$2"
@@ -358,6 +415,7 @@ start_task() {
 }
 
 task_pids=()
+background_failures=0
 wait_for_task_slot() {
   while (( ${#task_pids[@]} >= max_concurrency )); do
     pid="${task_pids[0]}"
@@ -368,8 +426,24 @@ wait_for_task_slot() {
     task_pids=("${task_pids[@]:1}")
     if [[ "$task_status" -ne 0 ]]; then
       echo "后台任务结束但未成功：PID=${pid}，退出码=${task_status}" >&2
+      background_failures=1
     fi
   done
+}
+
+wait_for_all_tasks() {
+  local pid task_status
+  for pid in "${task_pids[@]}"; do
+    set +e
+    wait "$pid"
+    task_status=$?
+    set -e
+    if [[ "$task_status" -ne 0 ]]; then
+      echo "后台任务结束但未成功：PID=${pid}，退出码=${task_status}" >&2
+      background_failures=1
+    fi
+  done
+  return "$background_failures"
 }
 
 if (( task_count == 1 )); then
@@ -382,4 +456,7 @@ else
     fi
     start_task "$index" "$root_output_path/task_$(printf '%03d' "$((index + 1))")"
   done
+  if [[ "$background" == "true" ]]; then
+    wait_for_all_tasks
+  fi
 fi
