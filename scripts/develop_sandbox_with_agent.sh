@@ -94,13 +94,17 @@ task = source[index] if isinstance(source, list) else source
 Path(sys.argv[2]).write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
   cp "$project_dir/docs/sandbox_spec_prompt.md" "$task_output/SPEC_TASK.md"
-  cp "$project_dir/docs/sandbox_agent_prompt.md" "$task_output/AGENT_TASK.md"
+  cp "$project_dir/docs/sandbox_spec_prompt.md" "$task_output/AGENT_TASK.md"
   cat >> "$task_output/SPEC_TASK.md" <<EOF
 
 ## Task-specific input
 
 The complete task input is in ./task.json. The specification output must be ./spec.md.
 The project output directory is: $task_output
+
+## Active phase
+
+Phase 1 is active. Write only ./spec.md and do not implement code, tests, tools, HTTP handlers, or Docker files.
 EOF
   cat >> "$task_output/AGENT_TASK.md" <<EOF
 
@@ -108,6 +112,10 @@ EOF
 
 The complete task input is in ./task.json. Do not modify its semantics.
 The approved specification is in ./spec.md. The project output directory is: $task_output
+
+## Active phase
+
+Phase 2 is active. Read ./spec.md and implement the complete sandbox now. Do not regenerate the specification unless a concrete implementation constraint requires a documented correction.
 EOF
 }
 

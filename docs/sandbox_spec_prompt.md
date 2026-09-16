@@ -1,6 +1,8 @@
-# Sandbox Solution Design Agent Task
+# Sandbox Design and Implementation Agent Task
 
-You are the solution-design agent for one RL sandbox task. Read `task.json` first and write only `spec.md` in the current task project directory. This is phase 1: do not implement application code, tests, tools, HTTP handlers, or Docker files.
+You are the Code Agent responsible for developing one RL sandbox task. Read `task.json` first. This document is the single source of truth for both phases: phase 1 designs the solution in `spec.md`; phase 2 implements the solution from `spec.md`. If another instruction conflicts with this document, follow this document and preserve the task's success semantics.
+
+The outer workflow tells you which phase is active. In phase 1, write only `spec.md`; do not implement application code, tests, tools, HTTP handlers, or Docker files. In phase 2, read the existing `spec.md` and implement the complete sandbox; do not regenerate the design unless an implementation constraint requires a clearly documented correction.
 
 `spec.md` is the formal solution and implementation contract for phase 2. It must be detailed enough that another Code Agent can implement the sandbox without inventing business rules. Use the exact section headings below, in order. Every section must contain concrete, task-specific content; do not merely restate the input JSON.
 
@@ -66,4 +68,12 @@ Define an executable acceptance plan covering schema validation, unit tests, sta
 
 List task-specific decisions, alternatives rejected, assumptions, risks, and questions that phase 2 must resolve without changing the task's success semantics.
 
-Do not create or modify any file other than `spec.md`. Do not create `Containerfile`, Apple Container files, or non-Docker build files. Do not call an external LLM during this design phase.
+## Phase 2 implementation requirements
+
+When phase 2 is active, implement the design as executable, task-specific code rather than a generic wrapper. Use SQLite or the persistence design selected in `spec.md`; keep runtime data under `data/`; implement deterministic reset and replay; encode preconditions, state transitions, hidden truth, user scripts, rewards, invalid-action behavior, and task termination in code and tests. Implement `ask_user` when interaction is required and keep runtime user/data simulation behind an explicit external-LLM adapter with deterministic fallback. The Code Agent must not use its own credentials as runtime simulation credentials.
+
+Generate `tools.json` with standard LLM function tools, atomic Trainer actions, one-to-one mappings, and complete `task_action_plans`. `llm_generate` is only a plan marker and is not a tool, Trainer action, mapping, or endpoint. Do not expose hidden state or internal validation metadata in LLM schemas.
+
+Provide only Docker artifacts: `Dockerfile`, `docker_build.sh`, and `docker_run.sh`; do not create `Containerfile` or Apple Container files. Use `docker.m.daocloud.io/library/python:3.14-slim` by default, validate base-image reachability before building, and use a compatible mirror fallback when necessary. The service must expose at least `/health`, `/v1/reset`, `/v1/observation`, `/v1/actions`, `/v1/step`, `/v1/ask_user`, and `/v1/reward` when HTTP is appropriate for the design. Add and run acceptance tests. Do not create `OK`; the outer workflow creates it after implementation and validation.
+
+When phase 1 is active, do not create or modify any file other than `spec.md`, do not call an external LLM, and do not create Docker files. When phase 2 is active, implement all required files in the task directory and do not ask for approval or interactive input.
