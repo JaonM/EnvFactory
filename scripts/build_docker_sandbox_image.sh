@@ -49,6 +49,7 @@ if [[ "$dockerfile" != /* ]]; then dockerfile="$(pwd)/$dockerfile"; fi
 [[ -d "$context" ]] || { echo "构建上下文不存在：$context" >&2; exit 3; }
 [[ -f "$dockerfile" ]] || { echo "Dockerfile 不存在：$dockerfile" >&2; exit 3; }
 command -v docker >/dev/null 2>&1 || { echo "未找到 docker CLI" >&2; exit 4; }
+rm -f "$context/OK"
 
 from_image="$(awk 'toupper($1) == "FROM" {print $2; exit}' "$dockerfile")"
 if [[ -z "$from_image" ]]; then
@@ -112,6 +113,8 @@ awk -v image="$selected" '
 ' "$dockerfile" > "$resolved_dockerfile"
 
 docker build --file "$resolved_dockerfile" --tag "$tag" "$context"
+# The marker is written only after the image build succeeds.
+touch "$context/OK"
 if [[ "$start" == "true" ]]; then
   exec docker run --rm --publish 8080:8080 \
     --mount "type=bind,source=$(cd "$context/data" && pwd),target=/workspace/data" \

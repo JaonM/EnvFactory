@@ -49,6 +49,7 @@ if [[ "$input_path" != /* ]]; then input_path="$project_dir/$input_path"; fi
 output_path="$output"
 if [[ "$output_path" != /* ]]; then output_path="$project_dir/$output_path"; fi
 mkdir -p "$output_path/data"
+rm -f "$output_path/OK"
 cp "$input_path" "$output_path/task.json"
 cp "$project_dir/docs/sandbox_agent_prompt.md" "$output_path/AGENT_TASK.md"
 
@@ -202,7 +203,9 @@ PY
   fi
 
   case "$runtime" in
-    none) ;;
+    none)
+      touch "$output_path/OK"
+      ;;
     docker)
       build_args=(--context "$output_path" --tag "$tag")
       if [[ "$start" == "true" ]]; then build_args+=(--start); fi
@@ -211,6 +214,7 @@ PY
     container)
       command -v container >/dev/null 2>&1 || { echo "未找到 container CLI"; return 6; }
       container build --tag "$tag" "$output_path"
+      touch "$output_path/OK"
       if [[ "$start" == "true" ]]; then
         exec container run --rm --publish 8080:8080 --mount "type=bind,source=$(cd "$output_path/data" && pwd),target=/workspace/data" "$tag"
       fi
@@ -220,6 +224,7 @@ PY
       return 2
       ;;
   esac
+  echo "沙箱构建完成标记：$output_path/OK"
   echo "Code Agent 已完成沙箱开发：$output_path"
 }
 
