@@ -23,7 +23,7 @@ usage() {
   --input FILE       任务 JSON 或 JSON task list，默认：examples/clothing_materials_task.json
   --output DIR       单任务工作目录；输入为 list 时作为输出根目录，默认：output/sandbox/agent_clothing_materials_sandbox
   --agent NAME       codex、claude 或 opencode，默认：codex
-  --runtime NAME     none、docker、container 或 auto，默认：none
+  --runtime NAME     none 或 docker，默认：none
   --tag NAME         镜像名称，默认：env-factory-agent-sandbox
   --max-concurrency N 并发开发任务数，默认：2
   --start            构建后立即启动容器，默认：不启动
@@ -132,7 +132,7 @@ run_agent_and_finalize() {
     echo "移除不再使用的 Containerfile：$output_path/Containerfile"
     rm -f "$output_path/Containerfile"
   fi
-  required=(spec.md tools.json Dockerfile docker_build.sh docker_run.sh container_build.sh container_run.sh)
+  required=(spec.md tools.json Dockerfile docker_build.sh docker_run.sh)
   for file in "${required[@]}"; do
     if [[ ! -f "$output_path/$file" ]]; then
       echo "Code Agent 未生成必需文件：$output_path/$file"
@@ -278,13 +278,6 @@ PY
     return 5
   fi
 
-  if [[ "$runtime" == "auto" ]]; then
-    if command -v container >/dev/null 2>&1; then runtime="container"
-    elif command -v docker >/dev/null 2>&1; then runtime="docker"
-    else echo "未找到 container 或 docker CLI"; return 6
-    fi
-  fi
-
   case "$runtime" in
     none)
       touch "$output_path/OK"
@@ -294,16 +287,8 @@ PY
       if [[ "$start" == "true" ]]; then build_args+=(--start); fi
       "$project_dir/scripts/build_docker_sandbox_image.sh" "${build_args[@]}"
       ;;
-    container)
-      command -v container >/dev/null 2>&1 || { echo "未找到 container CLI"; return 6; }
-      container build --tag "$current_tag" "$output_path"
-      touch "$output_path/OK"
-      if [[ "$start" == "true" ]]; then
-        exec container run --rm --publish 8080:8080 --mount "type=bind,source=$(cd "$output_path/data" && pwd),target=/workspace/data" "$current_tag"
-      fi
-      ;;
     *)
-      echo "不支持的 runtime：$runtime；可选值为 none、docker、container、auto"
+      echo "不支持的 runtime：$runtime；可选值为 none、docker"
       return 2
       ;;
   esac
