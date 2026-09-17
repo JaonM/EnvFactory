@@ -280,8 +280,12 @@ for index, tool in enumerate(llm_tools):
 
 trainer_names = set()
 for index, action in enumerate(trainer_actions):
-    if not isinstance(action, dict) or not {"name", "action_type", "description", "parameters"}.issubset(action):
-        raise SystemExit(f"trainer_actions 第 {index + 1} 项缺少标准字段")
+    required_action_fields = {"name", "action_type", "description", "parameters"}
+    if not isinstance(action, dict):
+        raise SystemExit(f"trainer_actions 第 {index + 1} 项必须是 object")
+    missing_action_fields = sorted(required_action_fields - set(action))
+    if missing_action_fields:
+        raise SystemExit(f"trainer_actions 第 {index + 1} 项缺少字段：{', '.join(missing_action_fields)}")
     name = action["name"]
     schema = action["parameters"]
     if not isinstance(name, str) or not name or name in trainer_names:
