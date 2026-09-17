@@ -98,7 +98,7 @@ prepare_task() {
   rm -f \
     "$task_output/OK" "$task_output/status.json" "$task_output/status.json.tmp" \
     "$task_output/agent.log" "$task_output/TASK_PROMPT.md" "$task_output/SPEC_TASK.md" "$task_output/AGENT_TASK.md" \
-    "$task_output/spec.md" "$task_output/tools.json" "$task_output/Dockerfile" \
+    "$task_output/spec.md" "$task_output/action_plan.json" "$task_output/tools.json" "$task_output/Dockerfile" \
     "$task_output/docker_build.sh" "$task_output/docker_run.sh" \
     "$task_output/acceptance.sh" "$task_output/IMPLEMENTATION_REPORT.md" \
     "$task_output/app.py"
@@ -123,12 +123,12 @@ write_task_prompt() {
   cp "$project_dir/docs/sandbox_spec_prompt.md" "$task_output/TASK_PROMPT.md"
   cat >> "$task_output/TASK_PROMPT.md" <<EOF
 
-The complete task input is in ./task.json. The specification output must be ./spec.md.
+The complete task input is in ./task.json. The specification output must be ./spec.md and ./action_plan.json.
 The project output directory is: $task_output
 
 ## Active phase
 
-$(if [[ "$phase" == "phase1" ]]; then echo "Phase 1 is active. Write only ./spec.md and do not implement code, tests, tools, HTTP handlers, or Docker files."; else echo "Phase 2 is active. Read ./spec.md and implement the complete sandbox now. Do not regenerate the specification unless a concrete implementation constraint requires a documented correction."; fi)
+$(if [[ "$phase" == "phase1" ]]; then echo "Phase 1 is active. Write only ./spec.md and ./action_plan.json; do not implement code, tests, tools, HTTP handlers, or Docker files."; else echo "Phase 2 is active. Read ./spec.md and ./action_plan.json and implement the complete sandbox now. Do not regenerate the design unless a concrete implementation constraint requires a documented correction."; fi)
 EOF
 }
 
@@ -177,21 +177,89 @@ tmp.replace(path)
 PY
 }
 
+validate_action_plan() {
+  python3 - "$output_path/action_plan.json" "$output_path/task.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+task = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+if not isinstance(plan, dict) or not isinstance(plan.get("actions"), list) or not plan["actions"]:
+    raise SystemExit("action_plan.json 必须包含非空 actions 数组")
+task_actions = {
+    item.get("field") for item in task.get("environment", [])
+    if item.get("type") == "action" and isinstance(item.get("field"), str)
+}
+seen_actions = set()
+public_tools = set()
+for index, action in enumerate(plan["actions"], 1):
+    if not isinstance(action, dict):
+        raise SystemExit(f"action_plan.actions 第 {index} 项必须是 object")
+    name = action.get("task_action")
+    if not isinstance(name, str) or not name or name in seen_actions:
+        raise SystemExit(f"action_plan.actions 第 {index} 项 task_action 无效或重复")
+    if name not in task_actions:
+        raise SystemExit(f"action_plan 引用了不存在的 task action：{name}")
+    if action.get("classification") not in {"atomic", "composite"}:
+        raise SystemExit(f"action_plan action {name} 必须声明 atomic 或 composite")
+    steps = action.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise SystemExit(f"action_plan action {name} 必须包含非空 steps")
+    for step_index, step in enumerate(steps, 1):
+        if not isinstance(step, dict) or step.get("kind") not in {"public_llm_tool", "internal", "llm_generate"}:
+            raise SystemExit(f"action_plan action {name} 的第 {step_index} 步 kind 无效")
+        if step["kind"] == "public_llm_tool":
+            tool_name = step.get("tool_name")
+            if not isinstance(tool_name, str) or not tool_name:
+                raise SystemExit(f"action_plan action {name} 的公开工具步骤缺少 tool_name")
+            if tool_name in public_tools:
+                raise SystemExit(f"action_plan 中公开工具重复：{tool_name}")
+            public_tools.add(tool_name)
+    seen_actions.add(name)
+if seen_actions != task_actions:
+    raise SystemExit(f"action_plan 未覆盖全部 task action：缺少={sorted(task_actions-seen_actions)}")
+print("action_plan validation: ok")
+PY
+}
+
 run_agent_and_finalize_impl() {
   echo "Code Agent 规格阶段开始：agent=$agent output=$output_path"
-  set +e
   spec_prompt="$(<"$output_path/TASK_PROMPT.md")"
-  run_code_agent "$spec_prompt"
-  agent_status=$?
-  set -e
-  if [[ "$agent_status" -ne 0 ]]; then
-    echo "Code Agent 规格阶段失败，退出码：$agent_status"
-    return "$agent_status"
-  fi
-  if [[ ! -s "$output_path/spec.md" ]]; then
-    echo "Code Agent 规格阶段未生成非空 spec.md"
-    return 5
-  fi
+  for phase1_attempt in 1 2 3; do
+    if [[ "$phase1_attempt" -eq 1 ]]; then
+      phase1_prompt="$spec_prompt"
+    else
+      phase1_prompt="$(cat <<EOF
+上一轮生成的 action_plan.json 未通过外部校验：
+$plan_error
+
+请只修正 spec.md 和 action_plan.json，严格按任务 action 重新分析原子/复合动作、公开 LLM Tool、串行/并行依赖，并重新保存文件。不要报告完成，先修复后结束。
+EOF
+)"
+    fi
+    set +e
+    run_code_agent "$phase1_prompt"
+    agent_status=$?
+    set -e
+    if [[ "$agent_status" -eq 0 && -s "$output_path/spec.md" && -s "$output_path/action_plan.json" ]]; then
+      set +e
+      plan_error="$(validate_action_plan 2>&1)"
+      plan_status=$?
+      set -e
+      if [[ "$plan_status" -eq 0 ]]; then
+        break
+      fi
+    else
+      plan_error="Code Agent 规格阶段退出码为 $agent_status，或未生成 spec.md/action_plan.json"
+      plan_status=1
+    fi
+    if [[ "$phase1_attempt" -eq 3 ]]; then
+      echo "规格阶段连续 3 次未通过：$plan_error"
+      return 5
+    fi
+    echo "规格方案校验失败，准备让 Code Agent 第 $((phase1_attempt + 1)) 次修复：$plan_error"
+  done
   echo "Code Agent 规格阶段完成：$output_path/spec.md"
 
   echo "Code Agent 实现阶段开始：agent=$agent output=$output_path"
@@ -224,15 +292,16 @@ run_agent_and_finalize_impl() {
     fi
   done
 
-  validation_error_file="$(mktemp "${TMPDIR:-/tmp}/sandbox-tools-validation.XXXXXX")"
-  set +e
-  python3 - "$output_path/tools.json" "$output_path/task.json" 2>"$validation_error_file" <<'PY'
+  for tools_attempt in 1 2 3; do
+    validation_error_file="$(mktemp "${TMPDIR:-/tmp}/sandbox-tools-validation.XXXXXX")"
+    set +e
+    python3 - "$output_path/tools.json" "$output_path/action_plan.json" 2>"$validation_error_file" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 tools_path = Path(sys.argv[1])
-task_path = Path(sys.argv[2])
+plan_path = Path(sys.argv[2])
 payload = json.loads(tools_path.read_text(encoding="utf-8"))
 llm_tools = payload.get("llm_tools") if isinstance(payload, dict) else None
 if not isinstance(llm_tools, list) or not llm_tools:
@@ -268,16 +337,49 @@ for index, tool in enumerate(llm_tools):
         raise SystemExit(f"LLM 工具 {name} 不得在 description 中包含内部 role/hidden_state 标记")
     llm_names.add(name)
 
+plan = json.loads(plan_path.read_text(encoding="utf-8"))
+public_tools = {
+    step.get("tool_name")
+    for action in plan.get("actions", [])
+    for step in action.get("steps", [])
+    if step.get("kind") == "public_llm_tool"
+}
+if public_tools != llm_names:
+    raise SystemExit(
+        f"llm_tools 与 action_plan.json 的公开工具不一致："
+        f"缺少={sorted(public_tools - llm_names)}，多余={sorted(llm_names - public_tools)}"
+    )
+
 PY
-  validation_status=$?
-  set -e
-  if [[ "$validation_status" -ne 0 ]]; then
+    validation_status=$?
+    set -e
+    if [[ "$validation_status" -eq 0 ]]; then
+      rm -f "$validation_error_file"
+      break
+    fi
     validation_detail="$(<"$validation_error_file")"
     rm -f "$validation_error_file"
-    echo "Code Agent 生成的 tools.json 校验失败：$validation_detail" >&2
-    return 5
-  fi
-  rm -f "$validation_error_file"
+    if [[ "$tools_attempt" -eq 3 ]]; then
+      echo "tools.json 连续 3 次校验失败：$validation_detail" >&2
+      return 5
+    fi
+    echo "tools.json 校验失败，准备让 Code Agent 第 $((tools_attempt + 1)) 次修复：$validation_detail" >&2
+    repair_prompt="$(cat <<EOF
+上一轮实现生成的 tools.json 未通过外部校验：
+$validation_detail
+
+请读取 ./spec.md 和 ./action_plan.json，只修复实现产物。确保 llm_tools 的公开工具集合严格等于 action_plan.json 中 kind=public_llm_tool 的 tool_name 集合，且每个 LLM tool 使用标准 function schema。不要把 task_action、trainer_actions、mappings 或 task_action_plans 的格式当作本次校验目标；修复后重新运行 acceptance.sh。
+EOF
+)"
+    set +e
+    run_code_agent "$repair_prompt"
+    repair_status=$?
+    set -e
+    if [[ "$repair_status" -ne 0 ]]; then
+      echo "Code Agent tools.json 修复阶段失败，退出码：$repair_status" >&2
+      return "$repair_status"
+    fi
+  done
 
   echo "执行沙箱验收脚本：$output_path/acceptance.sh"
   set +e
