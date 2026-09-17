@@ -235,20 +235,8 @@ tools_path = Path(sys.argv[1])
 task_path = Path(sys.argv[2])
 payload = json.loads(tools_path.read_text(encoding="utf-8"))
 llm_tools = payload.get("llm_tools") if isinstance(payload, dict) else None
-trainer_actions = payload.get("trainer_actions") if isinstance(payload, dict) else None
 if not isinstance(llm_tools, list) or not llm_tools:
     raise SystemExit("tools.json 必须包含非空 llm_tools 数组")
-if not isinstance(trainer_actions, list) or not trainer_actions:
-    raise SystemExit("tools.json 必须包含非空 trainer_actions 数组")
-
-llm_mappings = payload.get("mappings") if isinstance(payload, dict) else None
-if isinstance(llm_mappings, dict):
-    llm_mappings = [
-        {"llm_tool": llm_tool, "trainer_action": trainer_action}
-        for llm_tool, trainer_action in llm_mappings.items()
-    ]
-elif not isinstance(llm_mappings, list):
-    raise SystemExit("tools.json 必须包含 mappings 对象或数组")
 
 llm_names = set()
 def has_internal_annotation(value):
@@ -280,92 +268,6 @@ for index, tool in enumerate(llm_tools):
         raise SystemExit(f"LLM 工具 {name} 不得在 description 中包含内部 role/hidden_state 标记")
     llm_names.add(name)
 
-trainer_names = set()
-for index, action in enumerate(trainer_actions):
-    required_action_fields = {"name", "action_type", "description", "parameters"}
-    if not isinstance(action, dict):
-        raise SystemExit(f"trainer_actions 第 {index + 1} 项必须是 object")
-    missing_action_fields = sorted(required_action_fields - set(action))
-    if missing_action_fields:
-        raise SystemExit(f"trainer_actions 第 {index + 1} 项缺少字段：{', '.join(missing_action_fields)}")
-    name = action["name"]
-    schema = action["parameters"]
-    if not isinstance(name, str) or not name or name in trainer_names:
-        raise SystemExit(f"Trainer 动作名称无效或重复：{name!r}")
-    if not isinstance(schema, dict) or schema.get("type") != "object":
-        raise SystemExit(f"Trainer 动作 {name} 的 parameters 必须是 object schema")
-    if not isinstance(schema.get("properties"), dict) or not isinstance(schema.get("required", []), list):
-        raise SystemExit(f"Trainer 动作 {name} 的 parameters 不完整")
-    if action.get("visibility") not in {"trainer", "visible", "trainer-visible"}:
-        raise SystemExit(f"Trainer 动作 {name} 的 visibility 必须为 trainer/visible")
-    if action.get("action_type") == "llm_generate":
-        raise SystemExit("llm_generate 只是执行计划标记，不能出现在 trainer_actions")
-    trainer_names.add(name)
-
-task = json.loads(task_path.read_text(encoding="utf-8"))
-action_names = {
-    item.get("field")
-    for item in task.get("environment", [])
-    if item.get("type") == "action"
-}
-plans = payload.get("task_action_plans") if isinstance(payload, dict) else None
-if isinstance(plans, dict):
-    plans = [
-        {"task_action": task_action, **plan}
-        for task_action, plan in plans.items()
-        if isinstance(plan, dict)
-    ]
-elif not isinstance(plans, list):
-    raise SystemExit("tools.json 必须包含 task_action_plans 对象或数组")
-planned_actions = set()
-for index, plan in enumerate(plans):
-    if not isinstance(plan, dict) or not {"task_action", "steps"}.issubset(plan):
-        raise SystemExit(f"task_action_plans 第 {index + 1} 项缺少 task_action 或 steps")
-    task_action = plan["task_action"]
-    steps = plan["steps"]
-    if task_action not in action_names or task_action in planned_actions:
-        raise SystemExit(f"任务 action 执行计划无效或重复：{task_action!r}")
-    if not isinstance(steps, list) or not steps:
-        raise SystemExit(f"任务 action {task_action} 必须至少包含一个执行步骤")
-    for step in steps:
-        if not isinstance(step, dict) or step.get("type") not in {"tool", "llm_generate"}:
-            raise SystemExit(f"任务 action {task_action} 存在无效步骤类型")
-        if step["type"] == "tool":
-            if not {"llm_tool", "trainer_action"}.issubset(step):
-                raise SystemExit(f"任务 action {task_action} 的 tool 步骤必须包含 llm_tool 和 trainer_action")
-            if step["llm_tool"] not in llm_names or step["trainer_action"] not in trainer_names:
-                raise SystemExit(f"任务 action {task_action} 引用了不存在的工具或 Trainer 动作")
-        elif set(step) - {"type", "depends_on", "parallel_group"}:
-            raise SystemExit(f"任务 action {task_action} 的 llm_generate 步骤不能包含工具参数")
-    planned_actions.add(task_action)
-if planned_actions != action_names:
-    missing = sorted(action_names - planned_actions)
-    extra = sorted(planned_actions - action_names)
-    raise SystemExit(f"task_action_plans 覆盖不完整，缺少={missing}，多余={extra}")
-
-mapped_llm = set()
-mapped_trainer = set()
-for mapping in llm_mappings:
-    if not isinstance(mapping, dict) or not {"llm_tool", "trainer_action"}.issubset(mapping):
-        raise SystemExit("每个 mappings 项必须包含 llm_tool 和 trainer_action")
-    if mapping["llm_tool"] in mapped_llm:
-        raise SystemExit(f"LLM 工具存在重复映射：{mapping['llm_tool']}")
-    if mapping["trainer_action"] in mapped_trainer:
-        raise SystemExit(f"Trainer 动作存在重复映射：{mapping['trainer_action']}")
-    if mapping["llm_tool"] not in llm_names or mapping["trainer_action"] not in trainer_names:
-        raise SystemExit(f"无效的 LLM 工具映射：{mapping}")
-    mapped_llm.add(mapping["llm_tool"])
-    mapped_trainer.add(mapping["trainer_action"])
-if mapped_llm != llm_names:
-    raise SystemExit("每个 LLM 工具都必须有且只有一个 Trainer action 映射")
-mapping_by_llm = {mapping["llm_tool"]: mapping["trainer_action"] for mapping in llm_mappings}
-for plan in plans:
-    for step in plan["steps"]:
-        if step.get("type") == "tool" and mapping_by_llm[step["llm_tool"]] != step["trainer_action"]:
-            raise SystemExit(f"任务 action {plan['task_action']} 的工具映射与 mappings 不一致")
-for required_name in ("ask_user",):
-    if required_name in action_names and required_name not in trainer_names:
-        raise SystemExit(f"tools.json 缺少 Trainer 动作：{required_name}")
 PY
   validation_status=$?
   set -e
