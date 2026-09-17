@@ -12,7 +12,7 @@ Restate the task, task type, complexity, uncertainty, expected interaction style
 
 ## 2. Requirement decomposition and implementation logic
 
-Decompose the task into implementable requirements. For each requirement specify: preconditions, inputs, business logic, reads, writes, time cost, LLM tools, corresponding Trainer actions, success result, rejection/invalid-action result, failure behavior, and acceptance tests. Include a dependency graph that explicitly identifies serial, parallel, and mixed execution; do not assume one high-level action equals one tool.
+Decompose the task into implementable requirements. For each requirement specify: preconditions, inputs, business logic, reads, writes, time cost, LLM tools, corresponding Trainer actions, success result, rejection/invalid-action result, failure behavior, and acceptance tests. Before listing tools, analyze every `environment.action` as a semantic milestone: classify it as atomic or composite, explain why, and break composite actions into observable atomic steps. For every step specify its inputs, outputs, state/persistence effects, time cost, and whether it is an LLM tool call, a Trainer action, an environment-internal operation, or direct `llm_generate`. Include an explicit dependency graph that identifies serial, parallel, and mixed execution, including fan-out and join points. A high-level action may remain directly mapped to one LLM tool and one Trainer action when the analysis proves it is truly atomic; direct copying of all action names without this analysis is invalid.
 
 ## 3. Data model and persistence design
 
@@ -32,7 +32,7 @@ Use real wall-clock timestamps and durations, not an abstract integer time count
 
 ## 7. LLM tools, Trainer actions, and action-chain design
 
-Define LLM-facing tools using the standard function schema: `{"type":"function","function":{"name":"...","description":"...","parameters":{"type":"object","properties":{},"required":[]}}}`.
+Define LLM-facing tools using the standard function schema: `{"type":"function","function":{"name":"...","description":"...","parameters":{"type":"object","properties":{},"required":[]}}}`. Generate the tool list from the action decomposition, not by copying the task action list. Include an action-decomposition table or graph in this section with columns `task_action`, `atomic_step`, `step_type`, `llm_tool`, `trainer_action`, `depends_on`, `parallel_group`, `inputs`, `outputs`, and `state_effects`. A task action that is proven atomic may use its own name as the tool name; a composite action must expose each required atomic tool separately and may end with `llm_generate` without a tool call.
 
 Tools must expose only inputs the LLM can know or provide; do not put hidden truth, predicted answers as required inputs, or internal `role=` annotations into the public schema. Define Trainer-facing atomic actions separately, with exact parameters, preconditions, effects, time cost, observation changes, persistence writes, and errors. Each LLM tool maps to exactly one Trainer action, and each tool call causes the Trainer to execute that corresponding action. Represent high-level action plans as serial/parallel/mixed chains. `llm_generate` is only an internal plan marker meaning the LLM can reply from context; it is not an LLM tool, Trainer action, mapping, or endpoint.
 
