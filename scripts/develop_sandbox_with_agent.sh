@@ -207,7 +207,7 @@ for index, action in enumerate(plan["actions"], 1):
     if not isinstance(steps, list) or not steps:
         raise SystemExit(f"action_plan action {name} 必须包含非空 steps")
     for step_index, step in enumerate(steps, 1):
-        if not isinstance(step, dict) or step.get("kind") not in {"public_llm_tool", "internal", "llm_generate"}:
+        if not isinstance(step, dict) or step.get("kind") not in {"public_llm_tool", "llm_generate"}:
             raise SystemExit(f"action_plan action {name} 的第 {step_index} 步 kind 无效")
         if step["kind"] == "public_llm_tool":
             tool_name = step.get("tool_name")
