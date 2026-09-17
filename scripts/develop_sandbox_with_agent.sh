@@ -224,7 +224,9 @@ run_agent_and_finalize_impl() {
     fi
   done
 
-  if ! python3 - "$output_path/tools.json" "$output_path/task.json" <<'PY'
+  validation_error_file="$(mktemp "${TMPDIR:-/tmp}/sandbox-tools-validation.XXXXXX")"
+  set +e
+  python3 - "$output_path/tools.json" "$output_path/task.json" 2>"$validation_error_file" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -365,10 +367,15 @@ for required_name in ("ask_user",):
     if required_name in action_names and required_name not in trainer_names:
         raise SystemExit(f"tools.json 缺少 Trainer 动作：{required_name}")
 PY
-  then
-    echo "Code Agent 生成的 tools.json 不符合标准工具 schema" >&2
+  validation_status=$?
+  set -e
+  if [[ "$validation_status" -ne 0 ]]; then
+    validation_detail="$(<"$validation_error_file")"
+    rm -f "$validation_error_file"
+    echo "Code Agent 生成的 tools.json 校验失败：$validation_detail" >&2
     return 5
   fi
+  rm -f "$validation_error_file"
 
   echo "执行沙箱验收脚本：$output_path/acceptance.sh"
   set +e
