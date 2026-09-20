@@ -20,12 +20,12 @@ usage() {
 默认后台运行，Agent 日志写入目标目录的 agent.log。
 
 选项：
-  --input FILE       任务 JSON 或 JSON task list，默认：examples/clothing_materials_task.json
+  --input PATH       任务 JSON、JSON task list 或包含 task-N/task.json 的 artifacts 目录，默认：examples/clothing_materials_task.json
   --output DIR       单任务工作目录；输入为 list 时作为输出根目录，默认：output/sandbox/agent_clothing_materials_sandbox
   --agent NAME       codex、claude 或 opencode，默认：codex
   --runtime NAME     none 或 docker，默认：none
   --tag NAME         镜像名称，默认：env-factory-agent-sandbox
-  --max-concurrency N 并发开发任务数，默认：2
+  --max-concurrency N 并发任务数，默认：2
   --start            构建后立即启动容器，默认：不启动
   --foreground       前台等待 Agent 完成，默认：后台运行
   -h, --help         显示帮助
@@ -70,8 +70,45 @@ input_path="$input"
 if [[ "$input_path" != /* ]]; then input_path="$project_dir/$input_path"; fi
 output_path="$output"
 if [[ "$output_path" != /* ]]; then output_path="$project_dir/$output_path"; fi
+# 规范化用户传入的目录，避免 --output xxx/ 与后续 /agent.log 等路径拼接产生双斜杠。
+if [[ "$output_path" != "/" ]]; then output_path="${output_path%/}"; fi
 root_output_path="$output_path"
+temporary_input=""
+cleanup_temporary_input() {
+  if [[ -n "$temporary_input" ]]; then
+    rm -f "$temporary_input"
+  fi
+}
+trap cleanup_temporary_input EXIT
 
+if [[ -d "$input_path" ]]; then
+  if [[ -f "$input_path/task.json" ]]; then
+    input_path="$input_path/task.json"
+  else
+    task_json_candidates=()
+    while IFS= read -r candidate; do task_json_candidates+=("$candidate"); done < <(find "$input_path" -mindepth 2 -maxdepth 2 -type f -name task.json -print)
+    if (( ${#task_json_candidates[@]} == 0 )); then
+      echo "--input 目录必须直接包含 task.json，或包含一个或多个 task-N/task.json：$input_path" >&2
+      exit 3
+    elif (( ${#task_json_candidates[@]} == 1 )); then
+      input_path="${task_json_candidates[0]}"
+    else
+      temporary_input="$(mktemp "${TMPDIR:-/tmp}/envfactory-task-list.XXXXXX.json")"
+      python3 - "$temporary_input" "${task_json_candidates[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+destination = Path(sys.argv[1])
+tasks = [json.loads(Path(item).read_text(encoding="utf-8")) for item in sys.argv[2:]]
+if not all(isinstance(task, dict) for task in tasks):
+    raise SystemExit("任务目录中的 task.json 必须都是 JSON object")
+destination.write_text(json.dumps(tasks, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
+      input_path="$temporary_input"
+    fi
+  fi
+fi
 [[ -f "$input_path" ]] || { echo "任务输入不存在：$input_path" >&2; exit 3; }
 task_count="$(python3 - "$input_path" <<'PY'
 import json
@@ -97,23 +134,97 @@ prepare_task() {
   local task_output="$2"
   rm -f \
     "$task_output/OK" "$task_output/status.json" "$task_output/status.json.tmp" \
-    "$task_output/agent.log" "$task_output/TASK_PROMPT.md" "$task_output/SPEC_TASK.md" "$task_output/AGENT_TASK.md" \
-    "$task_output/spec.md" "$task_output/action_plan.json" "$task_output/tools.json" "$task_output/Dockerfile" \
+    "$task_output/agent.log" \
+    "$task_output/TASK_PROMPT.md" "$task_output/SPEC_TASK.md" "$task_output/AGENT_TASK.md" \
+    "$task_output/BUILD_CONTRACT.json" \
+    "$task_output/spec.md" "$task_output/action_plan.json" "$task_output/development_plan.json" "$task_output/tools.json" "$task_output/Dockerfile" \
     "$task_output/docker_build.sh" "$task_output/docker_run.sh" \
     "$task_output/acceptance.sh" "$task_output/IMPLEMENTATION_REPORT.md" \
     "$task_output/app.py"
   rm -rf "$task_output/data" "$task_output/tests"
   mkdir -p "$task_output/data"
-  python3 - "$input_path" "$task_output/task.json" "$task_index" <<'PY'
+  python3 - "$input_path" "$task_output/task.json" "$task_index" "$project_dir" "$task_output" <<'PY'
 import json
+import shutil
 import sys
 from pathlib import Path
 
 source = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 index = int(sys.argv[3])
 task = source[index] if isinstance(source, list) else source
+project_dir = Path(sys.argv[4])
+task_output = Path(sys.argv[5])
+artifacts = task.get("artifacts") if isinstance(task, dict) else None
+if isinstance(artifacts, dict):
+    def copy_manifest(key, destination_name):
+        manifest = artifacts.get(key)
+        if not isinstance(manifest, dict) or not manifest.get("root"):
+            return
+        source_root = Path(str(manifest["root"]))
+        if not source_root.is_absolute():
+            source_root = project_dir / source_root
+        if not source_root.is_dir():
+            raise SystemExit(f"{key} 目录不存在：{source_root}")
+        destination = task_output / "data" / destination_name
+        shutil.copytree(source_root, destination, dirs_exist_ok=True)
+        rewritten = dict(manifest)
+        rewritten["root"] = f"data/{destination_name}"
+        artifacts[key] = rewritten
+        return rewritten
+
+    data_manifest = copy_manifest("data_manifest", "business_data")
+    user_manifest = copy_manifest("user_simulation_manifest", "user_simulation")
+    task["artifacts"] = artifacts
+    for item in task.get("environment", []):
+        if isinstance(item, dict) and item.get("type") == "business_data_manifest" and data_manifest:
+            item["value"] = data_manifest
 Path(sys.argv[2]).write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
+  python3 - "$task_output/task.json" "$task_output/BUILD_CONTRACT.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+task = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+requirements = task.get("requirements", {})
+actions = task.get("actions", [])
+metrics = task.get("metrics", [])
+if not isinstance(requirements, dict) or not isinstance(actions, list) or not isinstance(metrics, list):
+    raise SystemExit("任务缺少 requirements、actions 或 metrics")
+action_names = [item.get("name") for item in actions if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"]]
+obligations = [
+    {"id": "platform.persistence", "kind": "platform", "required": True},
+    {"id": "platform.tool_schema", "kind": "platform", "required": True},
+    {"id": "platform.hidden_truth_isolation", "kind": "platform", "required": True},
+    {"id": "platform.user_simulator", "kind": "platform", "required": True},
+    {"id": "platform.reward_interface", "kind": "platform", "required": True},
+    *[{"id": f"task_action.{name}", "kind": "task_action", "required": True} for name in action_names],
+    {"id": "evaluation.reward_and_termination", "kind": "evaluation", "required": True},
+]
+contract = {
+    "schema_version": "1.0",
+    "authority": "env_factory_outer_workflow",
+    "mutable_by_code_agent": False,
+    "obligations": obligations,
+    "requirements": requirements,
+    "platform": {
+        "persistence": {"required": True, "episode_isolation": True},
+        "tool_schema": "openai_function",
+        "tool_trainer_action_mapping": "one_to_one",
+        "hidden_truth_isolation": True,
+        "runtime_credentials": "external_only",
+        "user_simulator": {"required": True, "only_trigger": "ask_user"},
+        "reward_interface": {"required": True},
+    },
+    "task_actions": actions,
+    "capabilities": [{"id": "external_model_boundary", "required": True, "detected": True}],
+    "evaluation": {"metric_ids": [item.get("id") for item in metrics if isinstance(item, dict) and item.get("id")]},
+}
+Path(sys.argv[2]).write_text(
+    json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+)
+PY
+  chmod 444 "$task_output/BUILD_CONTRACT.json"
   write_task_prompt "phase1" "$task_output"
 }
 
@@ -123,12 +234,16 @@ write_task_prompt() {
   cp "$project_dir/docs/sandbox_spec_prompt.md" "$task_output/TASK_PROMPT.md"
   cat >> "$task_output/TASK_PROMPT.md" <<EOF
 
-The complete task input is in ./task.json. The specification output must be ./spec.md and ./action_plan.json.
+The complete task input is in ./task.json. The immutable outer-workflow contract is in ./BUILD_CONTRACT.json; it is generated during task generation and must be treated as authoritative. Phase 1 produces ./spec.md. Phase 2 implements the complete sandbox directly from ./spec.md.
 The project output directory is: $task_output
 
 ## Active phase
 
-$(if [[ "$phase" == "phase1" ]]; then echo "Phase 1 is active. Write only ./spec.md and ./action_plan.json; do not implement code, tests, tools, HTTP handlers, or Docker files."; else echo "Phase 2 is active. Read ./spec.md and ./action_plan.json and implement the complete sandbox now. Do not regenerate the design unless a concrete implementation constraint requires a documented correction."; fi)
+$(if [[ "$phase" == "phase1" ]]; then
+  echo "Phase 1 is active. Read ./task.json and ./BUILD_CONTRACT.json and write only ./spec.md. The spec must explicitly cover every BUILD_CONTRACT obligation and include each obligation id literally in the relevant section; do not weaken or replace the contract. Do not create action_plan.json, development_plan.json, code, tests, tools, HTTP handlers, Docker files, or development-plan files."
+elif [[ "$phase" == "phase2" ]]; then
+  echo "Phase 2 is active. Read ./spec.md, ./task.json, and ./BUILD_CONTRACT.json, then implement the complete sandbox in one pass. Treat spec.md as the authoritative implementation design and preserve every BUILD_CONTRACT obligation. Generate the complete runnable project, including persistence, business data loading, user simulator, Trainer actions, observations, rewards, standard tools.json, tests, acceptance.sh, IMPLEMENTATION_REPORT.md, Dockerfile, docker_build.sh, and docker_run.sh. Do not create action_plan.json or development_plan.json. Do not stop at a demo or plan: write the implementation and run its checks before finishing."
+fi)
 EOF
 }
 
@@ -136,13 +251,13 @@ run_code_agent() {
   local phase_prompt="$1"
   case "$agent" in
     codex)
-      (cd "$output_path" && codex exec --approve-for-me "$phase_prompt")
+      (cd "$output_path" && codex exec --approve-for-me "$phase_prompt") </dev/null
       ;;
     claude)
-      (cd "$output_path" && claude --dangerously-skip-permissions --print "$phase_prompt")
+      (cd "$output_path" && claude --dangerously-skip-permissions --print "$phase_prompt") </dev/null
       ;;
     opencode)
-      (cd "$output_path" && opencode run "$phase_prompt")
+      (cd "$output_path" && opencode run "$phase_prompt") </dev/null
       ;;
     *)
       echo "不支持的 agent：${agent}；可选值为 codex、claude、opencode"
@@ -171,224 +286,254 @@ payload = {
     "runtime": sys.argv[6],
     "finished_at": datetime.now(timezone.utc).isoformat(),
 }
+
 tmp = path.with_name(path.name + ".tmp")
 tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 tmp.replace(path)
 PY
 }
 
-validate_action_plan() {
-  python3 - "$output_path/action_plan.json" "$output_path/task.json" <<'PY'
+validate_spec_contract() {
+  python3 - "$output_path/spec.md" "$output_path/BUILD_CONTRACT.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-task = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-if not isinstance(plan, dict) or not isinstance(plan.get("actions"), list) or not plan["actions"]:
-    raise SystemExit("action_plan.json 必须包含非空 actions 数组")
-task_actions = {
-    item.get("field") for item in task.get("environment", [])
-    if item.get("type") == "action" and isinstance(item.get("field"), str)
-}
-seen_actions = set()
-public_tools = set()
-for index, action in enumerate(plan["actions"], 1):
-    if not isinstance(action, dict):
-        raise SystemExit(f"action_plan.actions 第 {index} 项必须是 object")
-    name = action.get("task_action")
-    if not isinstance(name, str) or not name or name in seen_actions:
-        raise SystemExit(f"action_plan.actions 第 {index} 项 task_action 无效或重复")
-    if name not in task_actions:
-        raise SystemExit(f"action_plan 引用了不存在的 task action：{name}")
-    if action.get("classification") not in {"atomic", "composite"}:
-        raise SystemExit(f"action_plan action {name} 必须声明 atomic 或 composite")
-    steps = action.get("steps")
-    if not isinstance(steps, list) or not steps:
-        raise SystemExit(f"action_plan action {name} 必须包含非空 steps")
-    for step_index, step in enumerate(steps, 1):
-        if not isinstance(step, dict) or step.get("kind") not in {"public_llm_tool", "llm_generate"}:
-            raise SystemExit(f"action_plan action {name} 的第 {step_index} 步 kind 无效")
-        if step["kind"] == "public_llm_tool":
-            tool_name = step.get("tool_name")
-            if not isinstance(tool_name, str) or not tool_name:
-                raise SystemExit(f"action_plan action {name} 的公开工具步骤缺少 tool_name")
-            if tool_name in public_tools:
-                raise SystemExit(f"action_plan 中公开工具重复：{tool_name}")
-            public_tools.add(tool_name)
-    seen_actions.add(name)
-if seen_actions != task_actions:
-    raise SystemExit(f"action_plan 未覆盖全部 task action：缺少={sorted(task_actions-seen_actions)}")
-print("action_plan validation: ok")
+spec = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+contract = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+obligations = contract.get("obligations", [])
+missing = [item["id"] for item in obligations if item.get("required", True) and item["id"] not in spec]
+if missing:
+    raise SystemExit("spec 未覆盖 BUILD_CONTRACT obligations：" + ", ".join(missing))
+for action in contract.get("task_actions", []):
+    name = action.get("name")
+    if not isinstance(name, str) or name not in spec:
+        raise SystemExit(f"spec 未覆盖结构化 task action：{name}")
+print("spec contract validation: ok")
 PY
+}
+
+validate_spec_implementation() {
+  python3 - "$output_path/spec.md" "$output_path/task.json" "$output_path/tools.json" "$output_path/BUILD_CONTRACT.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+spec_path, task_path, tools_path, contract_path = map(Path, sys.argv[1:])
+spec = spec_path.read_text(encoding="utf-8", errors="replace")
+task = json.loads(task_path.read_text(encoding="utf-8"))
+tools = json.loads(tools_path.read_text(encoding="utf-8"))
+contract = json.loads(contract_path.read_text(encoding="utf-8"))
+
+if len(spec.strip()) < 1000:
+    raise SystemExit("spec.md 过短，未形成可执行的详细实现规格")
+required_topics = {
+    "data": ("数据模型", "持久化", "业务数据"),
+    "simulator": ("user simulator", "用户模拟", "用户剧本"),
+    "tools": ("工具", "Trainer action", "Trainer Action"),
+    "reward": ("奖励", "reward", "观测"),
+    "acceptance": ("验收", "acceptance", "测试"),
+    "runtime": ("Docker", "运行时", "API"),
+}
+for topic, markers in required_topics.items():
+    if not any(marker in spec for marker in markers):
+        raise SystemExit(f"spec.md 缺少实现主题：{topic}")
+
+actions = []
+action_sources = []
+if isinstance(task, dict):
+    action_sources.extend(task.get("actions", []))
+    action_sources.extend(task.get("environment", []))
+for item in action_sources:
+    if isinstance(item, dict) and item.get("type") == "action":
+        name = item.get("name") or item.get("field") or item.get("value")
+        if isinstance(name, str) and name and name not in actions:
+            actions.append(name)
+missing_actions = [name for name in actions if name not in spec]
+if missing_actions:
+    raise SystemExit("spec.md 未覆盖任务动作：" + ", ".join(missing_actions))
+
+if not isinstance(tools, list) or not tools:
+    raise SystemExit("tools.json 必须是非空的顶层 Function Tool 数组")
+names = set()
+def check_schema(schema, location):
+    if not isinstance(schema, dict):
+        raise SystemExit(f"工具参数 {location} schema 必须是 object")
+    if not isinstance(schema.get("description"), str) or not schema["description"].strip():
+        raise SystemExit(f"工具参数 {location} 缺少 description")
+    if schema.get("type") == "object":
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            raise SystemExit(f"工具参数 {location}.properties 必须是 object")
+        required = schema.get("required", [])
+        if not isinstance(required, list) or any(key not in properties for key in required):
+            raise SystemExit(f"工具参数 {location}.required 无效")
+        for key, value in properties.items():
+            check_schema(value, f"{location}.{key}")
+    elif schema.get("type") == "array" and "items" in schema:
+        check_schema(schema["items"], f"{location}[]")
+
+for index, tool in enumerate(tools, 1):
+    if not isinstance(tool, dict) or tool.get("type") != "function":
+        raise SystemExit(f"tools.json 第 {index} 项不是标准 function tool")
+    function = tool.get("function")
+    if not isinstance(function, dict):
+        raise SystemExit(f"tools.json 第 {index} 项缺少 function")
+    name = function.get("name")
+    if not isinstance(name, str) or not name or name in names:
+        raise SystemExit(f"tools.json 工具名无效或重复：{name!r}")
+    if not isinstance(function.get("description"), str) or not function["description"].strip():
+        raise SystemExit(f"工具 {name} 缺少 function.description")
+    parameters = function.get("parameters")
+    if not isinstance(parameters, dict) or parameters.get("type") != "object":
+        raise SystemExit(f"工具 {name} 的 parameters 必须是 object schema")
+    if not isinstance(parameters.get("properties"), dict):
+        raise SystemExit(f"工具 {name} 缺少 parameters.properties")
+    for key, value in parameters["properties"].items():
+        check_schema(value, f"{name}.{key}")
+    names.add(name)
+    if name not in spec:
+        raise SystemExit(f"spec.md 未定义实现工具：{name}")
+
+required_obligations = {
+    item.get("id") for item in contract.get("obligations", [])
+    if item.get("required", True) and item.get("id")
+}
+missing_obligations = sorted(item for item in required_obligations if item not in spec)
+if missing_obligations:
+    raise SystemExit("spec.md 未覆盖 required obligations：" + ", ".join(missing_obligations))
+print("spec implementation validation: ok")
+PY
+}
+
+required_sandbox_files=(
+  spec.md tools.json Dockerfile docker_build.sh docker_run.sh
+  acceptance.sh IMPLEMENTATION_REPORT.md
+)
+
+validate_delivery() {
+  local missing=()
+  local file
+  for file in "${required_sandbox_files[@]}"; do
+    [[ -s "$output_path/$file" ]] || missing+=("$file")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    echo "Code Agent 未生成必需文件：${missing[*]}"
+    return 1
+  fi
+
+  local legacy=()
+  for file in action_plan.json development_plan.json; do
+    [[ -e "$output_path/$file" ]] && legacy+=("$file")
+  done
+  if (( ${#legacy[@]} > 0 )); then
+    echo "生成了已废弃的拓扑产物：${legacy[*]}"
+    return 1
+  fi
+
+  local acceptance_log acceptance_status
+  acceptance_log="$(mktemp "${TMPDIR:-/tmp}/sandbox-acceptance.XXXXXX")"
+  set +e
+  (cd "$output_path" && bash ./acceptance.sh) >"$acceptance_log" 2>&1
+  acceptance_status=$?
+  set -e
+  if [[ "$acceptance_status" -ne 0 ]]; then
+    echo "沙箱验收失败，退出码：$acceptance_status"
+    cat "$acceptance_log"
+    rm -f "$acceptance_log"
+    return "$acceptance_status"
+  fi
+  rm -f "$acceptance_log"
+  validate_spec_implementation
 }
 
 run_agent_and_finalize_impl() {
   echo "Code Agent 规格阶段开始：agent=$agent output=$output_path"
   spec_prompt="$(<"$output_path/TASK_PROMPT.md")"
-  for phase1_attempt in 1 2 3; do
-    if [[ "$phase1_attempt" -eq 1 ]]; then
-      phase1_prompt="$spec_prompt"
-    else
-      phase1_prompt="$(cat <<EOF
-上一轮生成的 action_plan.json 未通过外部校验：
-$plan_error
-
-请只修正 spec.md 和 action_plan.json，严格按任务 action 重新分析原子/复合动作、公开 LLM Tool、串行/并行依赖，并重新保存文件。不要报告完成，先修复后结束。
-EOF
-)"
-    fi
+  for spec_attempt in 1 2 3; do
     set +e
-    run_code_agent "$phase1_prompt"
+    run_code_agent "$spec_prompt"
     agent_status=$?
     set -e
-    if [[ "$agent_status" -eq 0 && -s "$output_path/spec.md" && -s "$output_path/action_plan.json" ]]; then
+    if [[ "$agent_status" -eq 0 && -s "$output_path/spec.md" ]]; then
       set +e
-      plan_error="$(validate_action_plan 2>&1)"
-      plan_status=$?
+      spec_contract_error="$(validate_spec_contract 2>&1)"
+      spec_contract_status=$?
       set -e
-      if [[ "$plan_status" -eq 0 ]]; then
+      if [[ "$spec_contract_status" -eq 0 ]]; then
         break
       fi
     else
-      plan_error="Code Agent 规格阶段退出码为 $agent_status，或未生成 spec.md/action_plan.json"
-      plan_status=1
+      spec_contract_status=1
+      spec_contract_error="Code Agent 未生成 spec.md，退出码：$agent_status"
     fi
-    if [[ "$phase1_attempt" -eq 3 ]]; then
-      echo "规格阶段连续 3 次未通过：$plan_error"
+    if [[ "$spec_attempt" -eq 3 ]]; then
+      echo "规格阶段连续 3 次未通过：$spec_contract_error" >&2
       return 5
     fi
-    echo "规格方案校验失败，准备让 Code Agent 第 $((phase1_attempt + 1)) 次修复：$plan_error"
+    echo "规格未通过外层契约校验，将错误发送给同一 Code Agent 重试：$spec_contract_error" >&2
+    spec_prompt="$(cat <<EOF
+$spec_prompt
+
+上一轮生成的 spec.md 未通过 BUILD_CONTRACT 校验：
+$spec_contract_error
+
+请只修复 spec.md，逐项覆盖 ./BUILD_CONTRACT.json 中所有 required obligations，并在相关章节中原样写出 obligation id。不要修改 BUILD_CONTRACT.json，也不要生成其他文件。
+EOF
+)"
   done
   echo "Code Agent 规格阶段完成：$output_path/spec.md"
 
-  echo "Code Agent 实现阶段开始：agent=$agent output=$output_path"
   write_task_prompt "phase2" "$output_path"
-  prompt="$(<"$output_path/TASK_PROMPT.md")"
-  set +e
-  run_code_agent "$prompt"
-  agent_status=$?
-  set -e
-  if [[ "$agent_status" -ne 0 ]]; then
-    echo "Code Agent 实现阶段失败，退出码：$agent_status"
-    return "$agent_status"
-  fi
+  implementation_prompt="$(<"$output_path/TASK_PROMPT.md")"
+  implementation_error=""
+  implementation_succeeded="false"
+  for implementation_attempt in 1 2 3; do
+    attempt_prompt="$implementation_prompt"
+    if [[ "$implementation_attempt" -gt 1 ]]; then
+      attempt_prompt="$(cat <<EOF
+$implementation_prompt
 
-  if [[ -f "$output_path/Containerfile" ]]; then
-    echo "移除不再使用的 Containerfile：$output_path/Containerfile"
-    rm -f "$output_path/Containerfile"
-  fi
-  required=(spec.md tools.json Dockerfile docker_build.sh docker_run.sh acceptance.sh IMPLEMENTATION_REPORT.md)
-  for file in "${required[@]}"; do
-    if [[ ! -f "$output_path/$file" ]]; then
-      echo "Code Agent 未生成必需文件：$output_path/$file"
-      return 5
-    fi
-  done
-  for file in acceptance.sh IMPLEMENTATION_REPORT.md; do
-    if [[ ! -s "$output_path/$file" ]]; then
-      echo "Code Agent 生成的文件为空：$output_path/$file"
-      return 5
-    fi
-  done
+上一轮一次性开发未通过外层检查，必须根据以下实际错误继续修复当前沙箱，不能只解释问题：
+$implementation_error
 
-  for tools_attempt in 1 2 3; do
-    validation_error_file="$(mktemp "${TMPDIR:-/tmp}/sandbox-tools-validation.XXXXXX")"
-    set +e
-    python3 - "$output_path/tools.json" "$output_path/action_plan.json" 2>"$validation_error_file" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-tools_path = Path(sys.argv[1])
-plan_path = Path(sys.argv[2])
-payload = json.loads(tools_path.read_text(encoding="utf-8"))
-llm_tools = payload.get("llm_tools") if isinstance(payload, dict) else None
-if not isinstance(llm_tools, list) or not llm_tools:
-    raise SystemExit("tools.json 必须包含非空 llm_tools 数组")
-
-llm_names = set()
-def has_internal_annotation(value):
-    if isinstance(value, str):
-        return "role=" in value or "hidden_state" in value
-    if isinstance(value, dict):
-        return any(has_internal_annotation(item) for item in value.values())
-    if isinstance(value, list):
-        return any(has_internal_annotation(item) for item in value)
-    return False
-
-for index, tool in enumerate(llm_tools):
-    if not isinstance(tool, dict) or tool.get("type") != "function":
-        raise SystemExit(f"LLM 工具 {index + 1} 必须使用 type=function")
-    function = tool.get("function")
-    if not isinstance(function, dict) or not {"name", "description", "parameters"}.issubset(function):
-        raise SystemExit(f"LLM 工具 {index + 1} 缺少标准 function 字段")
-    name = function["name"]
-    schema = function["parameters"]
-    if not isinstance(name, str) or not name or name in llm_names:
-        raise SystemExit(f"tools.json 工具名称无效或重复：{name!r}")
-    if not isinstance(schema, dict) or schema.get("type") != "object":
-        raise SystemExit(f"工具 {name} 的 parameters 必须是 object schema")
-    if not isinstance(schema.get("properties"), dict):
-        raise SystemExit(f"工具 {name} 缺少 parameters.properties")
-    if not isinstance(schema.get("required", []), list):
-        raise SystemExit(f"工具 {name} 的 parameters.required 必须是数组")
-    if has_internal_annotation(function):
-        raise SystemExit(f"LLM 工具 {name} 不得在 description 中包含内部 role/hidden_state 标记")
-    llm_names.add(name)
-
-plan = json.loads(plan_path.read_text(encoding="utf-8"))
-public_tools = {
-    step.get("tool_name")
-    for action in plan.get("actions", [])
-    for step in action.get("steps", [])
-    if step.get("kind") == "public_llm_tool"
-}
-if public_tools != llm_names:
-    raise SystemExit(
-        f"llm_tools 与 action_plan.json 的公开工具不一致："
-        f"缺少={sorted(public_tools - llm_names)}，多余={sorted(llm_names - public_tools)}"
-    )
-
-PY
-    validation_status=$?
-    set -e
-    if [[ "$validation_status" -eq 0 ]]; then
-      rm -f "$validation_error_file"
-      break
-    fi
-    validation_detail="$(<"$validation_error_file")"
-    rm -f "$validation_error_file"
-    if [[ "$tools_attempt" -eq 3 ]]; then
-      echo "tools.json 连续 3 次校验失败：$validation_detail" >&2
-      return 5
-    fi
-    echo "tools.json 校验失败，准备让 Code Agent 第 $((tools_attempt + 1)) 次修复：$validation_detail" >&2
-    repair_prompt="$(cat <<EOF
-上一轮实现生成的 tools.json 未通过外部校验：
-$validation_detail
-
-请读取 ./spec.md 和 ./action_plan.json，只修复实现产物。确保 llm_tools 的公开工具集合严格等于 action_plan.json 中 kind=public_llm_tool 的 tool_name 集合，且每个 LLM tool 使用标准 function schema。不要把 task_action、trainer_actions、mappings 或 task_action_plans 的格式当作本次校验目标；修复后重新运行 acceptance.sh。
+请重新运行相关测试和 acceptance.sh，确保所有必需文件真实存在且非空。
 EOF
 )"
-    set +e
-    run_code_agent "$repair_prompt"
-    repair_status=$?
-    set -e
-    if [[ "$repair_status" -ne 0 ]]; then
-      echo "Code Agent tools.json 修复阶段失败，退出码：$repair_status" >&2
-      return "$repair_status"
     fi
+    set +e
+    run_code_agent "$attempt_prompt"
+    agent_status=$?
+    set -e
+    if [[ "$agent_status" -ne 0 ]]; then
+      implementation_error="Code Agent 一次性开发退出码：$agent_status"
+    else
+      set +e
+      delivery_error="$(validate_delivery 2>&1)"
+      delivery_status=$?
+      set -e
+      if [[ "$delivery_status" -eq 0 ]]; then
+        implementation_succeeded="true"
+        break
+      fi
+      implementation_error="$delivery_error"
+    fi
+    echo "一次性开发第 ${implementation_attempt} 次尝试失败：$implementation_error" >&2
   done
-
-  echo "执行沙箱验收脚本：$output_path/acceptance.sh"
-  set +e
-  (cd "$output_path" && bash ./acceptance.sh)
-  acceptance_status=$?
-  set -e
-  if [[ "$acceptance_status" -ne 0 ]]; then
-    echo "沙箱验收失败，退出码：$acceptance_status" >&2
-    return "$acceptance_status"
+  if [[ "$implementation_succeeded" != "true" ]]; then
+    echo "Code Agent 一次性开发连续 3 次未通过：$implementation_error" >&2
+    return 5
+  fi
+  echo "Code Agent 一次性开发完成：$output_path"
+  echo "执行 spec 实现合规复核：$output_path/spec.md"
+  if ! validate_spec_implementation; then
+    echo "spec 实现合规复核失败" >&2
+    return 5
+  fi
+  echo "执行运行时契约 trace 校验：$output_path/runtime_trace.jsonl"
+  if ! validate_runtime_trace; then
+    echo "运行时契约 trace 校验失败" >&2
+    return 5
   fi
 
   case "$runtime" in
@@ -401,7 +546,7 @@ EOF
       "$project_dir/scripts/build_docker_sandbox_image.sh" "${build_args[@]}"
       ;;
     *)
-      echo "不支持的 runtime：$runtime；可选值为 none、docker"
+      echo "不支持的 runtime：${runtime}；可选值为 none、docker"
       return 2
       ;;
   esac
