@@ -14,5 +14,6 @@ class Task:
     env: list[Any]
     metrics: list[Any]
     task_type: TaskType = TaskType.EVENT
+    task_intent: str = "query"
     complexity: str = "standard"
-    complexity_features: dict[str, Any] | None = None
+    artifacts: dict[str, Any] | None = None

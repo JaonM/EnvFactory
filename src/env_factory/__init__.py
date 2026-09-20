@@ -26,12 +26,8 @@ from .llm import LLMClient, LLMError, LLMResponse
 from .wikipedia import WikipediaClient, WikipediaError, WikipediaResponse, WikipediaResult
 from .wikipedia_dump import LocalWikipediaClient, WikipediaDumpIndexer
 from .task import Task
-from .task_generator import (
-    TaskEnvironmentGenerator,
-    TaskGenerationError,
-    TaskGenerator,
-    TaskMetricsGenerator,
-)
+from .task_generator import TaskGenerationError, TaskGenerator
+from .task_pipeline import PipelineGenerationError, TaskGenerationPipeline
 
 __all__ = [
     "DEFAULT_KNOWLEDGE_GRAPH_SCHEMA",
@@ -62,10 +58,10 @@ __all__ = [
     "LocalWikipediaClient",
     "WikipediaDumpIndexer",
     "Task",
-    "TaskEnvironmentGenerator",
-    "TaskMetricsGenerator",
     "TaskGenerator",
     "TaskGenerationError",
+    "PipelineGenerationError",
+    "TaskGenerationPipeline",
     "TaskType",
     "TaskTypeNode",
     "main",

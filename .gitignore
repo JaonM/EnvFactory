@@ -17,3 +17,5 @@ data/
 
 # Generated tasks
 output/
+
+.idea/
