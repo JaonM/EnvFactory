@@ -25,12 +25,6 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=1, help="生成任务数量，默认 1")
     parser.add_argument("--max-workers", type=int, default=4, help="任务生成并发数，默认 4")
     parser.add_argument(
-        "--hierarchy-child-limit",
-        type=int,
-        default=10,
-        help="每个路径关键词最多抽取的直接下位词数量，默认 10",
-    )
-    parser.add_argument(
         "--path-query-timeout",
         type=float,
         default=10.0,
@@ -85,8 +79,6 @@ def main() -> None:
         parser.error("--count 必须大于 0")
     if args.max_workers <= 0:
         parser.error("--max-workers 必须大于 0")
-    if args.hierarchy_child_limit <= 0:
-        parser.error("--hierarchy-child-limit 必须大于 0")
     if args.path_query_timeout <= 0:
         parser.error("--path-query-timeout 必须大于 0")
     if args.max_dialogue_turns < 4:
@@ -113,8 +105,6 @@ def main() -> None:
         generator = TaskGenerator(
             store,
             llm,
-            hierarchy_child_limit=args.hierarchy_child_limit,
-            hierarchy_workers=args.max_workers,
             user_script_count=args.user_script_count,
             sessions_per_script=args.sessions_per_script,
             maximum_dialogue_turns=args.max_dialogue_turns,

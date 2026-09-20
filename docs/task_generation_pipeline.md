@@ -1,6 +1,6 @@
-# 八阶段任务生成流程
+# 任务生成流程
 
-`examples/generate_task.py` 统一使用八阶段外部 LLM 流程。每个任务先随机选择一个 `task_intent`，再由独立的外部 OpenAI 兼容 LLM 按该意图生成任务；进入下一阶段前进行 JSON 结构校验。
+`examples/generate_task.py` 统一使用分阶段外部 LLM 流程。每个任务先随机选择一个 `task_intent`，再由独立的外部 OpenAI 兼容 LLM 按该意图生成任务；进入下一阶段前进行 JSON 结构校验。
 
 当前任务意图包括：`query`（查询）、`explain`（解释）、`compare`（比较）、`recommend`（推荐）、`diagnose`（诊断）、`modify`（修改）、`execute`（执行）、`plan`（规划）、`summarize`（总结）、`create`（创建）、`extract`（提取）、`classify`（分类）、`validate`（验证）、`audit`（审查）、`calculate`（计算）、`estimate`（估算）、`schedule`（排程）、`monitor`（监控）、`troubleshoot`（排障）、`transform`（转换）、`decide`（决策）和 `simulate`（模拟）。只有 `plan` 意图允许生成策划或执行方案，其他意图必须保持对应的目标和输出形式。可通过 `--task-intent` 指定意图，不指定时随机选择。
 
@@ -51,7 +51,7 @@ python examples/generate_task.py \
 
 每个任务最终写入 `output/task_artifacts/task-N/task.json`；业务数据、用户模拟文件和 `tools.json` 也保存在同一个 `task-N` 目录中。
 
-任务生成已统一使用七阶段 pipeline，不再提供旧版生成模式或兼容分支。
+任务生成已统一使用当前 pipeline，不再提供旧版生成模式或兼容分支。画像下位词扩展、constraints 构造和历史格式兼容解析均已删除。
 
 观测与奖励设计规则：只保留与任务目标完成强相关的关键过程指标和目标结果指标，不能为每个普通动作机械创建指标；任务无需关键工具动作时 process 指标可以为空，存在多个关键动作时不限制过程指标数量。关键过程指标必须是 `hybrid`，使用精简字段 `target_action`、`evaluation_inputs`、`criteria` 和固定 `condition=llm_expected_tool_call_exact_match`。沙箱 Code Agent 根据该指标在实现评估器时调用外部 LLM，结合当前 Context、可用工具和 `criteria` 生成期望工具名及参数真值；随后由规则引擎对 Agent 实际工具名和规范化参数进行确定性精确比对，LLM 不直接输出最终过程分数，任务 JSON 也不嵌入完整 prompt 或 expected-call schema。结果指标判断任务目标是否完成或关键业务数据是否达到目标，可使用 `rule-based`、`model-based` 或 `hybrid`。惩罚指标只有在直接影响任务目标时才保留，用于偏离用户诉求、无效循环或业务数据偏离预期；工具选择错误和工具参数错误不作为惩罚项。
 

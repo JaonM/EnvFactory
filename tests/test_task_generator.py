@@ -93,12 +93,6 @@ class TaskGeneratorTest(unittest.TestCase):
         self.assertEqual(captured["keywords"], ["买衣服"])
         self.assertEqual(task.desc, "帮我买一件合适尺码的衣服")
 
-    def test_hierarchy_child_limit_is_configurable(self):
-        generator = TaskGenerator(FakeStore(), FakeLLM(), hierarchy_child_limit=3)
-        self.assertEqual(generator.hierarchy_child_limit, 3)
-        with self.assertRaises(ValueError):
-            TaskGenerator(FakeStore(), FakeLLM(), hierarchy_child_limit=0)
-
     def test_generate_uses_path_keywords(self):
         store = FakeStore()
         llm = FakeLLM()

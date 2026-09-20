@@ -70,11 +70,6 @@ class OpenAIToolArtifactTest(unittest.TestCase):
 
 
 class RewardContractTest(unittest.TestCase):
-    def test_missing_semantic_criteria_can_fall_back_to_rubric(self):
-        metrics = [{"id": "process", "type": "hybrid", "rubric": "检查关键动作是否正确"}]
-        normalized = TaskGenerationPipeline._normalize_metric_evaluation_fields(metrics)
-        self.assertEqual(normalized[0]["criteria"], ["检查关键动作是否正确"])
-
     def test_metric_weights_are_normalized_by_sign_group(self):
         metrics = [
             {"category": "process", "weight": 2.0},

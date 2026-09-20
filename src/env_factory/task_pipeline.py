@@ -1,4 +1,4 @@
-"""Eight-stage external-LLM task generation pipeline.
+"""External-LLM task generation pipeline.
 
 Each stage has an independent prompt, JSON envelope, validation and retry
 boundary.  The final task is assembled from the validated stage artifacts;
@@ -208,7 +208,6 @@ class TaskGenerationPipeline:
         task_type: str,
         style: str,
         task_intent: str = "query",
-        profile_terms: list[str],
         graph_context: dict[str, Any],
         artifact_dir: str | Path | None = None,
     ) -> dict[str, Any]:
@@ -276,7 +275,7 @@ class TaskGenerationPipeline:
             "environment_entities",
             "根据任务描述分析完成任务所需的最小必要业务实体。只保留完成任务、支持 Agent 查询或修改、以及奖励评测真正需要持久化的业务事实；不需要独立查询、复用或更新的静态说明、标签和建议作为其他实体的字段或 JSON 保存。只有存在独立生命周期、独立查询/更新需求或明确业务关系时才拆分实体。输出实体、用途、必须保存的业务事实和实体关系，实体必须足够覆盖完整任务但遵循最小必要原则。",
             {"task_description": description, "task_type": task_type, "keywords": keywords,
-             "profile_terms": profile_terms, "output": {"entities": [{"entity_id": "string", "name": "string", "description": "string", "required_facts": [], "relationships": []}]}},
+             "output": {"entities": [{"entity_id": "string", "name": "string", "description": "string", "required_facts": [], "relationships": []}]}},
         )
         self._validate_entities(entity_plan.get("entities"))
 
@@ -299,23 +298,7 @@ class TaskGenerationPipeline:
                 {"task_description": description, "entities": entity_plan["entities"], "table": table,
                  "output": {"rows": []}},
             )
-            generated = None
-            # The table design is authoritative; only rows cross this stage
-            # boundary. Keep compatibility with older providers that returned
-            # a table envelope while preferring the minimal rows-only contract.
-            if isinstance(result.get("rows"), list):
-                generated = table | {"rows": result["rows"]}
-            if not isinstance(generated, dict):
-                nested = result.get("table")
-                if isinstance(nested, dict) and isinstance(nested.get("rows"), list):
-                    generated = table | {"rows": nested["rows"]}
-            if not isinstance(generated, dict):
-                tables = result.get("tables")
-                if isinstance(tables, list) and tables and isinstance(tables[0], dict) and isinstance(tables[0].get("rows"), list):
-                    generated = table | {"rows": tables[0]["rows"]}
-            if not isinstance(generated, dict) and isinstance(result.get("table_name"), str):
-                generated = result
-            if not isinstance(generated, dict):
+            if not isinstance(result.get("rows"), list):
                 logger.error(
                     "environment table data invalid: table=%s result_keys=%s expected=table.rows",
                     table["table_name"],
@@ -325,7 +308,7 @@ class TaskGenerationPipeline:
                     f"environment_table_data.{table['table_name']} must return table.rows; "
                     f"received keys={sorted(result)}"
                 )
-            return generated
+            return table | {"rows": result["rows"]}
 
         generated_tables: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=min(8, len(table_definitions))) as executor:
@@ -681,7 +664,7 @@ class TaskGenerationPipeline:
                     "category 只能是 process、outcome、penalty；process 指标只能对应关键动作，且 type 必须为 hybrid；"
                     "每个关键 process 指标必须包含非空 target_action、evaluation_inputs、criteria，且 condition 必须严格为 llm_expected_tool_call_exact_match；"
                     "每个 rule-based 或 hybrid 指标必须补充非空 condition；每个 model-based 或 hybrid 指标必须补充非空 evaluation_inputs 和 criteria 数组，"
-                    "不能返回 criteria 缺失、空数组或 null；如果 rubric 已说明评价标准，也必须将其展开为 criteria 数组。"
+                    "不能返回 criteria 缺失、空数组或 null。"
                 )
             candidate_rewards = self._call(
                 "observations_rewards" if reward_attempt == 1 else "observations_rewards.repair",
@@ -691,7 +674,6 @@ class TaskGenerationPipeline:
             try:
                 candidate_metrics = self._list(candidate_rewards.get("metrics"), "metrics")
                 candidate_metrics = self._normalize_metric_weights(candidate_metrics)
-                candidate_metrics = self._normalize_metric_evaluation_fields(candidate_metrics)
                 candidate_rewards["metrics"] = candidate_metrics
                 self._validate_metrics(candidate_metrics)
                 # Build the formula from the validated metric weights instead
@@ -891,33 +873,6 @@ class TaskGenerationPipeline:
             for metric in metrics:
                 if isinstance(metric, dict) and metric.get("category") == "penalty" and isinstance(metric.get("weight"), (int, float)):
                     metric["weight"] = float(metric["weight"]) / negative
-        return metrics
-
-    @staticmethod
-    def _normalize_metric_evaluation_fields(metrics: list[Any]) -> list[Any]:
-        """Repair a common LLM omission without changing evaluation semantics.
-
-        Hybrid/model-based metrics need semantic criteria. When a provider
-        returns a meaningful rubric but omits criteria, the rubric is the only
-        safe deterministic fallback; the strict validator still rejects the
-        metric when neither field contains usable text.
-        """
-        for index, metric in enumerate(metrics):
-            if not isinstance(metric, dict):
-                continue
-            metric_type = metric.get("type")
-            criteria = metric.get("criteria")
-            if metric_type in {"model-based", "hybrid"} and (
-                not isinstance(criteria, list) or not any(isinstance(item, str) and item.strip() for item in criteria)
-            ):
-                rubric = metric.get("rubric")
-                if isinstance(rubric, str) and rubric.strip():
-                    metric["criteria"] = [rubric.strip()]
-                    logger.warning(
-                        "filled missing metric criteria from rubric: metric_index=%d metric_id=%s",
-                        index,
-                        metric.get("id"),
-                    )
         return metrics
 
     @staticmethod
