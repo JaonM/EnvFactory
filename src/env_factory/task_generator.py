@@ -67,6 +67,7 @@ class TaskGenerator:
         sessions_per_script: int = 2,
         minimum_dialogue_turns: int = 4,
         maximum_dialogue_turns: int = 12,
+        noise_tool_max: int = 3,
     ) -> None:
         self.store = store
         self.llm = llm
@@ -76,6 +77,7 @@ class TaskGenerator:
             sessions_per_script=sessions_per_script,
             minimum_dialogue_turns=minimum_dialogue_turns,
             maximum_dialogue_turns=maximum_dialogue_turns,
+            noise_tool_max=noise_tool_max,
         )
 
     def generate(
@@ -141,7 +143,6 @@ class TaskGenerator:
             artifacts=artifacts,
         )
 
-    @staticmethod
     @staticmethod
     def _select_task_type(task_type: TaskType | str | None) -> TaskType:
         if task_type is None:

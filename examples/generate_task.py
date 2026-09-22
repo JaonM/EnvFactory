@@ -74,6 +74,12 @@ def main() -> None:
         default=12,
         help="每个对话 session 的最大消息数，默认 12；达到后以 max_turns_reached 结束",
     )
+    parser.add_argument(
+        "--noise-tool-max",
+        type=int,
+        default=3,
+        help="每个任务最多生成的噪声工具数量，实际数量随机为 0..N；噪声工具由共享运行时安全执行，默认 3",
+    )
     args = parser.parse_args()
     if args.count <= 0:
         parser.error("--count 必须大于 0")
@@ -83,6 +89,8 @@ def main() -> None:
         parser.error("--path-query-timeout 必须大于 0")
     if args.max_dialogue_turns < 4:
         parser.error("--max-dialogue-turns 必须至少为 4")
+    if args.noise_tool_max < 0:
+        parser.error("--noise-tool-max 不能小于 0")
     load_dotenv()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -108,6 +116,7 @@ def main() -> None:
             user_script_count=args.user_script_count,
             sessions_per_script=args.sessions_per_script,
             maximum_dialogue_turns=args.max_dialogue_turns,
+            noise_tool_max=args.noise_tool_max,
         )
         with ThreadPoolExecutor(max_workers=min(args.max_workers, args.count)) as executor:
             def generate_one(index: int):
@@ -175,13 +184,21 @@ def main() -> None:
                             "task_intent": task.task_intent,
                             "complexity": task.complexity,
                             "requirements": pipeline_artifacts.get("requirements", {}),
+                            "environment_plan": pipeline_artifacts.get("environment_plan", {}),
                             "environment": task.env,
                             "actions": pipeline_artifacts.get("actions", []),
+                            "capability_plan": pipeline_artifacts.get("capability_plan", []),
                             "tools": pipeline_artifacts.get("tools", []),
+                            "tool_bindings": pipeline_artifacts.get("tool_bindings", []),
+                            "tool_implementations": pipeline_artifacts.get("tool_implementations", []),
+                            "noise_tools": pipeline_artifacts.get("noise_tools", []),
                             "observation_schema": pipeline_artifacts.get("observation_schema", {}),
+                            "reward_key_steps": pipeline_artifacts.get("reward_key_steps", []),
                             "metrics": task.metrics,
+                            "metric_implementations": pipeline_artifacts.get("metric_implementations", []),
                             "reward_formula": pipeline_artifacts.get("reward_formula", {}),
-                            "termination": pipeline_artifacts.get("termination", []),
+                            "acceptance_contract": pipeline_artifacts.get("acceptance_contract", {}),
+                            "task_readiness": pipeline_artifacts.get("task_readiness", {}),
                             "artifacts": artifact_manifest,
                         },
                         ensure_ascii=False,
