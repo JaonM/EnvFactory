@@ -1,19 +1,26 @@
 # RL Sandbox Design and Implementation Contract
 
-You are the Code Agent developing one RL sandbox task. Read `task.json` first. This document is the sole contract for the staged workflow:
+The outer workflow pre-generates an EnvFactory-owned `app.py` composition and
+`task_impl.py` extension module. Preserve the composition architecture. Put
+task-specific handlers, observation projection, custom metric scores and the
+optional user renderer in `task_impl.py`; do not replace the shared runtime
+with a task-specific framework.
 
-- Phase 1 writes only `spec.md`.
-- Phase 2 reads `spec.md` and implements the complete sandbox in one Code Agent run, including tools, Trainer actions, tests, acceptance, and Docker artifacts.
+You are the Code Agent developing one RL sandbox task. Read `BUILD_CONTRACT.json` first. It is the read-only task contract formed by removing only the top-level `actions` field from `task.json`. The outer workflow will first create a module development DAG, then invoke you for each production module and finally for structured defect repairs.
 
-There is no action-plan phase, development-topology phase, or per-node Code Agent phase. `spec.md` is the single design handoff between the two phases and must contain the complete tool/action semantics needed for implementation.
+The outer workflow first asks the Code Agent to generate a module-level `development_plan.json`. This is an implementation DAG, not a task-action plan: it contains production modules, dependencies, inputs, outputs, and executable validation commands. The outer workflow then invokes the same Code Agent once per node in dependency order. Do not create `spec.md` or `action_plan.json`, and do not turn task actions into development nodes.
 
-The specification must be task-specific and executable. Do not merely restate the input or build a generic demo. Preserve the task's success and failure semantics.
+The implementation must be task-specific and executable. Do not merely restate the input or build a generic demo. Preserve the task's success and failure semantics. If a required task field is absent, report the omission instead of inventing a default.
 
 The outer workflow may provide a read-only `BUILD_CONTRACT.json`. It is an
-authoritative machine-readable contract generated from the task input, not a
-Code Agent proposal. Every required obligation in that file has a stable
-`id`; `spec.md` must preserve and reference those IDs. The outer workflow
-validates coverage independently.
+authoritative projection with exactly the same JSON structure and values as
+`task.json` after removing only the top-level `actions` field, not a Code Agent
+proposal and not a second source of requirements. It must contain no
+platform obligation, capability, endpoint, evaluation rule, action, or other
+business information that is absent from `task.json`. Use only the fields and
+values present in `task.json`; if the task omits a required implementation
+contract such as observation schema or reward definition, report the omission
+instead of inventing a default.
 
 ## Global action and tool rules
 
@@ -25,11 +32,12 @@ validates coverage independently.
    Use this decision test: if the Agent supplies one request/evidence boundary and the sandbox returns the result of that operation, use `atomic`; if the Agent must choose or invoke multiple separate operations, or one operation's public output is required as another operation's input, use `composite`. Do not classify an action based only on its internal implementation complexity, external-model usage, synchronous/asynchronous behavior, or whether it eventually produces text. Never invent values such as `composite_internal_execution`, `direct_terminal_generation`, or `internal`; internal processing is described in the action's implementation fields, not in `classification`.
 
    Generic examples: `request_user_evidence` is usually `atomic` because it is one interaction request; `recognize_from_submitted_evidence` may be `atomic` when one evidence-to-result tool call is the Agent boundary even though the sandbox performs OCR and model inference internally; `prepare_report` is `composite` when it requires separate data lookups followed by a final response, for example `lookup_facts` and `lookup_constraints` in parallel, then `llm_generate` as the terminal step. These are decision examples, not fixed tool names for every task.
-2. The `spec.md` action-decomposition section is authoritative. It must describe each task action's Agent-visible atomic operations, tool name, OpenAI Function parameters, corresponding Trainer action, dependencies, inputs, outputs, effects, and terminal direct-generation steps. There is no separate `action_plan.json` artifact. Each public tool has one canonical `tool_name`; the shared `ask_user` bridge may serve multiple interaction actions, while unrelated tools must not be duplicated. `llm_generate` is an internal design step with no tool name and is never emitted as an LLM tool or Trainer action.
-3. Every atomic operation the Agent must choose or perform is a public LLM Tool and has exactly one corresponding Trainer action. Every LLM tool call causes the Trainer to execute that action. Validation, normalization, transactions, persistence, and hidden evaluation are implementation details inside the corresponding public action, not separate plan steps.
+2. The `tools` section in `BUILD_CONTRACT.json` is authoritative. Implement each declared tool's complete Agent-visible input, output, validation, persistence, and business behavior. There is no separate task-action or Trainer-action registry, spec, or `action_plan.json` artifact. Each public tool has one canonical `tool_name`; user interaction is handled by the separate `user_simulator` endpoint and must not be emitted as an LLM Tool. `llm_generate` is an internal runtime step with no tool name and is never emitted as an LLM tool.
+3. Every atomic operation the Agent must choose or perform is a public LLM Tool. The Trainer submits the tool call to the sandbox, and the sandbox executes that tool; the contract does not declare a separate Trainer-action registry. Validation, normalization, transactions, persistence, and hidden evaluation are implementation details inside the tool execution, not separate plan steps.
+   The contract may also include `noise_tools` metadata. Every corresponding noise tool is exposed in `tools.json` and has a normal executable endpoint, but is not bound to a task action, must not mutate task-critical business data, and must not produce task-progress reward. `unrelated` tools are unrelated to the task; `related_irrelevant` tools are topic-related but irrelevant to completing the task.
 4. Any operation that retrieves knowledge or business data, extracts information, interprets evidence, makes a decision, or supplies context needed by the LLM must be a public LLM Tool. Independent lookups must be separate tools and may share a parallel group; do not hide them in a high-level wrapper.
-5. `ask_user` is both an LLM Tool and a Trainer action, but it is not the user simulator. It is the single public bridge for all user information, clarification, confirmation, correction, and other user interaction. The LLM decides when to call it and passes the interaction request as a JSON object. Each successful `ask_user` call must trigger exactly one User Simulator turn: the Trainer validates and persists the request, delivers it to the independent LLM user simulator, persists the generated user message, and writes that message into the next observation/context returned to the Agent. `reset`, timers, observation reads, and other Trainer actions must never trigger the User Simulator automatically. `ask_user` must appear in `llm_tools`, `trainer_actions`, and `mappings`.
-6. `llm_generate` means the LLM replies directly from the current context. It is not an LLM Tool, Trainer action, mapping, or endpoint.
+5. User interaction is not an LLM Tool. `POST /v1/user_simulator` is an internal Trainer-only endpoint and is never exposed in the tools available to the Agent. The Trainer must pass the complete ordered `messages` conversation array; the endpoint must not accept a single-message shortcut or Agent-supplied profile/script identifiers. Each successful endpoint call triggers exactly one User Simulator turn: the sandbox validates and persists the request, reads the current episode's profile/script/user state, delivers the complete context to the independent LLM user simulator, persists the generated `user_query` and `should_end` flag, and exposes them through the next observation. Reset, timers, observation reads, and business-tool calls must never trigger the User Simulator automatically.
+6. `llm_generate` means the LLM replies directly from the current context. It is not an LLM Tool or endpoint.
 7. LLM tools use the standard Function Tool shape:
 
    `{"type":"function","function":{"name":"...","description":"...","parameters":{"type":"object","properties":{},"required":[]}}}`
@@ -44,7 +52,7 @@ validates coverage independently.
    namespace.
 
    For confirmation actions, a user's confirmation is an environment event
-   produced by `ask_user` and persisted by the sandbox. Do not expose
+   produced by the `user_simulator` endpoint and persisted by the sandbox. Do not expose
    internal acceptance record IDs, message IDs, evidence IDs, database keys,
    or fields such as `acceptance_evidence_id` / `acceptance_message_id` as
    required LLM-tool inputs. The confirmation action must resolve and validate
@@ -62,25 +70,31 @@ validates coverage independently.
 
 ## 1. Task understanding and scope
 
-In `spec.md`, describe the task, type, complexity, uncertainty, expected interaction style, success/failure conditions, out-of-scope behavior, and the boundary between semantic task milestones and atomic implementation operations.
-For every required `BUILD_CONTRACT.json` obligation, include its literal ID
-and explain the design that satisfies it. Do not remove, weaken, or redefine
-an outer obligation.
+Use the fields in `BUILD_CONTRACT.json` to implement the task, type, complexity, uncertainty, expected interaction style, success/failure conditions, out-of-scope behavior, and the declared tool boundaries. The top-level `actions` field in `task.json` is context only and is not a sandbox registry.
+If `BUILD_CONTRACT.json` contains explicit contract fields, implement those
+fields exactly. Do not invent an obligation section or add requirements that
+are absent from the task input.
 
 ## 2. Requirement decomposition and implementation logic
 
-For every requirement and task action, specify preconditions, public inputs, business logic, reads, writes, time cost, LLM tools, corresponding Trainer actions, success result, invalid/rejected result, failure behavior, and acceptance tests. Do not describe task-environment state variables in the environment-generation stage; derive executable state transitions later from the complete business records and action matrix. For media-based actions, specify only the generated-code execution/persistence boundary, tool-parameter handling, process transitions, and task-goal evaluation; do not add media recognition or separate media-reference evaluation. These implementation steps must remain inside the corresponding Trainer Action execution. Include the complete action-decomposition table or graph with:
+For every declared tool, specify preconditions, public inputs, business logic, reads, writes, time cost, user interaction, success result, invalid/rejected result, failure behavior, and acceptance tests. Do not describe task-environment state variables in the environment-generation stage; derive runtime state only from the complete business records and tool execution. For media-based tools, specify only the generated-code execution/persistence boundary, tool-parameter handling, process transitions, and task-goal evaluation; do not add media recognition or separate media-reference evaluation. Include the complete tool execution relationships when tools depend on one another.
 
-`task_action`, `atomic_step`, `step_type`, `llm_tool`, `trainer_action`, `depends_on`, `parallel_group`, `inputs`, `outputs`, `state_effects`.
+`tool_name`, `inputs`, `outputs`, `depends_on`, `parallel_group`, and
+`state_effects`.
 
-Each action and step must also include `obligation_ids` for the contract
-obligations it implements. The union of these IDs must cover every required
-obligation. The Code Agent must implement this design directly; it must not
-invent a second plan format or silently omit a tool because it is inconvenient.
+Do not add `obligation_ids`, Trainer-action mappings, or another planning
+layer unless those fields are present in `BUILD_CONTRACT.json`. Implement
+every declared tool directly; do not silently omit a tool because it is
+inconvenient.
 
 Show fan-out, joins, and mixed serial/parallel execution. A task action may map directly to one tool only when the analysis proves it is atomic; copying all task action names without decomposition is invalid.
 
 ## 3. Data model and persistence
+
+Use `sandbox_runtime.ManifestDataStore` to load and validate the declared data
+manifest, calculate the baseline hash, and create an isolated business-data
+copy on reset. Task code may query or replace declared tables through this
+store; do not regenerate JSONL import, baseline copying, or episode isolation.
 
 Define entities, relationships, types, visibility, defaults, and invariants. Prefer SQLite unless the task requires another store. Specify tables, keys, foreign keys, indexes, uniqueness, JSON fields, migrations, transaction boundaries, per-task isolation, crash recovery, concurrency, reset, replay, idempotency, timestamps, state, hidden truth, evidence, actions, tool calls, user messages, rewards, and errors. Before the Agent can act, the sandbox must generate or load an authoritative ground-truth record from the task data model and deterministic seed, assign it a version/hash, and keep it immutable for that episode. Persist the user model, generated behavior script, `user_known_facts`, `user_beliefs`, conversation memory, and user-state transitions with provenance and visibility flags; keep ground truth separate from user knowledge, Agent claims, observations, and model outputs, and never expose it through observation. Never persist API keys.
 
@@ -90,38 +104,94 @@ Read `artifacts.data_manifest` and the files it references: `data_document.md`, 
 
 ## 5. LLM user simulator
 
-Design an independent, stateful user simulator, separate from `ask_user` and from the Code Agent. Read `artifacts.user_simulation_manifest` and its separate profile/script/session files when available; do not expect these large artifacts to be embedded in `task.json`. Initialize a user model containing persona, goals, constraints, knowledge level, `user_known_facts`, uncertain `user_beliefs`, memory, patience, trust, urgency, and willingness to share. `user_known_facts` are user-visible facts selected by the sandbox from simulated task data; `user_beliefs` are derived/noisy user interpretations and may be wrong. The Agent cannot write either domain. First write a script-generation prompt that describes the task and asks an external OpenAI-compatible LLM to return a validated JSON behavior script containing persona, goals, constraints, branching rules, and turn behaviors; the script constrains behavior and does not replace the state model.
+Use `sandbox_runtime.ContractUserSimulator` for seeded session selection,
+episode-isolated turn state, memory persistence, `should_end`, attachments and
+deterministic fallback. Supply only an optional RuntimeLLMClient-backed
+renderer; do not regenerate the simulator state machine.
 
-At runtime, use this exact pipeline: only a successful Agent `ask_user` call starts one simulator turn; the Trainer persists the JSON request; a behavior planner selects one response mode using the user model, conversation memory, request quality, and seeded randomness; a fact/attachment selector chooses only facts and registered attachment IDs allowed by `user_known_facts`/`user_beliefs`; an external LLM renders one natural-language response and decides whether the user behavior includes an attachment; a validator checks facts, attachment ownership, `entity_id` binding, safety, persona, and output schema; then the Trainer persists the response and attachment references, updates user state, and includes the response plus attachments in the next observation/context. The simulator output schema must include `message`, `attachments` (an array of registered attachment objects with `attachment_id`, `entity_id`, and `kind`), and `done`; use an empty array when the user does not provide media. The simulator must emit exactly one user message per `ask_user` call. No simulator turn may occur without `ask_user`, and reset, timers, observation reads, or other actions must not invoke it. `ask_user` must not fabricate the user message or attachment. On external-LLM failure, use the validated behavior plan and deterministic seeded rendering fallback, including a pre-registered attachment when the fallback behavior requires media. The simulator must not read hidden truth, credentials, or evaluation data, and must not act as the Code Agent.
+Design an independent, stateful user simulator, separate from the Agent and from business tools. Read `artifacts.user_simulation_manifest` and its separate profile/script/session files when available; do not expect these large artifacts to be embedded in `task.json`. Initialize a user model containing persona, goals, constraints, knowledge level, `user_known_facts`, uncertain `user_beliefs`, memory, patience, trust, urgency, and willingness to share. `user_known_facts` are user-visible facts selected by the sandbox from simulated task data; `user_beliefs` are derived/noisy user interpretations and may be wrong. The Agent cannot write either domain. First write a script-generation prompt that describes the task and asks an external OpenAI-compatible LLM to return a validated JSON behavior script containing persona, goals, constraints, branching rules, and turn behaviors; the script constrains behavior and does not replace the state model.
+
+At runtime, use this exact pipeline: only a successful `POST /v1/user_simulator` call starts one simulator turn; the Trainer passes the complete ordered `messages` array; a behavior planner selects one response mode using the user model, conversation memory, request quality, and seeded randomness; a fact/attachment selector chooses only facts and registered attachment IDs allowed by `user_known_facts`/`user_beliefs`; an external LLM renders one natural-language `user_query` and consumes the selected script branch's `should_end` signal; a validator checks facts, attachment ownership, `entity_id` binding, safety, persona, and output schema; then the Trainer persists the response, `should_end` flag, and attachment references, updates user state, and exposes them through the next observation/context. The simulator output schema must include `user_query`, boolean `should_end`, and `attachments` (an array of registered attachment objects with `attachment_id`, `entity_id`, and `kind`); use `false` and an empty array when the user continues without media. The simulator must emit exactly one user message per endpoint call. No simulator turn may occur without this endpoint, and reset, timers, observation reads, or business-tool calls must not invoke it. On external-LLM failure, use the validated behavior plan and deterministic seeded rendering fallback, including a pre-registered attachment when the fallback behavior requires media. The simulator must not read hidden truth, credentials, or evaluation data, and must not act as the Code Agent.
 
 ## 6. Real-time simulation
 
 Use real wall-clock timestamps and durations, not an abstract integer clock. Define start time, timezone, `current_time`, action start/end, waiting/deadlines, concurrent ordering, replay, and accelerated versus wall-clock behavior. State the time equation, for example `simulated_now = start_time + elapsed_simulated_seconds`. Every time-consuming action has a duration and observable effect; tests must avoid unnecessary sleeping.
 
-## 7. Tools, Trainer actions, and action chain
+## 7. Tools and tool execution chain
 
-The spec must contain the complete Agent-visible tool/action design before
-implementation. For each public tool and Trainer action, specify the exact
-OpenAI Function schema, preconditions, effects, time cost, observation
-changes, persistence writes, return structure, and errors. The Code Agent
-must generate the root `tools.json` from this section and keep its
-`llm_tools`, `trainer_actions`, and one-to-one mappings consistent with the
-implementation. Do not create `action_plan.json` or
-`development_plan.json`. The Trainer only submits the action request and
-receives the action result, observation, and reward; the sandbox performs all
-action-internal media processing and evaluation.
+Use `sandbox_runtime.SandboxApplication` as the HTTP/WSGI boundary. Wire task
+callbacks into it; do not regenerate routing, Trainer authentication, reset,
+tool discovery, tool dispatch, error envelopes, replay, or WSGI parsing in
+`app.py`. The generated `app.py` should be a thin composition and launcher.
+
+Compile every entry in top-level `tool_implementations` with
+`sandbox_runtime.DeclarativeToolCompiler`. Do not write Python handlers for
+those tools. Implement handlers only for declared business tools that have no
+declarative implementation specification.
+
+Use the supplied `sandbox_runtime.ContractToolRegistry` and
+`validate_json_schema` for Function Tool validation, dispatch, mutation hooks,
+and trace recording. Implement only task-specific handler functions in the
+generated tool module. Do not copy or reimplement the generic schema walker or
+tool execution envelope.
+
+Pass `BUILD_CONTRACT.noise_tools` to `ContractToolRegistry`. Do not implement
+task-specific handlers for declared noise tools: the shared registry executes
+them with a safe, observable result, records `noise=true`, and never changes
+task-critical business state. Noise calls remain visible in the trajectory but
+must not satisfy key steps or receive positive process/outcome reward.
+
+The implementation must expose the complete Agent-visible tool design. For
+each public tool, specify the exact OpenAI Function schema, preconditions,
+effects, time cost, observation changes, persistence writes, return structure,
+and errors. The Code Agent must implement the root `tools.json` as the
+standard Function Tool array declared by the contract. Do not create
+`action_plan.json`, or a separate Trainer-action registry. The outer workflow
+owns `development_plan.json`; the Code Agent must not replace it after planning.
+A tool request returns only the business result of that tool. It must
+not calculate or return observation or reward. The sandbox records the tool
+call and its effects in the current session trace. The Trainer obtains public
+observation only by calling the observation endpoint, and obtains reward only
+by calling the declared reward endpoint; the reward endpoint then evaluates
+the accumulated trace and current business data for that request.
 
 ## 8. External LLM configuration and Docker injection
+
+The user script must define a boolean `should_end` on every decision branch.
+The User Simulator consumes the selected branch and returns both `message` and
+`should_end`; `true` means the user stops asking questions and `false` means
+the conversation continues. The Agent Simulator never emits this flag. The
+controller persists the flag and ends the dialogue only when it is `true` and
+the configured minimum dialogue length has been reached; the maximum length
+is only a safety fallback.
 
 Identify runtime features requiring an external model, including user-script generation, user-message simulation, data simulation, and optional trajectory-quality evaluation. Media handling must remain deterministic and programmatic; no media-recognition model or media API key is part of the sandbox runtime. The sandbox action executor, not the RL Trainer, owns any runtime model calls. Use the common OpenAI-compatible Chat Completions contract (`POST {base_url}/chat/completions`, Bearer API key, JSON `messages`) and define the script-generation and response-generation prompts, output schemas, provider/base URL/model, timeout, retries, environment variables (`SANDBOX_LLM_API_KEY`, `SANDBOX_LLM_BASE_URL`, `SANDBOX_LLM_MODEL`, `SANDBOX_LLM_TIMEOUT_SECONDS`, `SANDBOX_LLM_MAX_RETRIES`), Docker `-e`/`--env-file` usage, missing-key behavior, deterministic fallback or disabled mode. Never bake keys into images, observations, logs, or databases; Code Agent credentials must never be runtime credentials.
 
 ## 9. Reward and evaluation
 
-Translate every metric into executable step, terminal, and trajectory logic. Keep only process metrics strongly related to task completion, plus outcome metrics for goal completion or measurable business-data changes. If a task has no key tool actions or can be completed by direct generation, process metrics may be empty; if it has multiple key actions, do not impose an artificial count limit. Observation metrics must not depend on task-generation artifacts such as `user_profiles`, `user_scripts`, or `dialogue_sessions`; `evaluation_inputs` may reference only runtime inputs such as the actual `conversation`, `public_observation`, `available_tools`, `tool_call`, `tool_results`, `business_data`, `final_document`, and `terminal_observation`. Each key process metric is `hybrid` and uses the compact contract `target_action`, `evaluation_inputs`, `criteria`, and `condition=llm_expected_tool_call_exact_match`: the sandbox evaluator calls the externally supplied LLM to generate the expected tool name and arguments from the current runtime context, then performs a deterministic canonical comparison with the Agent's actual tool call. Do not embed a full LLM prompt or expected-call schema in the task metric, and do not let the evaluator LLM directly assign the final process score. Tool selection/parameter mismatch is a process result, not a penalty. Define formulas, weights, rewards, penalties, clipping/normalization, once-only rules, invalid actions, hidden-state evaluation, terminal success/failure, deterministic replay, response shape, and hidden-truth leakage prevention. Evaluate only valid tool name/parameters, process-interface correctness, environment state transitions, and task-goal completion. Media content and media-reference validity are not separate evaluation targets. For `ask_user`, evaluate the Agent's interaction request and its effect on task progress; do not reward or penalize the content of a user-simulator message as if it were an Agent action.
+Execute `acceptance_contract.executable_scenarios` through the supplied
+`sandbox_runtime.AcceptanceScenarioRunner`. Do not translate structured
+scenarios back into task-specific shell or Python assertions.
+
+Use the supplied `sandbox_runtime.ContractRewardAggregator` for metric range
+validation, weighting, and clipping. The generated reward module is
+responsible only for producing each declared metric score from runtime state;
+it must not reimplement the aggregation formula.
+
+Evaluate every top-level `metric_implementations` entry with
+`sandbox_runtime.DeclarativeMetricEvaluator`. Do not write custom evaluators
+for those metrics. Custom code or the runtime LLM is allowed only for metrics
+without a declarative implementation.
+
+Translate every metric into executable step, terminal, and trajectory logic. Keep only process metrics strongly related to task completion, plus outcome metrics for goal completion or measurable business-data changes. If a task has no key tool actions or can be completed by direct generation, process metrics may be empty; if it has multiple key actions, do not impose an artificial count limit. Observation metrics must not depend on task-generation artifacts such as `user_profiles`, `user_scripts`, or `dialogue_sessions`; `evaluation_inputs` may reference only runtime inputs such as the actual `conversation`, `public_observation`, `available_tools`, `tool_call`, `tool_results`, `business_data`, `final_agent_response`, and `terminal_observation`. Each key process metric is `hybrid` and uses the compact contract `target_action`, `evaluation_inputs`, `criteria`, and `condition=llm_expected_tool_call_exact_match`: the sandbox evaluator calls the externally supplied LLM to generate the expected tool name and arguments from the current runtime context, then performs a deterministic canonical comparison with the Agent's actual tool call. Do not embed a full LLM prompt or expected-call schema in the task metric, and do not let the evaluator LLM directly assign the final process score. Tool selection/parameter mismatch is a process result, not a penalty. Define formulas, weights, rewards, penalties, clipping/normalization, once-only rules, invalid actions, hidden-state evaluation, terminal success/failure, deterministic replay, response shape, and hidden-truth leakage prevention. Evaluate only valid tool name/parameters, process-interface correctness, environment state transitions, and task-goal completion. Media content and media-reference validity are not separate evaluation targets. For the `user_simulator` endpoint, evaluate the Agent's natural-language interaction request and its effect on task progress; do not reward or penalize the content of the generated user query as if it were an Agent action.
+
+The reward evaluator must be contract-driven, not a task-specific shortcut. Before generating metrics, the task contract contains `reward_key_steps`, the minimal goal-critical Agent actions identified from the task, business model, tools, and dialogue evidence. Ordinary lookups, optional exploration, noise tools, and every tool merely because it exists are not process-reward candidates. Process metrics may target only `reward_key_steps[*].action_name`; if there are no key steps, process metrics must be empty. Do not replace an evaluator with keyword presence, fixed tool-list positions, successful-call coverage, or a hard-coded final-document flag. For every metric, load its `evaluator` object from `BUILD_CONTRACT.json`: process metrics must call the external LLM to produce the expected tool name and arguments, then compare canonical JSON arguments exactly; rule-based outcome/penalty metrics must execute their declared `assertion` against the declared runtime fields; model-based metrics must call the configured external LLM; hybrid outcome metrics must execute both the declared rule and external-LLM branch according to their `score_mapping`. Acceptance must exercise at least one passing and one failing case for every evaluator family, including wrong arguments, wrong numeric results, missing business changes, repeated invalid calls, and user-intent deviation. A reward endpoint that only checks `-1 <= reward <= 1` is insufficient.
+
+The generated runtime must remain contract-generic after generation. Do not copy generated metric IDs, metric weights, fixed expected-call dictionaries, fixed user-session filenames, or fixed turn-count termination rules into runtime code. Load the complete metric/evaluator list, reward formula, tool registry, user profiles, user scripts, and script/session manifests at runtime. Implement separate ToolRegistry, RewardEvaluator, and UserSimulator responsibilities. EnvFactory may reject implementations that hard-code generated metric IDs or always select the first user session, even if the task-specific happy-path acceptance passes.
 
 ## 10. Trainer API and state transitions
 
-Design health, reset, observation, tool/action discovery, action execution, user-interaction request delivery, reward/status, replay/export, and optional shutdown interfaces. For each define method/path or protocol, request/response, status/error codes, authentication boundary, idempotency, concurrency, and persistence behavior. The user-interaction interface must distinguish the Agent's `ask_user` request from the simulator's generated user message: one successful `ask_user` call produces one simulator response, which must be persisted before it is returned in observation/context. No other interface or background process may invoke the simulator.
+Design health, reset, observation, tool discovery, tool execution, the `user_simulator` request delivery endpoint, the Trainer-only `POST /v1/agent_response` endpoint, reward/status, replay/export, and optional shutdown interfaces. `agent_response` accepts a non-empty `content`, persists it as the current episode's `final_agent_response`, and records it in replay; it is not exposed as an LLM Tool. Tool execution must return only its business result; it must not calculate or return observation or reward. Only the observation endpoint returns public observation, and only the reward endpoint calculates and returns reward when explicitly called.
 
 Define and expand these equations for the task:
 
@@ -129,53 +199,84 @@ Define and expand these equations for the task:
 `T_(t+1) = G(T_t, A_t)`
 `O_(t+1) = H(S_(t+1))`
 `R_t = Q(S_t, A_t, S_(t+1))`
-`D_t = terminal(S_(t+1))`
 
-Explain observable state, hidden state, persistent records, action effects, time effects, termination, and how each Trainer action changes variables and storage.
+Explain observable state, hidden state, persistent records, tool effects, time effects, and how each tool changes variables and storage.
 
 ## 11. Acceptance and verification
 
-Define executable tests for the standard tool schema, action chains, state transitions, invalid actions, hidden-state leakage, user scripts, external-LLM mocks, media-generation code dependencies/entrypoint execution, generated media persistence, timestamps/durations, concurrency/isolation, rewards, API contracts, reset/replay determinism, Docker build/startup, health checks, and an end-to-end trajectory. Assert that no OCR/multimodal call or binding-generation path is required and that valid tool parameters, process interfaces, state transitions, and task-goal completion are evaluated. Do not add tests whose only purpose is media-reference or media-recognition correctness. Specify evidence and the condition for the outer workflow to create `OK`.
+Define executable tests for the standard tool schema, action chains, state transitions, invalid actions, hidden-state leakage, user scripts, external-LLM mocks, media-generation code dependencies/entrypoint execution, generated media persistence, timestamps/durations, concurrency/isolation, rewards, API contracts, reset/replay determinism, Docker build/startup, health checks, and an end-to-end trajectory. Assert that no OCR/multimodal call or binding-generation path is required and that valid tool parameters, process interfaces, state transitions, and task-goal completion are evaluated. Do not add tests whose only purpose is media-reference or media-recognition correctness. Specify evidence and the condition for the outer workflow to write a successful `status.json`.
+
+The outer workflow additionally runs executable mutation testing after the
+normal acceptance succeeds. The runtime must honor the declared
+`SANDBOX_MUTATION_MODE` modes with `disabled` as the production default.
+`acceptance.sh` must inherit that variable and fail for every non-disabled
+mutant; a surviving mutant is a build failure. The outer workflow also runs
+independent HTTP conformance for each mutant and sends the surviving mode,
+stdout/stderr, and runtime log back to the same Code Agent for repair, with a
+maximum of three implementation attempts.
 
 ## Design decisions and unresolved assumptions
 
-Record task-specific decisions, rejected alternatives, assumptions, risks, and unresolved questions. Phase 2 must resolve implementation details without changing task success semantics.
+Record task-specific decisions, rejected alternatives, assumptions, risks, and unresolved questions in `IMPLEMENTATION_REPORT.md`. Resolve implementation details without changing task success semantics.
 
-## Phase 1 requirements
+## Runtime HTTP contract
 
-Read `task.json` and the read-only `BUILD_CONTRACT.json`, then write only
-`spec.md`. Do not create implementation code, tests, tools, HTTP handlers,
-Docker files, or any plan/topology artifact. The spec must be detailed enough
-to implement the complete sandbox: task-specific business data and
-persistence, generated media when needed, user simulator, complete atomic
-action/tool decomposition, Trainer actions, observations, rewards, APIs,
-external-model boundaries, and acceptance tests. Include every required
-obligation ID literally and explain how the design satisfies it.
+`BUILD_CONTRACT.json.requirements.runtime_interface` is the authoritative HTTP
+boundary for the sandbox and RL Trainer. Implement every declared system
+endpoint, every `kind=llm_tool` endpoint, and the `kind=reward_function`
+endpoint exactly as listed. The tool endpoint is `POST /v1/tools/{tool_name}`;
+the endpoint's `request_schema` must be enforced against the corresponding
+OpenAI Function Tool parameters. Do not invent an action endpoint or a second
+tool registry. The reward endpoint must return the runtime reward computed from
+the declared metrics and `reward_formula`, including component scores and
+component scores when declared by the contract. There is no task-level
+`termination` field or termination evaluator.
 
-## Phase 2 requirements
+The generated contract normally includes `GET /health`, `POST /v1/reset`,
+`GET /v1/observation`, `GET /v1/tools`, `POST /v1/user_simulator`,
+`POST /v1/agent_response`, one endpoint entry for every LLM tool, and
+`GET /v1/reward`. `user_simulator`, `agent_response`, and `reward` are marked
+`access=rl_trainer_only`; none may be exposed as an Agent tool. These are a contract, not a requirement to start the
+service during image construction; acceptance may start it temporarily.
 
-Read `spec.md`, `task.json`, and `BUILD_CONTRACT.json`, then implement the
-complete sandbox in one Code Agent run. Generate all production code and
-delivery artifacts directly from the spec, including business-data loading,
-persistence, user simulator, Trainer action executor, observation/reward
-interfaces, root `tools.json` in standard OpenAI Function Tool format, tests,
-`acceptance.sh`, `IMPLEMENTATION_REPORT.md`, `Dockerfile`,
-`docker_build.sh`, and `docker_run.sh`. Implement every action/tool described
-in the spec and preserve the contract semantics. Do not create
-`action_plan.json`, `development_plan.json`, topology scripts, child specs,
-or per-node plans. Do not stop at a demo or a design report.
+## Implementation requirements
 
-The outer workflow may retry this same Phase 2 Code Agent with the captured
+Read `BUILD_CONTRACT.json`, `task.json`, and all referenced artifacts. First
+generate a valid module-level `development_plan.json`; implementation is then
+performed node by node in dependency order. Generate all production code and
+delivery artifacts directly from the contract, including
+business-data loading, persistence, user simulator, tool execution,
+observation/reward interfaces, root `tools.json` in standard OpenAI Function
+Tool format, tests, `acceptance.sh`, `IMPLEMENTATION_REPORT.md`, `Dockerfile`,
+`docker_build.sh`, and `docker_run.sh`. Do not create `spec.md`,
+`action_plan.json`, topology scripts, child specs, or task-action plans. Do not
+stop at a demo or a design report.
+
+The outer workflow may retry this same Code Agent with the captured
 stderr, test output, acceptance output, or missing-file list. On retry, fix
 the reported defect in the existing sandbox and finish the complete build;
-do not replace the spec or weaken the contract.
+do not replace `BUILD_CONTRACT.json` or weaken the task contract.
 
-Provide only Docker artifacts: `Dockerfile`, `docker_build.sh`, and `docker_run.sh`; never create `Containerfile` or Apple Container files. Default the base image to `docker.m.daocloud.io/library/python:3.14-slim`, validate reachability before building, and use a compatible mirror fallback when needed. When HTTP is appropriate, expose at least `/health`, `/v1/reset`, `/v1/observation`, `/v1/actions`, `/v1/step`, `/v1/ask_user`, and `/v1/reward`.
+Provide only Docker artifacts: `Dockerfile`, `docker_build.sh`, and `docker_run.sh`; never create `Containerfile` or Apple Container files. Default the base image to `docker.m.daocloud.io/library/python:3.14-slim`, validate reachability before building, and use a compatible mirror fallback when needed. Building the image must not start a container or leave a server running; `docker_run.sh` is an explicit operator command only. When HTTP is declared, implement exactly the endpoints in `requirements.runtime_interface`, including the separate reward endpoint.
 
-Create a real executable `acceptance.sh` and non-empty `IMPLEMENTATION_REPORT.md`. Acceptance must capture server stderr, use bounded health retries, distinguish startup errors from an environment permission failure on local TCP binding, and use equivalent in-process checks only for the latter. When `BUILD_CONTRACT.json` declares a non-empty capability `required_trace`, acceptance must write JSONL `runtime_trace.jsonl` at the sandbox root; each event must include `event` and may include `capability_id` and `action_id`. The outer workflow validates the required event order independently. Do not create `OK`; the outer workflow creates it after successful phases, file checks, acceptance, trace validation, and optional Docker build.
+Create a real executable `acceptance.sh` and non-empty `IMPLEMENTATION_REPORT.md`. Acceptance must use the runtime in-process boundary by default (`SANDBOX_ACCEPTANCE_MODE=in_process`) so a host that forbids local TCP binding cannot be mistaken for a business failure. It may start the service temporarily for HTTP checks only when `SANDBOX_ACCEPTANCE_MODE=http` is explicitly selected; it must always terminate that process before exiting and must never turn it into a background service after construction. The in-process checks must exercise the same public application boundary and request schemas as the HTTP handlers, not private business shortcuts. It must capture server stderr, use bounded health retries, distinguish startup errors from an environment permission failure on local TCP binding, and retain HTTP checks as an explicit diagnostic mode. Every business assertion must include diagnostic context: endpoint, HTTP method, request payload, mutation mode, response status, response body, relevant episode ID, and the preceding tool results. On failure, write these details to `acceptance_failure.log` and print them to stderr; do not use bare assertions whose failure only reports `AssertionError`. When `BUILD_CONTRACT.json` declares a non-empty capability `required_trace`, acceptance must write JSONL `runtime_trace.jsonl` at the sandbox root; each event must include `event` and may include `capability_id` and `action_id`. The outer workflow validates the required event order independently. Do not create an `OK` marker. The outer workflow writes `status.json` with `status=pending` when a task starts, updates it to `success` after successful phases, file checks, acceptance, trace validation, and optional Docker build, and records `failed` plus the exit code when construction fails.
+The sandbox must include `requirements-dev.txt` with `pytest`, install it in the Docker image, and run `python3 -m pytest -q`. A missing pytest installation is a failed build, not a passed or silently skipped test. After acceptance, write `acceptance_result.json` with `business_acceptance: "passed"` and `http_conformance: "passed"` or `"skipped"`; if HTTP is skipped, include a non-empty `http_skip_reason`.
 
-Before finishing Phase 2, run the acceptance plan, including tool-schema
+The outer workflow separately generates an EnvFactory-owned conformance plan from `task.json`, `BUILD_CONTRACT.json`, and `tools.json` after implementation. It checks the contract projection, OpenAI tool schemas, declared HTTP endpoints, reward key-step coverage, evaluator declarations, score ranges, and normalized reward formula. It also records invalid-input cases for every tool and pass/fail evaluator cases for every metric. This plan is regenerated in a temporary directory at final acceptance, so files or checks written by the Code Agent cannot weaken it. The sandbox `acceptance.sh` is supplementary and must not be treated as the authority for contract compliance.
+
+Production gates are mandatory: use the provided `runtime_llm.py` and `sandbox_runtime.py` primitives; implement the runtime interface's Trainer Bearer authentication with `SANDBOX_TRAINER_API_KEY`; only LLM tool endpoints are Agent-facing, while reset, observation, user simulator, reward, and replay are Trainer-only. Use an isolated database and trace for every episode, accept a seed on reset, make reset/replay deterministic, support the declared `Idempotency-Key`, and expose replay metadata including seed, schema version, trace hash, and business-data hash. User simulation and evaluator calls must use one shared OpenAI-compatible adapter with the declared `SANDBOX_LLM_*` variables, bounded timeout/retry, deterministic fallback or mock mode via `SANDBOX_EVALUATOR_MOCK`, structured call traces, and secret redaction. All HTTP failures must use the declared JSON error schema and request IDs; logs must be structured and redact credentials. Acceptance must independently exercise unauthorized access, cross-episode leakage, reset determinism, idempotent retry, replay integrity, LLM timeout/fallback, evaluator mock/real schema parity, and reward changes after business-data changes. The Docker image must run as a non-root user, contain no credentials, and be started with read-only root filesystem, dropped capabilities, `no-new-privileges`, and bounded CPU, memory, and process limits.
+
+For HTTP acceptance helpers, parse both successful responses and expected error
+responses. A request that intentionally exercises validation, a missing
+precondition, a conflict, or a not-found case must catch `HTTPError`, decode
+its JSON error envelope, and assert the documented error code; it must never
+let `urlopen()` abort the acceptance script before the response is inspected.
+Unexpected status codes or non-JSON bodies must still fail with the URL,
+request payload, status code, and response body so the implementation agent
+can repair the actual contract mismatch.
+
+Before finishing, run the acceptance plan, including tool-schema
 validation, public-tool/Trainer-action correspondence, persistence checks,
 reward checks, and an end-to-end trajectory. Fix implementation failures
 rather than merely reporting them. Do not ask for approval or interactive
-input during any phase.
+input during construction.

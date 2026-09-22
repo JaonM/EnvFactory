@@ -6,18 +6,22 @@ context=""
 tag="env-factory-agent-sandbox"
 start="false"
 dockerfile=""
+port="8080"
+env_file=""
 
 usage() {
   cat <<'EOF'
 用法：scripts/build_docker_sandbox_image.sh --context DIR [选项]
 
-构建 Docker 沙箱镜像。构建前会验证 Dockerfile 第一条 FROM 镜像的 manifest；
+构建 Docker 沙箱镜像。构建完成后默认不启动容器；构建前会验证 Dockerfile 第一条 FROM 镜像的 manifest；
 原镜像不可达时，按顺序尝试平替镜像站点。
 
 选项：
   --context DIR     Docker 构建上下文目录，必填
   --dockerfile FILE Dockerfile 路径，默认：DIR/Dockerfile
   --tag NAME        镜像名称，默认：env-factory-agent-sandbox
+  --port N          宿主机端口，容器端口固定为 8000，默认：8080
+  --env-file FILE   启动容器时注入的环境变量文件，默认：不使用
   --start           构建后启动容器，默认：不启动
   -h, --help        显示帮助
 
@@ -29,9 +33,17 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --context) context="$2"; shift 2 ;;
-    --dockerfile) dockerfile="$2"; shift 2 ;;
-    --tag) tag="$2"; shift 2 ;;
+    --context|--dockerfile|--tag|--port|--env-file)
+      if (( $# < 2 )); then echo "$1 需要提供参数值" >&2; exit 2; fi
+      case "$1" in
+        --context) context="$2" ;;
+        --dockerfile) dockerfile="$2" ;;
+        --tag) tag="$2" ;;
+        --port) port="$2" ;;
+        --env-file) env_file="$2" ;;
+      esac
+      shift 2
+      ;;
     --start) start="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
@@ -43,14 +55,33 @@ if [[ -z "$context" ]]; then
   usage >&2
   exit 2
 fi
+if ! [[ "$port" =~ ^[1-9][0-9]*$ ]] || (( port > 65535 )); then
+  echo "--port 必须是 1 到 65535：$port" >&2
+  exit 2
+fi
+if [[ -z "$tag" ]]; then
+  echo "--tag 不能为空" >&2
+  exit 2
+fi
+if [[ -n "$env_file" && ! -f "$env_file" ]]; then
+  echo "--env-file 文件不存在：$env_file" >&2
+  exit 3
+fi
 if [[ "$context" != /* ]]; then context="$(pwd)/$context"; fi
 if [[ -z "$dockerfile" ]]; then dockerfile="$context/Dockerfile"; fi
 if [[ "$dockerfile" != /* ]]; then dockerfile="$(pwd)/$dockerfile"; fi
 [[ -d "$context" ]] || { echo "构建上下文不存在：$context" >&2; exit 3; }
 [[ -f "$dockerfile" ]] || { echo "Dockerfile 不存在：$dockerfile" >&2; exit 3; }
 command -v docker >/dev/null 2>&1 || { echo "未找到 docker CLI" >&2; exit 4; }
-rm -f "$context/OK"
-
+docker_user="$(awk 'toupper($1) == "USER" {print $2; exit}' "$dockerfile")"
+if [[ -z "$docker_user" || "$docker_user" == "root" || "$docker_user" == "0" ]]; then
+  echo "Dockerfile 必须声明非 root USER：$dockerfile" >&2
+  exit 4
+fi
+if grep -Eiq '^[[:space:]]*ENV[[:space:]].*(API_KEY|SECRET|TOKEN|PASSWORD)' "$dockerfile"; then
+  echo "Dockerfile 不得写入 API key、secret、token 或 password" >&2
+  exit 4
+fi
 from_image="$(awk 'toupper($1) == "FROM" {print $2; exit}' "$dockerfile")"
 if [[ -z "$from_image" ]]; then
   echo "Dockerfile 中没有找到 FROM 指令：$dockerfile" >&2
@@ -112,11 +143,38 @@ awk -v image="$selected" '
   { print }
 ' "$dockerfile" > "$resolved_dockerfile"
 
-docker build --file "$resolved_dockerfile" --tag "$tag" "$context"
-# The marker is written only after the image build succeeds.
-touch "$context/OK"
+docker build --pull=missing --file "$resolved_dockerfile" --tag "$tag" "$context"
+# Keep a machine-readable image provenance record beside the sandbox.
+image_id="$(docker image inspect --format '{{.Id}}' "$tag")"
+python3 - "$context/docker_image_metadata.json" "$tag" "$selected" "$image_id" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "tag": sys.argv[2],
+    "base_image": sys.argv[3],
+    "image_id": sys.argv[4],
+    "built_at": datetime.now(timezone.utc).isoformat(),
+}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
 if [[ "$start" == "true" ]]; then
-  exec docker run --rm --publish 8080:8080 \
+  run_args=(
+    --rm
+    --read-only
+    --cap-drop ALL
+    --security-opt no-new-privileges:true
+    --pids-limit "${SANDBOX_PIDS_LIMIT:-128}"
+    --memory "${SANDBOX_MEMORY_LIMIT:-512m}"
+    --cpus "${SANDBOX_CPU_LIMIT:-1.0}"
+  )
+  for env_name in SANDBOX_TRAINER_API_KEY SANDBOX_LLM_API_KEY SANDBOX_LLM_BASE_URL SANDBOX_LLM_MODEL SANDBOX_LLM_TIMEOUT_SECONDS SANDBOX_LLM_MAX_RETRIES SANDBOX_EVALUATOR_MOCK; do
+    if [[ -n "${!env_name:-}" ]]; then run_args+=(--env "$env_name"); fi
+  done
+  if [[ -n "$env_file" ]]; then run_args+=(--env-file "$env_file"); fi
+  container_id="$(docker run -d "${run_args[@]}" --publish "$port:8000" \
     --mount "type=bind,source=$(cd "$context/data" && pwd),target=/workspace/data" \
-    "$tag"
+    "$tag")"
+  echo "沙箱容器已后台启动：$container_id"
 fi
