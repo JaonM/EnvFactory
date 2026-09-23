@@ -80,8 +80,8 @@ WIKIPEDIA_DUMP_DB=data/wikipedia.sqlite3
 任务生成完成后，会继续根据任务描述和环境生成 `rule-based/model-based` 观测指标，写入 `Task.metrics`。为提高工具选择训练的辨别能力，默认生成 2–3 个噪声工具并覆盖相关无关与完全无关两类；噪声工具由共享运行时提供无任务关键副作用的通用实现，不占用业务 handler 实现成本，也不产生任务进度奖励。工具生成前会把动作分类为环境操作、Agent 推理和 Agent 回答，只有环境操作可以暴露为工具。任务规模不再绑定具体构建模型，结构有效性由 schema、契约、任务级 readiness、外层验收和训练可用性门禁统一判断。
 
 沙箱通过普通 acceptance、outer conformance 和 mutation testing 后，还必须通过 `scripts/validate_training_readiness.py` 的 RL 环境硬门禁。该门禁执行结构化成功、失败、噪声及反事实轨迹，检查奖励可分离性、确定性和公开 observation 泄漏，并输出 `training_readiness.json`。
-默认在 `output/task_artifacts/task-N/task.json` 写入每个任务的最终文件；可通过 `--output` 指定输出根目录。Pipeline 运行日志默认写入 `output/task_generation.log`，也会输出到终端，可通过 `--log-file` 指定其他文件。日志记录任务级和阶段级开始、重试、成功、失败、耗时、产物路径和进度，不记录 Prompt 或凭据。任务默认并发生成 4 个，可通过 `--max-workers` 调整并发数。用户画像候选下位词查询默认每个关键词最多取 10 个，可通过 `--hierarchy-child-limit N` 调整；下位词查询并发度复用 `--max-workers`。Neo4j 路径查询默认 10 秒超时，可通过 `--path-query-timeout` 调整。
-使用 `--count N` 可批量生成 N 个任务；所有任务均以 JSONL 方式逐行追加输出。
+默认在 `output/task_artifacts/task-N/task.json` 写入每个任务的最终文件；可通过 `--output` 指定输出根目录。每次运行会扫描已有 `task-N`，从当前最大编号的下一号开始追加，绝不覆盖已有任务；并发进程通过原子目录预留避免编号冲突。Pipeline 运行日志默认追加写入 `output/task_generation.log`，也会输出到终端，可通过 `--log-file` 指定其他文件。日志记录任务级和阶段级开始、重试、成功、失败、耗时、产物路径和进度，不记录 Prompt 或凭据。任务默认并发生成 4 个，可通过 `--max-workers` 调整并发数。Neo4j 路径查询默认 10 秒超时，可通过 `--path-query-timeout` 调整。
+使用 `--count N` 可批量新增 N 个独立的 `task-N` 目录；失败任务会清理本次预留目录，但不会修改任何历史任务。
 
 任务环境由完整业务数据、数据说明文档、用户模拟素材、原子 Agent 动作和观测奖励设计组成，不再由任务生成阶段生成 `state`、`hidden_state` 或 `transition_rule` 记录。运行时状态、状态转移和终止执行逻辑由后续 Code Agent 在沙箱中根据业务数据和任务契约实现。
 任务生成结果不再包含 `constraints` 字段。沙箱构建脚本根据 `task.json` 中的 requirements、actions 和 metrics 派生只读的 `BUILD_CONTRACT.json`，供 Code Agent 进行阶段验收；`spec.md` 是设计说明，`BUILD_CONTRACT.json` 是构建阶段派生的外层约束。
