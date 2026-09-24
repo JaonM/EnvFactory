@@ -14,13 +14,16 @@ import copy
 import json
 import os
 import random
+import re
 import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+from urllib.request import Request, urlopen
 
 try:
     from .runtime_llm import RuntimeLLMClient, RuntimeLLMConfig, RuntimeLLMError
@@ -71,6 +74,47 @@ class JsonLog:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
+class ExternalCapabilityClient:
+    """Configured boundary for external-capability task tools.
+
+    Training can inject deterministic JSON fixtures; production can point the
+    same contract at an HTTP provider. Missing configuration is represented as
+    an explicit data gap, never fabricated market/search data.
+    """
+
+    def __init__(self) -> None:
+        self.base_url = os.getenv("SANDBOX_EXTERNAL_CAPABILITY_URL", "").rstrip("/")
+        self.fixture_path = os.getenv("SANDBOX_EXTERNAL_FIXTURES", "")
+
+    def query(self, capability: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if self.fixture_path:
+            fixtures = json.loads(Path(self.fixture_path).read_text(encoding="utf-8"))
+            value = fixtures.get(capability) if isinstance(fixtures, Mapping) else None
+            if isinstance(value, Mapping):
+                cases = value.get("cases")
+                if isinstance(cases, list):
+                    for case in cases:
+                        if isinstance(case, Mapping) and canonical_json(case.get("arguments")) == canonical_json(arguments):
+                            return dict(case["result"])
+                    return {"status": "data_unavailable", "items": [], "reason": "fixture has no matching arguments"}
+                if arguments:
+                    raise SandboxError("EXTERNAL_FIXTURE_INVALID", "parameterized capability requires argument-indexed fixture cases", 500)
+                return dict(value)
+        if self.base_url:
+            payload = canonical_json({"capability": capability, "arguments": dict(arguments)}).encode("utf-8")
+            with urlopen(Request(
+                self.base_url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+            ), timeout=float(os.getenv("SANDBOX_EXTERNAL_TIMEOUT_SECONDS", "15"))) as response:
+                value = json.loads(response.read().decode("utf-8"))
+            if not isinstance(value, Mapping):
+                raise SandboxError("EXTERNAL_RESPONSE_INVALID", "external provider returned a non-object", 502)
+            return dict(value)
+        return {
+            "status": "data_unavailable", "items": [], "capability": capability,
+            "source": None, "reason": "external capability provider is not configured",
+        }
+
+
 @dataclass(frozen=True)
 class Episode:
     episode_id: str
@@ -86,15 +130,45 @@ class EpisodeStore:
         self.db_path = str(db_path)
         self.schema_version = schema_version
         self._lock = threading.RLock()
+        self._local = threading.local()
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
+        existing = getattr(self._local, "connection", None)
+        if existing is not None:
+            yield existing
+            return
         connection = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+        self._local.connection = connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            self._local.connection = None
+            connection.close()
+
+    @contextmanager
+    def transaction(self):
+        with self._lock, self._connect():
+            yield
+
+    @contextmanager
+    def episode_context(self, episode_id: str | None):
+        previous = getattr(self._local, "episode_id", None)
+        self._local.episode_id = episode_id
+        try:
+            yield
+        finally:
+            self._local.episode_id = previous
 
     def _init_db(self) -> None:
         with self._connect() as db:
@@ -135,6 +209,9 @@ class EpisodeStore:
                     applied_at REAL NOT NULL
                 );
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(idempotency)")}
+            if "request_hash" not in columns:
+                db.execute("ALTER TABLE idempotency ADD COLUMN request_hash TEXT")
 
     def reset(self, *, episode_id: str | None = None, seed: int | None = None, data_hash: str = "") -> Episode:
         with self._lock, self._connect() as db:
@@ -150,7 +227,13 @@ class EpisodeStore:
 
     def current(self) -> Episode:
         with self._connect() as db:
-            row = db.execute("SELECT * FROM episodes WHERE active=1 ORDER BY created_at DESC LIMIT 1").fetchone()
+            selected = getattr(self._local, "episode_id", None)
+            if selected:
+                row = db.execute("SELECT * FROM episodes WHERE episode_id=?", (selected,)).fetchone()
+                if row is None:
+                    raise SandboxError("EPISODE_NOT_FOUND", "unknown episode", 404)
+            else:
+                row = db.execute("SELECT * FROM episodes WHERE active=1 ORDER BY created_at DESC LIMIT 1").fetchone()
         if row is None:
             return self.reset()
         return Episode(row["episode_id"], row["seed"], row["data_hash"], row["schema_version"])
@@ -165,8 +248,35 @@ class EpisodeStore:
             sequence = int(db.execute("SELECT COALESCE(MAX(sequence), 0) FROM events WHERE episode_id=?", (episode.episode_id,)).fetchone()[0]) + 1
             db.execute("INSERT INTO events VALUES(?,?,?,?,?,?)", (episode.episode_id, sequence, event_type, canonical_json(payload), canonical_json(result), time.time()))
             if idem_key:
-                db.execute("INSERT INTO idempotency VALUES(?,?,?,?)", (episode.episode_id, idem_key, canonical_json(result), time.time()))
+                db.execute("INSERT INTO idempotency(episode_id,idem_key,response_json,created_at,request_hash) VALUES(?,?,?,?,?)", (episode.episode_id, idem_key, canonical_json(result), time.time(), self._request_hash(event_type, payload)))
         return result
+
+    @staticmethod
+    def _request_hash(event_type: str, payload: Any) -> str:
+        stable = {key: value for key, value in payload.items() if key not in {"timestamp", "duration_ms", "tool_call_id"}} if isinstance(payload, Mapping) else payload
+        return sha256_json({"event": event_type, "payload": stable})
+
+    def execute_idempotent(
+        self,
+        idem_key: str,
+        event_type: str,
+        payload: Any,
+        operation: Callable[[], Any],
+    ) -> Any:
+        """Execute and record an operation at most once for the active episode."""
+        with self.transaction():
+            episode = self.current()
+            with self._connect() as db:
+                existing = db.execute(
+                    "SELECT response_json,request_hash FROM idempotency WHERE episode_id=? AND idem_key=?",
+                    (episode.episode_id, idem_key),
+                ).fetchone()
+            if existing:
+                if existing[1] != self._request_hash(event_type, payload):
+                    raise SandboxError("IDEMPOTENCY_CONFLICT", "idempotency key belongs to another request", 409)
+                return json.loads(existing[0])
+            result = operation()
+            return self.event(event_type, payload, result, idem_key=idem_key)
 
     def set_state(self, state_key: str, value: Any) -> None:
         episode = self.current()
@@ -209,21 +319,30 @@ class DataManifestValidator:
             schema = json.loads((root / schema_file).read_text(encoding="utf-8"))
             columns = {column["name"] for column in schema.get("columns", [])}
             rows = [json.loads(line) for line in (root / rows_file).read_text(encoding="utf-8").splitlines() if line.strip()]
-            if not rows or any(set(row) != columns for row in rows):
+            if any(set(row) != columns for row in rows):
                 raise SandboxError("DATA_INVALID", f"table {name} rows do not match schema", 500)
             primary = schema.get("primary_key", [])
-            if len({tuple(row[key] for key in primary) for row in rows}) != len(rows):
+            if primary and len({tuple(row[key] for key in primary) for row in rows}) != len(rows):
                 raise SandboxError("DATA_INVALID", f"table {name} primary key is not unique", 500)
             loaded[name] = rows
             for foreign_key in schema.get("foreign_keys", []):
                 if isinstance(foreign_key, dict):
-                    foreign_keys.append((name, foreign_key.get("column"), foreign_key.get("ref_table"), foreign_key.get("ref_column")))
+                    # Accept both the compact runtime vocabulary and the more
+                    # descriptive names emitted by task/data generators.  The
+                    # shared boundary is the right place to normalize these;
+                    # generated sandboxes should not need one-off adapters.
+                    ref_table = foreign_key.get("ref_table") or foreign_key.get("references_table")
+                    ref_column = foreign_key.get("ref_column") or foreign_key.get("references_column")
+                    foreign_keys.append((name, foreign_key.get("column"), ref_table, ref_column))
                 elif isinstance(foreign_key, (list, tuple)) and len(foreign_key) == 4:
                     foreign_keys.append(tuple(foreign_key))
         for table, column, ref_table, ref_column in foreign_keys:
             if not all(isinstance(value, str) and value for value in (table, column, ref_table, ref_column)):
                 raise SandboxError("DATA_INVALID", "foreign key declaration is invalid", 500)
-            if ref_table not in loaded or any(row.get(ref_column) not in {item.get(ref_column) for item in loaded[ref_table]} for row in loaded[table]):
+            if ref_table not in loaded or any(
+                row.get(column) not in {item.get(ref_column) for item in loaded[ref_table]}
+                for row in loaded[table]
+            ):
                 raise SandboxError("DATA_INVALID", f"foreign key {table}.{column} is invalid", 500)
         return {"tables": loaded, "data_hash": sha256_json(loaded)}
 
@@ -243,6 +362,53 @@ class ManifestDataStore:
         self.baseline: dict[str, list[dict[str, Any]]] = validated["tables"]
         self.data_hash: str = validated["data_hash"]
         self.episode_store = episode_store
+        self.schemas = {
+            table["table_name"]: json.loads((Path(root) / table["schema_file"]).read_text(encoding="utf-8"))
+            for table in manifest.get("tables", [])
+        }
+        self._validate_tables(self.baseline)
+
+    def _validate_tables(self, tables: Mapping[str, Any]) -> None:
+        for name, schema in self.schemas.items():
+            rows = tables[name]
+            columns = {column["name"]: column for column in schema.get("columns", [])}
+            primary = schema.get("primary_key", [])
+            seen: set[str] = set()
+            for row in rows:
+                if set(row) != set(columns):
+                    raise SandboxError("DATA_INVALID", f"fields do not match schema: {name}", 400)
+                for field, column in columns.items():
+                    value = row[field]
+                    if value is None and column.get("nullable") is True and field not in primary:
+                        continue
+                    if value is None and (field in primary or column.get("nullable") is False):
+                        raise SandboxError("DATA_INVALID", f"null field: {name}.{field}", 400)
+                    kind = str(column.get("type", "")).lower()
+                    kind = {"int": "integer", "float": "number", "double": "number", "text": "string", "bool": "boolean"}.get(kind, kind)
+                    if kind:
+                        validate_json_schema({**column, "type": kind}, value, f"{name}.{field}")
+                if primary:
+                    key = canonical_json([row[field] for field in primary])
+                    if key in seen:
+                        raise SandboxError("DATA_INVALID", f"duplicate primary key: {name}", 400)
+                    seen.add(key)
+            for field, column in columns.items():
+                if column.get("unique") is True:
+                    values = [canonical_json(row[field]) for row in rows if row[field] is not None]
+                    if len(values) != len(set(values)):
+                        raise SandboxError("DATA_INVALID", f"duplicate unique field: {name}.{field}", 400)
+            for foreign in schema.get("foreign_keys", []):
+                if isinstance(foreign, Mapping):
+                    field = foreign.get("column")
+                    parent = foreign.get("ref_table") or foreign.get("references_table")
+                    target = foreign.get("ref_column") or foreign.get("references_column")
+                else:
+                    _, field, parent, target = foreign
+                if parent not in tables or any(
+                    row.get(field) is not None and not any(other.get(target) == row.get(field) for other in tables[parent])
+                    for row in rows
+                ):
+                    raise SandboxError("DATA_INVALID", f"foreign key violation: {name}.{field}", 400)
 
     def reset(self, _episode: Episode | None = None) -> None:
         self.episode_store.set_state(self.STATE_KEY, copy.deepcopy(self.baseline))
@@ -272,11 +438,12 @@ class ManifestDataStore:
         tables = self._all()
         if name not in tables:
             raise SandboxError("NOT_FOUND", f"unknown business table: {name}", 404)
-        original_columns = set(tables[name][0]) if tables[name] else set()
+        original_columns = {column["name"] for column in self.schemas[name].get("columns", [])}
         replacement = [dict(row) for row in rows]
         if any(set(row) != original_columns for row in replacement):
             raise SandboxError("DATA_INVALID", f"replacement rows for {name} do not match schema", 400)
         tables[name] = replacement
+        self._validate_tables(tables)
         self.episode_store.set_state(self.STATE_KEY, tables)
 
     def insert(self, name: str, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -369,7 +536,7 @@ class DeclarativeToolCompiler:
                     if self._matches(row.get(rule["column"]), arguments[argument], rule["operator"])
                 ]
             if order_by:
-                rows.sort(key=lambda row: tuple(str(row.get(field, "")) for field in order_by))
+                rows.sort(key=lambda row: tuple((row.get(field) is None, row.get(field)) for field in order_by))
             if projection:
                 rows = [{field: row.get(field) for field in projection} for row in rows]
             return rows
@@ -448,6 +615,17 @@ def validate_json_schema(schema: Mapping[str, Any], value: Any, path: str = "arg
     enum = schema.get("enum")
     if isinstance(enum, list) and value not in enum:
         raise SandboxError("INVALID_ARGUMENT", f"{path} is not an allowed value", 400)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        import math
+        if not math.isfinite(value):
+            raise SandboxError("INVALID_ARGUMENT", f"{path} must be finite", 400)
+        for boundary, invalid in (("minimum", lambda limit: value < limit), ("maximum", lambda limit: value > limit)):
+            if boundary in schema and invalid(schema[boundary]):
+                raise SandboxError("INVALID_ARGUMENT", f"{path} violates {boundary}", 400)
+    if isinstance(value, (list, str)):
+        low, high = ("minItems", "maxItems") if isinstance(value, list) else ("minLength", "maxLength")
+        if len(value) < schema.get(low, 0) or len(value) > schema.get(high, float("inf")):
+            raise SandboxError("INVALID_ARGUMENT", f"{path} has invalid length", 400)
     if kind == "object":
         properties = schema.get("properties", {})
         required = schema.get("required", [])
@@ -477,10 +655,12 @@ class ContractToolRegistry:
         *,
         noise_tools: Sequence[Mapping[str, Any]] = (),
         event_recorder: Callable[..., Any] | None = None,
+        tool_contracts: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         self.tools = [dict(item) for item in tools]
         self.handlers = dict(handlers)
         self.event_recorder = event_recorder
+        self.output_schemas = {item["name"]: item.get("output_contract", {}).get("schema") for item in tool_contracts}
         self.noise_tools = {
             item.get("name"): dict(item)
             for item in noise_tools
@@ -505,31 +685,51 @@ class ContractToolRegistry:
         if not isinstance(arguments, Mapping):
             raise SandboxError("INVALID_ARGUMENT", "tool arguments must be an object", 400)
         args = dict(arguments)
-        validate_json_schema(self.schemas[name], args)
         mutation = os.getenv("SANDBOX_MUTATION_MODE", "disabled")
-        if mutation == "constant_tool_result":
-            result: Any = {"mutation": "constant_tool_result", "value": None}
-        elif name in self.noise_tools:
-            metadata = self.noise_tools[name]
-            result = {
-                "status": "ok",
-                "tool": name,
-                "category": metadata.get("category"),
-                "message": "Tool executed without changing task-critical business state.",
-            }
-        else:
-            result = self.handlers[name](args)
-        if self.event_recorder is not None and mutation != "skip_business_write":
-            self.event_recorder(
-                "tool_call",
-                {
-                    "tool_name": name,
-                    "arguments": args,
-                    "noise": name in self.noise_tools,
-                },
-                result,
-                idem_key=idem_key,
-            )
+        if mutation != "ignore_tool_arguments":
+            validate_json_schema(self.schemas[name], args)
+        tool_started = time.monotonic()
+        event_payload = {
+            "tool_name": name, "arguments": args, "noise": name in self.noise_tools,
+            "tool_call_id": f"call-{uuid.uuid4().hex}", "timestamp": time.time(),
+        }
+
+        def invoke() -> Any:
+            try:
+                if mutation == "constant_tool_result":
+                    return {"mutation": "constant_tool_result", "value": None}
+                if mutation == "skip_business_write" and name not in self.noise_tools:
+                    return {"status": "ok", "mutation": "skip_business_write"}
+                if name in self.noise_tools:
+                    metadata = self.noise_tools[name]
+                    if name.startswith("roll_virtual_die"):
+                        return {"value": random.Random(sha256_json(args)).randint(1, 6)}
+                    rows = copy.deepcopy(metadata.get("records", []))
+                    for argument, column in metadata.get("parameter_columns", {}).items():
+                        if argument in args:
+                            rows = [row for row in rows if row.get(column) == args[argument]]
+                    return {"records": rows, "count": len(rows)}
+                result = self.handlers[name](args)
+                output_schema = self.output_schemas.get(name)
+                if isinstance(output_schema, Mapping):
+                    try:
+                        validate_json_schema(output_schema, result, "tool_result")
+                    except SandboxError as exc:
+                        raise SandboxError("TOOL_RESULT_INVALID", str(exc), 500) from exc
+                return result
+            finally:
+                event_payload["duration_ms"] = round((time.monotonic() - tool_started) * 1000, 3)
+        recorder_owner = getattr(self.event_recorder, "__self__", None)
+        if isinstance(recorder_owner, EpisodeStore):
+            with recorder_owner.transaction():
+                if idem_key:
+                    return recorder_owner.execute_idempotent(idem_key, "tool_call", event_payload, invoke)
+                result = invoke()
+                recorder_owner.event("tool_call", event_payload, result)
+                return result
+        result = invoke()
+        if self.event_recorder is not None:
+            self.event_recorder("tool_call", event_payload, result, idem_key=idem_key)
         return result
 
 
@@ -544,11 +744,23 @@ class ContractRewardAggregator:
     def aggregate(self, scores: Mapping[str, Any]) -> dict[str, Any]:
         components: dict[str, float] = {}
         raw_reward = 0.0
+        declared_ids = {
+            metric.get("id") for metric in self.metrics
+            if isinstance(metric.get("id"), str) and metric.get("id")
+        }
+        missing = sorted(declared_ids - set(scores))
+        if missing:
+            raise SandboxError(
+                "REWARD_SCORE_MISSING",
+                "declared metrics have no runtime score",
+                500,
+                missing,
+            )
         for metric in self.metrics:
             metric_id = metric.get("id")
             if not isinstance(metric_id, str) or not metric_id:
                 raise SandboxError("REWARD_CONTRACT_INVALID", "metric id is invalid", 500)
-            value = float(scores.get(metric_id, 0.0))
+            value = float(scores[metric_id])
             score_range = metric.get("score_range")
             if not isinstance(score_range, list) or len(score_range) != 2:
                 raise SandboxError("REWARD_CONTRACT_INVALID", f"metric {metric_id} range is invalid", 500)
@@ -565,6 +777,250 @@ class ContractRewardAggregator:
         }
 
 
+class BusinessGoalEvaluator:
+    """Finite row predicates used by generation, execution and acceptance."""
+
+    @staticmethod
+    def evaluate(predicates: Sequence[Mapping[str, Any]], state: Mapping[str, Any]) -> bool:
+        if not predicates:
+            return False
+        for predicate in predicates:
+            table = predicate.get("table")
+            selector = predicate.get("where", {})
+            if table not in state or not isinstance(selector, Mapping):
+                return False
+            rows = [row for row in state[table] if all(row.get(key) == value for key, value in selector.items())]
+            expected = predicate.get("values", {})
+            matching = [row for row in rows if all(row.get(key) == value for key, value in expected.items())]
+            if len(matching) != predicate.get("count"):
+                return False
+        return True
+
+    @staticmethod
+    def preserves_unrelated(goal: Mapping[str, Any], baseline: Mapping[str, Any], state: Mapping[str, Any]) -> bool:
+        if set(baseline) != set(state):
+            return False
+        predicates = goal.get("row_predicates", [])
+        for table, old_rows in baseline.items():
+            relevant = [item for item in predicates if item.get("table") == table]
+            if not relevant:
+                if old_rows != state[table]:
+                    return False
+                continue
+            keys = goal.get("table_primary_keys", {}).get(table, [])
+            if not keys:  # legacy contracts have no row identity metadata
+                continue
+            index = lambda rows: {canonical_json([row.get(key) for key in keys]): row for row in rows}
+            before, after = index(old_rows), index(state[table])
+            for identity in before.keys() | after.keys():
+                old, new = before.get(identity), after.get(identity)
+                if old == new:
+                    continue
+                candidates = [item for item in relevant if all((old or new).get(key) == value for key, value in item.get("where", {}).items())]
+                if old is None:
+                    valid = any(item["count"] > 0 and all(new.get(key) == value for key, value in item["values"].items()) for item in candidates)
+                elif new is None:
+                    valid = any(item["count"] == 0 for item in candidates)
+                else:
+                    changed = {key for key in old.keys() | new.keys() if old.get(key) != new.get(key)}
+                    valid = any(changed <= set(item["values"]) for item in candidates)
+                if not valid:
+                    return False
+        return True
+
+
+class ContractRewardGate:
+    """Apply curriculum-level causal prerequisites before reward aggregation."""
+
+    def __init__(self, task_spec: Mapping[str, Any], metrics: Sequence[Mapping[str, Any]]) -> None:
+        self.task_spec = dict(task_spec)
+        self.metrics = [dict(item) for item in metrics]
+
+    def apply(self, scores: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(scores)
+        training = self.task_spec.get("training_contract", {})
+        category = training.get("category") if isinstance(training, Mapping) else None
+        dag = self.task_spec.get("capability_dag", {})
+        required = set(dag.get("nodes", [])) if isinstance(dag, Mapping) else set()
+        trajectory = context.get("trajectory", {})
+        events = trajectory.get("events", []) if isinstance(trajectory, Mapping) else []
+        all_calls = [
+            str(event.get("payload", {}).get("tool_name"))
+            for event in events if isinstance(event, Mapping)
+            and event.get("event") == "tool_call"
+            and isinstance(event.get("payload"), Mapping)
+        ]
+        business_calls = [
+            str(event.get("payload", {}).get("tool_name"))
+            for event in events if isinstance(event, Mapping)
+            and event.get("event") == "tool_call"
+            and isinstance(event.get("payload"), Mapping)
+            and event.get("payload", {}).get("noise") is not True
+        ]
+        called = set(business_calls)
+        edges = dag.get("edges", []) if isinstance(dag, Mapping) else []
+        # A later valid retry can establish a dependency after an early mistake.
+        calls = [event for event in events if isinstance(event, Mapping) and event.get("event") == "tool_call"
+                 and isinstance(event.get("payload"), Mapping)]
+        def established(edge: Mapping[str, Any]) -> bool:
+            for index, event in enumerate(calls):
+                if event["payload"].get("tool_name") != edge.get("to_tool"):
+                    continue
+                for previous in calls[:index]:
+                    if previous["payload"].get("tool_name") != edge.get("from_tool"):
+                        continue
+                    if edge.get("argument_path") and edge.get("result_path"):
+                        source = DeclarativeMetricEvaluator._resolve(previous.get("result"), edge["result_path"])
+                        target = DeclarativeMetricEvaluator._resolve(event["payload"].get("arguments", {}), edge["argument_path"])
+                        if source is not None and source == target:
+                            return True
+                    else:
+                        return True
+            return False
+        paths = dag.get("success_paths") or [list(required)]
+        dependency_progress = any(
+            bool(path) and set(path) <= called and any(
+                edge.get("from_tool") in path and edge.get("to_tool") in path for edge in edges
+            ) and all(established(edge) for edge in edges
+                      if edge.get("from_tool") in path and edge.get("to_tool") in path)
+            for path in paths
+        )
+        unresolved = any(
+            isinstance(event, Mapping)
+            and event.get("event") == "user_turn"
+            and isinstance(event.get("result"), Mapping)
+            and event.get("result", {}).get("termination_reason") == "unresolved_dialogue"
+            for event in events
+        )
+        causal_progress = (
+            not unresolved
+            and (
+                (category == "direct_response")
+                or (category == "simple_agentic" and bool(required & called))
+                or (
+                    category == "multi_step_agentic"
+                    and bool(edges)
+                    and dependency_progress
+                )
+            )
+        )
+        goals = self.task_spec.get("goal_contract", {})
+        predicates = goals.get("row_predicates", [])
+        if predicates:
+            baseline = context.get("initial_business_state", {})
+            state = context.get("business_state", {})
+            causal_progress = causal_progress and BusinessGoalEvaluator.evaluate(predicates, state)
+            if goals.get("requires_state_change"):
+                causal_progress = causal_progress and not BusinessGoalEvaluator.evaluate(predicates, baseline) and state != baseline
+                causal_progress = causal_progress and BusinessGoalEvaluator.preserves_unrelated(goals, baseline, state)
+        if not causal_progress:
+            for metric in self.metrics:
+                if metric.get("category") == "outcome" and metric.get("id") in result:
+                    low = metric.get("score_range", [0, 1])[0]
+                    result[str(metric["id"])] = float(low)
+        return result
+
+
+class ContractEvaluatorRuntime:
+    """Cached, trace-visible boundary for contract-declared LLM evaluators."""
+
+    STATE_KEY = "evaluator_cache"
+
+    def __init__(self, episode_store: EpisodeStore) -> None:
+        self.episode_store = episode_store
+
+    def json_judge(
+        self,
+        metric: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        fallback: Mapping[str, Any],
+        response_schema: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]:
+        # Evaluator calls are trace events, not task progress. Excluding them
+        # keeps repeated reward reads idempotent and makes the cache effective.
+        def stable(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return {key: stable(item) for key, item in value.items()
+                        if key not in {"timestamp", "duration_ms", "created_at", "trace_hash", "request_id", "tool_call_id", "sequence"}}
+            if isinstance(value, list):
+                return [stable(item) for item in value if not (
+                    isinstance(item, Mapping) and (item.get("event") or item.get("kind")) == "evaluator_call"
+                )]
+            return value
+        stable_context = stable(context)
+        context_hash = sha256_json({
+            "metric_id": metric.get("id"), "evaluator": metric.get("evaluator"),
+            "context": stable_context,
+        })
+        cache = self.episode_store.get_state(self.STATE_KEY, {})
+        if isinstance(cache, Mapping) and context_hash in cache:
+            return dict(cache[context_hash])
+        result: Mapping[str, Any]
+        used_fallback = False
+        try:
+            result = RuntimeLLMClient().json_chat(
+                [
+                    {"role": "system", "content": "Evaluate the supplied metric and return only a JSON object."},
+                    {"role": "user", "content": canonical_json({"metric": metric, "context": stable_context})},
+                ],
+                response_schema=response_schema or {"type": "object"},
+            )
+            if not isinstance(result, Mapping):
+                raise RuntimeLLMError("evaluator returned a non-object")
+        except (RuntimeLLMError, OSError, ValueError, TypeError):
+            result, used_fallback = dict(fallback), True
+        updated = dict(cache) if isinstance(cache, Mapping) else {}
+        updated[context_hash] = dict(result)
+        self.episode_store.set_state(self.STATE_KEY, updated)
+        self.episode_store.event("evaluator_call", {
+            "metric_id": metric.get("id"), "context_hash": context_hash,
+            "cached": False, "used_fallback": used_fallback,
+        }, dict(result))
+        return dict(result)
+
+
+class ContractModelMetricEvaluator:
+    """Platform-owned semantic outcome evaluator and explicitly limited fixture mode."""
+
+    def __init__(self, contract: Mapping[str, Any], store: EpisodeStore) -> None:
+        self.contract, self.store = contract, store
+        self.runtime = ContractEvaluatorRuntime(store)
+
+    def evaluate_all(self, context: Mapping[str, Any], existing: Mapping[str, float]) -> dict[str, float]:
+        scores = {}
+        mock = os.getenv("SANDBOX_EVALUATOR_MOCK", "").lower() in {"1", "true", "yes"}
+        for metric in self.contract.get("metrics", []):
+            metric_id = metric["id"]
+            if metric_id in existing or metric.get("evaluator", {}).get("kind") != "external_llm_judge":
+                continue
+            mapping = metric["evaluator"].get("score_mapping", {})
+            labels = {name: value for name, value in mapping.items()
+                      if isinstance(value, (int, float)) and not isinstance(value, bool)}
+            if not labels:
+                raise SandboxError("EVALUATOR_CONTRACT_INVALID", "semantic evaluator requires numeric label mapping", 500)
+            low, high = metric.get("score_range", [0, 1])
+            if any(not low <= value <= high for value in labels.values()):
+                raise SandboxError("EVALUATOR_CONTRACT_INVALID", "semantic score mapping exceeds declared range", 500)
+            failure = min(labels, key=labels.get)
+            if mock:
+                references = [step.get("content")
+                              for scenario in self.contract.get("acceptance_contract", {}).get("executable_scenarios", [])
+                              if scenario.get("kind") == "goal_success"
+                              for step in scenario.get("steps", []) if step.get("operation") == "agent_response"]
+                response = context.get("final_agent_response")
+                label = max(labels, key=labels.get) if response and response in references else failure
+                scores[metric_id] = float(labels[label])
+                self.store.event("evaluator_call", {"metric_id": metric_id, "mode": "offline_fixture", "semantic_verification": False}, {"label": label})
+            else:
+                result = self.runtime.json_judge(metric, context, fallback={"label": failure}, response_schema={
+                    "type": "object", "required": ["label"],
+                    "properties": {"label": {"type": "string", "enum": list(labels)}},
+                })
+                scores[metric_id] = float(labels[result["label"]])
+        return scores
+
+
 class DeclarativeMetricEvaluator:
     """Evaluate deterministic metric predicates from a constrained DSL."""
 
@@ -575,7 +1031,7 @@ class DeclarativeMetricEvaluator:
         current = value
         if path in {"", "$"}:
             return current
-        normalized = path.removeprefix("$.")
+        normalized = re.sub(r"\[(\d+)\]", r".\1", path).removeprefix("$.")
         for part in normalized.split("."):
             if isinstance(current, Mapping):
                 current = current.get(part)
@@ -653,34 +1109,128 @@ class DeclarativeMetricEvaluator:
 
 
 class ContractUserSimulator:
-    """Seeded, episode-isolated user-session controller with safe fallback."""
+    """Episode-isolated FSM user driven by a runtime LLM with safe fallback."""
 
     STATE_KEY = "user_simulator"
+    NORMAL_OUTCOMES = frozenset({
+        "goal_satisfied", "information_required", "user_correction",
+        "user_rejection", "user_acceptance",
+    })
+    RECOVERY_OUTCOMES = frozenset({
+        "agent_off_topic", "agent_premature_completion", "unrecognized",
+    })
 
     def __init__(
         self,
         episode_store: EpisodeStore,
-        sessions: Sequence[Mapping[str, Any]],
+        sessions: Sequence[Mapping[str, Any]] = (),
         *,
+        profiles: Sequence[Mapping[str, Any]] = (),
+        scripts: Sequence[Mapping[str, Any]] = (),
         renderer: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> None:
         self.episode_store = episode_store
-        self.sessions = [dict(item) for item in sessions]
+        # ``sessions`` is accepted only for source compatibility. Runtime user
+        # behavior must not replay task-generation dialogue samples.
+        self.sessions = []
+        self.profiles = {str(item.get("profile_id")): dict(item) for item in profiles if isinstance(item, Mapping)}
+        self.scripts = {
+            str(item.get("script_id")): self._normalize_script(item)
+            for item in scripts if isinstance(item, Mapping)
+        }
         self.renderer = renderer
-        if not self.sessions:
-            raise SandboxError("USER_SIMULATION_INVALID", "sessions must not be empty", 500)
-        for session in self.sessions:
-            if not isinstance(session.get("turns"), list) or not session["turns"]:
-                raise SandboxError("USER_SIMULATION_INVALID", "each session requires turns", 500)
-            user_turn_count = sum(1 for item in session["turns"] if isinstance(item, Mapping) and item.get("role") == "user")
-            flags = session.get("user_end_flags")
-            if not isinstance(flags, list) or len(flags) != user_turn_count or any(not isinstance(item, bool) for item in flags):
-                raise SandboxError("USER_SIMULATION_INVALID", "user_end_flags must match user turns", 500)
+        if not self.profiles or not self.scripts:
+            raise SandboxError("USER_SIMULATION_INVALID", "profiles and FSM scripts must not be empty", 500)
+
+    @classmethod
+    def _normalize_script(cls, source: Mapping[str, Any]) -> dict[str, Any]:
+        """Upgrade legacy FSMs to the typed dialogue-outcome protocol."""
+        script = copy.deepcopy(dict(source))
+        terminal_ids = {
+            item.get("state_id") for item in script.get("states", [])
+            if isinstance(item, Mapping) and item.get("terminal") is True
+        }
+        transitions = []
+        for raw in script.get("transitions", []):
+            if not isinstance(raw, Mapping):
+                continue
+            item = dict(raw)
+            if item.get("outcome_category") not in cls.NORMAL_OUTCOMES:
+                condition = str(item.get("condition", "")).casefold()
+                if item.get("to_state") in terminal_ids:
+                    outcome = "user_acceptance"
+                elif any(marker in condition for marker in ("补充", "信息", "澄清", "clarif", "information")):
+                    outcome = "information_required"
+                elif any(marker in condition for marker in ("纠正", "更正", "correct")):
+                    outcome = "user_correction"
+                elif any(marker in condition for marker in ("拒绝", "不接受", "reject")):
+                    outcome = "user_rejection"
+                else:
+                    outcome = "goal_satisfied"
+                item["outcome_category"] = outcome
+            transitions.append(item)
+        script["transitions"] = transitions
+        recovery = dict(script.get("recovery_policy", {}))
+        recovery.setdefault("max_recoveries", 2)
+        recovery.setdefault("user_behavior", "指出回复没有解决当前问题，并要求 Agent 重新回答。")
+        recovery["handled_outcomes"] = sorted(cls.RECOVERY_OUTCOMES)
+        script["recovery_policy"] = recovery
+        return script
 
     def reset(self, episode: Episode | None = None) -> None:
         episode = episode or self.episode_store.current()
-        index = random.Random(episode.seed).randrange(len(self.sessions))
-        self.episode_store.set_state(self.STATE_KEY, {"session_index": index, "turn_index": 0, "memory": []})
+        rng = random.Random(episode.seed)
+        script_id = sorted(self.scripts)[rng.randrange(len(self.scripts))]
+        profile_id = sorted(self.profiles)[rng.randrange(len(self.profiles))]
+        script = self.scripts[script_id]
+        self.episode_store.set_state(self.STATE_KEY, {
+            "turn_index": 0, "memory": [],
+            "script_id": script_id, "profile_id": profile_id,
+            "state_id": script.get("initial_state"), "variables": copy.deepcopy(script.get("variables", {})),
+            "recovery_count": 0, "termination_reason": None,
+        })
+
+    @staticmethod
+    def _llm_render(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        return RuntimeLLMClient().json_chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Act as the simulated user described by the supplied profile and current FSM state. "
+                        "Classify the dialogue into exactly one declared outcome_category. Normal outcomes are "
+                        "goal_satisfied, information_required, user_correction, user_rejection, user_acceptance. "
+                        "Recovery outcomes are agent_off_topic, agent_premature_completion, unrecognized. "
+                        "Normal outcomes require match_status=matched and one listed transition with the same category. "
+                        "Recovery outcomes require unmatched, except unrecognized may be ambiguous, and no transition. Return only JSON. "
+                        "Do not answer the user's own task, reveal hidden state, or invent business facts."
+                    ),
+                },
+                {"role": "user", "content": canonical_json(payload)},
+            ],
+            response_schema={
+                "type": "object",
+                "required": ["user_query", "match_status", "outcome_category", "reason_code"],
+                "properties": {
+                    "user_query": {"type": "string"},
+                    "transition_id": {"type": "string"},
+                    "match_status": {"type": "string", "enum": ["matched", "unmatched", "ambiguous"]},
+                    "outcome_category": {"type": "string"},
+                    "reason_code": {"type": "string"},
+                },
+            },
+        )
+
+    @classmethod
+    def _fallback_render(cls, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Infrastructure failure cannot establish user acceptance or success."""
+        return {
+            "user_query": "暂时无法确认当前回复，请稍后重试。",
+            "transition_id": None,
+            "match_status": "unmatched",
+            "outcome_category": "unrecognized",
+            "reason_code": "simulator_unavailable",
+        }
 
     def turn(self, messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
@@ -691,28 +1241,108 @@ class ContractUserSimulator:
         if not isinstance(state, dict):
             self.reset()
             state = self.episode_store.get_state(self.STATE_KEY)
-        session = self.sessions[int(state["session_index"])]
-        user_turns = [item for item in session["turns"] if isinstance(item, Mapping) and item.get("role") == "user"]
-        if not user_turns:
-            raise SandboxError("USER_SIMULATION_INVALID", "session has no user turns", 500)
-        index = min(int(state["turn_index"]), len(user_turns) - 1)
-        fallback = {
-            "user_query": str(user_turns[index].get("content", "")),
-            "should_end": bool(session.get("user_end_flags", [False] * len(user_turns))[index]),
-            "attachments": list(user_turns[index].get("attachments", [])),
+        script = self.scripts.get(str(state.get("script_id")), {})
+        profile = self.profiles.get(str(state.get("profile_id")), {})
+        if state.get("termination_reason"):
+            return {
+                "user_query": "本次对话已经结束。",
+                "should_end": True,
+                "attachments": [],
+                "termination_reason": state["termination_reason"],
+            }
+        index = int(state["turn_index"])
+        transitions = [
+            item for item in script.get("transitions", [])
+            if isinstance(item, Mapping) and item.get("from_state") == state.get("state_id")
+        ] if isinstance(script, Mapping) else []
+        current_state = next((
+            dict(item) for item in script.get("states", [])
+            if isinstance(item, Mapping) and item.get("state_id") == state.get("state_id")
+        ), {}) if isinstance(script, Mapping) else {}
+        payload = {
+            "messages": list(messages), "profile": profile,
+            "current_state": current_state, "state_id": state.get("state_id"),
+            "variables": copy.deepcopy(state.get("variables", {})),
+            "transitions": transitions, "turn_index": index,
+            "recovery_count": int(state.get("recovery_count", 0)),
+            "recovery_policy": dict(script.get("recovery_policy", {})),
         }
-        result = fallback
-        if self.renderer is not None:
-            try:
-                candidate = self.renderer({"messages": list(messages), "session": session, "turn_index": index, "fallback": fallback})
-                if isinstance(candidate, Mapping) and isinstance(candidate.get("user_query"), str) and isinstance(candidate.get("should_end"), bool):
-                    result = {"user_query": candidate["user_query"], "should_end": candidate["should_end"], "attachments": list(candidate.get("attachments", []))}
-            except Exception:
-                result = fallback
+        used_fallback = False
+        try:
+            candidate = (self.renderer or self._llm_render)(payload)
+            if not isinstance(candidate, Mapping) or not isinstance(candidate.get("user_query"), str) or not candidate["user_query"].strip():
+                raise RuntimeLLMError("user renderer returned an invalid user_query")
+            match_status = candidate.get("match_status")
+            if match_status is None:  # custom renderer compatibility
+                match_status = "matched" if candidate.get("transition_id") else "unmatched"
+            if match_status not in {"matched", "unmatched", "ambiguous"}:
+                raise RuntimeLLMError("user renderer returned an invalid match_status")
+            outcome = candidate.get("outcome_category")
+            if outcome is None and match_status == "matched":  # custom renderer compatibility
+                selected = next((item for item in transitions if item.get("transition_id") == candidate.get("transition_id")), {})
+                outcome = selected.get("outcome_category")
+            if outcome not in self.NORMAL_OUTCOMES | self.RECOVERY_OUTCOMES:
+                raise RuntimeLLMError("user renderer returned an invalid outcome_category")
+            transition_ids = {item.get("transition_id") for item in transitions}
+            if match_status == "matched" and candidate.get("transition_id") not in transition_ids:
+                raise RuntimeLLMError("user renderer selected an invalid transition")
+            selected = next((item for item in transitions if item.get("transition_id") == candidate.get("transition_id")), None)
+            if outcome in self.NORMAL_OUTCOMES and (
+                match_status != "matched" or selected is None or selected.get("outcome_category") != outcome
+            ):
+                raise RuntimeLLMError("normal outcome does not match the selected transition")
+            if outcome in self.RECOVERY_OUTCOMES and (
+                match_status == "matched" or candidate.get("transition_id") not in {None, ""}
+            ):
+                raise RuntimeLLMError("recovery outcome must not select a normal transition")
+            if outcome in {"agent_off_topic", "agent_premature_completion"} and match_status != "unmatched":
+                raise RuntimeLLMError("recognized recovery outcome must be unmatched")
+            if outcome == "unrecognized" and match_status not in {"unmatched", "ambiguous"}:
+                raise RuntimeLLMError("unrecognized outcome must be unmatched or ambiguous")
+            result = {
+                "user_query": candidate["user_query"].strip(),
+                "transition_id": candidate.get("transition_id") if match_status == "matched" else None,
+                "match_status": match_status,
+                "outcome_category": outcome,
+                "reason_code": str(candidate.get("reason_code") or match_status),
+                "attachments": list(candidate.get("attachments", [])),
+            }
+        except Exception:
+            used_fallback = True
+            fallback = self._fallback_render(payload)
+            result = {**fallback, "attachments": []}
+        if result["match_status"] != "matched":
+            recovery_policy = script.get("recovery_policy", {})
+            maximum = int(recovery_policy.get("max_recoveries", 2))
+            state["recovery_count"] = int(state.get("recovery_count", 0)) + 1
+            result["should_end"] = state["recovery_count"] >= maximum
+            if result["should_end"]:
+                state["termination_reason"] = "unresolved_dialogue"
+                result["termination_reason"] = "unresolved_dialogue"
+        elif transitions:
+            requested = result.get("transition_id") if isinstance(result, Mapping) else None
+            transition = next((item for item in transitions if item.get("transition_id") == requested), None)
+            if transition is not None:
+                state["recovery_count"] = 0
+                state["state_id"] = transition.get("to_state")
+                state["variables"] = {**state.get("variables", {}), **dict(transition.get("updates", {}))}
+                terminal_states = {
+                    item.get("state_id") for item in script.get("states", [])
+                    if isinstance(item, Mapping) and item.get("terminal") is True
+                }
+                result["should_end"] = bool(transition.get("should_end") or state["state_id"] in terminal_states)
+                if result["should_end"]:
+                    state["termination_reason"] = "completed"
+                    result["termination_reason"] = "completed"
+            else:
+                result["should_end"] = False
+        else:
+            result["should_end"] = bool(current_state.get("terminal"))
+        result.pop("transition_id", None)
         state["turn_index"] = index + 1
         state["memory"] = [*state.get("memory", []), {"messages": list(messages), "result": result}]
         self.episode_store.set_state(self.STATE_KEY, state)
-        self.episode_store.event("user_turn", {"messages": list(messages)}, result)
+        self.episode_store.event("user_turn", {"messages": list(messages), "used_fallback": used_fallback}, result)
         return result
 
 
@@ -755,17 +1385,36 @@ class SandboxApplication:
         body: Any = None,
         headers: Mapping[str, str] | None = None,
     ) -> tuple[int, dict[str, Any], dict[str, str]]:
+        started = time.monotonic()
         request = request_id()
         supplied = dict(headers or {})
         response_headers = {"Content-Type": "application/json", "X-Request-ID": request}
         try:
-            payload = self._dispatch(method.upper(), path, body, supplied)
-            return 200, dict(payload), response_headers
+            episode_id = self._header(supplied, "X-Episode-ID")
+            with self.episode_store.episode_context(episode_id):
+                with self.episode_store.transaction():
+                    payload = self._dispatch(method.upper(), path, body, supplied)
+            status, response = 200, dict(payload)
         except SandboxError as exc:
-            return exc.status, exc.body(request), response_headers
+            status, response = exc.status, exc.body(request)
         except Exception as exc:  # keep the public protocol stable
             error = SandboxError("INTERNAL_ERROR", "sandbox request failed", 500, {"type": type(exc).__name__})
-            return error.status, error.body(request), response_headers
+            status, response = error.status, error.body(request)
+        tool_call_id = None
+        if path.startswith("/v1/tools/"):
+            tool_call_id = f"call-{uuid.uuid4().hex}"
+            response_headers["X-Tool-Call-ID"] = tool_call_id
+        try:
+            with self.episode_store.episode_context(self._header(supplied, "X-Episode-ID")):
+                episode_id = self.episode_store.current().episode_id if path != "/health" else None
+        except Exception:
+            episode_id = None
+        JsonLog("sandbox.request").emit(
+            "request_completed", request_id=request, episode_id=episode_id,
+            tool_call_id=tool_call_id, method=method.upper(), path=path, status=status,
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+        )
+        return status, response, response_headers
 
     def _dispatch(self, method: str, path: str, body: Any, headers: Mapping[str, str]) -> Mapping[str, Any]:
         if method == "GET" and path == "/health":
@@ -773,7 +1422,8 @@ class SandboxApplication:
         if method == "GET" and path == "/v1/tools":
             return {"tools": self.tool_registry.tools}
         trainer_paths = {"/v1/reset", "/v1/observation", "/v1/user_simulator", "/v1/agent_response", "/v1/reward", "/v1/replay"}
-        if path in trainer_paths:
+        mutation = os.getenv("SANDBOX_MUTATION_MODE", "disabled")
+        if path in trainer_paths and mutation != "bypass_trainer_auth":
             require_trainer(self._header(headers, "Authorization"))
         if method == "POST" and path == "/v1/reset":
             if body is None:
@@ -783,8 +1433,11 @@ class SandboxApplication:
             unknown = sorted(set(body) - {"episode_id", "seed"})
             if unknown:
                 raise SandboxError("INVALID_ARGUMENT", "reset has unexpected properties", 400, unknown)
+            selected = self._header(headers, "X-Episode-ID")
+            if selected and body.get("episode_id", selected) != selected:
+                raise SandboxError("EPISODE_CONFLICT", "reset episode differs from X-Episode-ID", 409)
             episode = self.episode_store.reset(
-                episode_id=body.get("episode_id"), seed=body.get("seed"), data_hash=self.data_hash
+                episode_id=body.get("episode_id") or selected, seed=body.get("seed"), data_hash=self.data_hash
             )
             if self.reset_hook:
                 self.reset_hook(episode)
@@ -808,6 +1461,8 @@ class SandboxApplication:
             self.episode_store.event("agent_response", {"content": content}, {"accepted": True})
             return {"accepted": True}
         if method == "GET" and path == "/v1/reward":
+            if mutation == "constant_reward":
+                return {"reward": 0.0, "raw_reward": 0.0, "components": {"__mutation__": 0.0}}
             return dict(self.reward_callback())
         if method == "GET" and path == "/v1/replay":
             return self.episode_store.replay()
@@ -912,7 +1567,7 @@ class AcceptanceScenarioRunner:
                 status, last_body, _ = self.call(method, path, body, self.trainer_headers if auth else {})
             expected_status = step.get("expected_status", 200)
             if status != expected_status:
-                raise SandboxError("SCENARIO_ASSERTION_FAILED", f"step {index} expected HTTP {expected_status}, got {status}", 500, {"body": last_body})
+                raise SandboxError("SCENARIO_ASSERTION_FAILED", f"step {index} expected HTTP {expected_status}, got {status}", 500, {"body": last_body, "actual_status": status})
             capture = step.get("capture", {})
             if isinstance(capture, Mapping):
                 for name, capture_path in capture.items():

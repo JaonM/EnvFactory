@@ -6,12 +6,16 @@ from pathlib import Path
 
 from env_factory.sandbox_runtime import (
     ContractRewardAggregator,
+    ContractRewardGate,
+    ContractEvaluatorRuntime,
     ContractToolRegistry,
     ContractUserSimulator,
     DeclarativeToolCompiler,
     DeclarativeMetricEvaluator,
     AcceptanceScenarioRunner,
     EpisodeStore,
+    ExternalCapabilityClient,
+    DataManifestValidator,
     EvaluatorMock,
     SandboxError,
     SandboxApplication,
@@ -22,6 +26,35 @@ from env_factory.sandbox_runtime import (
 
 
 class SandboxRuntimeTest(unittest.TestCase):
+    def test_external_capability_client_uses_training_fixture_or_explicit_gap(self):
+        previous = os.environ.get("SANDBOX_EXTERNAL_FIXTURES")
+        try:
+            os.environ.pop("SANDBOX_EXTERNAL_FIXTURES", None)
+            self.assertEqual(ExternalCapabilityClient().query("prices", {})["status"], "data_unavailable")
+            with tempfile.TemporaryDirectory() as directory:
+                fixture = Path(directory) / "external.json"
+                fixture.write_text(json.dumps({"prices": {"status": "ok", "items": [1]}}), encoding="utf-8")
+                os.environ["SANDBOX_EXTERNAL_FIXTURES"] = str(fixture)
+                self.assertEqual(ExternalCapabilityClient().query("prices", {})["items"], [1])
+        finally:
+            if previous is None:
+                os.environ.pop("SANDBOX_EXTERNAL_FIXTURES", None)
+            else:
+                os.environ["SANDBOX_EXTERNAL_FIXTURES"] = previous
+
+    def test_contract_evaluator_runtime_caches_and_traces_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite3")
+            store.reset(episode_id="eval", seed=1)
+            evaluator = ContractEvaluatorRuntime(store)
+            metric = {"id": "quality", "evaluator": {"kind": "external_llm_judge"}}
+            first = evaluator.json_judge(metric, {"answer": "x"}, fallback={"label": "fail"})
+            second = evaluator.json_judge(metric, {"answer": "x"}, fallback={"label": "different"})
+            self.assertEqual(first, {"label": "fail"})
+            self.assertEqual(second, first)
+            events = store.replay()["events"]
+            self.assertEqual([item["event"] for item in events], ["evaluator_call"])
+
     def test_manifest_data_store_supports_stateless_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             store = EpisodeStore(Path(directory) / "episodes.sqlite3")
@@ -32,19 +65,120 @@ class SandboxRuntimeTest(unittest.TestCase):
             self.assertEqual(data.baseline, {})
             self.assertEqual(data.snapshot_hash(), __import__("hashlib").sha256(b"{}").hexdigest())
 
-    def test_contract_user_simulator_is_seeded_and_falls_back(self):
+    def test_contract_user_simulator_failure_does_not_accept_completion_claim(self):
         with tempfile.TemporaryDirectory() as directory:
             store = EpisodeStore(Path(directory) / "episodes.sqlite3")
             episode = store.reset(episode_id="user", seed=3)
-            simulator = ContractUserSimulator(store, [{
-                "turns": [{"role": "user", "content": "第一问"}, {"role": "assistant", "content": "答"}, {"role": "user", "content": "结束"}],
-                "user_end_flags": [False, True],
-            }], renderer=lambda _: (_ for _ in ()).throw(RuntimeError("timeout")))
+            simulator = ContractUserSimulator(
+                store,
+                profiles=[{"profile_id": "p1"}],
+                scripts=[{
+                    "script_id": "s1", "initial_state": "start", "variables": {},
+                    "recovery_policy": {"max_recoveries": 2, "user_behavior": "请重新回答。"},
+                    "states": [
+                        {"state_id": "start", "user_behavior": "第一问", "terminal": False},
+                        {"state_id": "done", "user_behavior": "结束", "terminal": True},
+                    ],
+                    "transitions": [{
+                        "transition_id": "finish", "from_state": "start", "to_state": "done",
+                        "condition": "continue", "should_end": True, "updates": {},
+                    }],
+                }],
+                renderer=lambda _: (_ for _ in ()).throw(RuntimeError("timeout")),
+            )
             simulator.reset(episode)
-            first = simulator.turn([{"role": "assistant", "content": "你好"}])
-            second = simulator.turn([{"role": "assistant", "content": "继续"}])
-            self.assertEqual(first, {"user_query": "第一问", "should_end": False, "attachments": []})
-            self.assertTrue(second["should_end"])
+            first = simulator.turn([{"role": "assistant", "content": "任务已完成，结果如下。"}])
+            state = store.get_state(ContractUserSimulator.STATE_KEY)
+            self.assertEqual(first["match_status"], "unmatched")
+            self.assertEqual(first["outcome_category"], "unrecognized")
+            self.assertFalse(first["should_end"])
+            self.assertEqual(first["reason_code"], "simulator_unavailable")
+            self.assertEqual(state["state_id"], "start")
+
+    def test_contract_user_simulator_fallback_does_not_advance_on_irrelevant_reply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite3")
+            episode = store.reset(episode_id="irrelevant", seed=3)
+            simulator = ContractUserSimulator(
+                store,
+                profiles=[{"profile_id": "p1"}],
+                scripts=[{
+                    "script_id": "s1", "initial_state": "start", "variables": {},
+                    "recovery_policy": {"max_recoveries": 2, "user_behavior": "请重新回答。"},
+                    "states": [
+                        {"state_id": "start", "user_behavior": "提出任务", "terminal": False},
+                        {"state_id": "review", "user_behavior": "检查结果", "terminal": False},
+                        {"state_id": "done", "user_behavior": "结束", "terminal": True},
+                    ],
+                    "transitions": [
+                        {"transition_id": "satisfied", "outcome_category": "goal_satisfied", "from_state": "start", "to_state": "review", "condition": "任务完成", "should_end": False, "updates": {}},
+                        {"transition_id": "accepted", "outcome_category": "user_acceptance", "from_state": "review", "to_state": "done", "condition": "接受结果", "should_end": True, "updates": {}},
+                    ],
+                }],
+                renderer=lambda _: (_ for _ in ()).throw(RuntimeError("offline")),
+            )
+            simulator.reset(episode)
+            result = simulator.turn([{"role": "assistant", "content": "今天天气不错。"}])
+            state = store.get_state(ContractUserSimulator.STATE_KEY)
+            self.assertEqual(result["match_status"], "unmatched")
+            self.assertEqual(state["state_id"], "start")
+            self.assertEqual(state["recovery_count"], 1)
+
+    def test_contract_user_simulator_tracks_declared_fsm_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite3")
+            episode = store.reset(episode_id="fsm", seed=1)
+            scripts = [{
+                "script_id": "s1", "initial_state": "start", "variables": {"known": False},
+                "recovery_policy": {"max_recoveries": 2, "user_behavior": "请重新回答。"},
+                "states": [{"state_id": "start", "user_behavior": "开始", "terminal": False}, {"state_id": "done", "user_behavior": "结束", "terminal": True}],
+                "transitions": [{
+                    "transition_id": "t1", "from_state": "start", "to_state": "done",
+                    "condition": "agent completes", "should_end": True, "updates": {"known": True},
+                }],
+            }]
+            simulator = ContractUserSimulator(
+                store, profiles=[{"profile_id": "p1"}], scripts=scripts,
+                renderer=lambda _: {"user_query": "结束", "transition_id": "t1"},
+            )
+            simulator.reset(episode)
+            result = simulator.turn([{"role": "assistant", "content": "完成"}])
+            state = store.get_state(ContractUserSimulator.STATE_KEY)
+            self.assertTrue(result["should_end"])
+            self.assertEqual(state["state_id"], "done")
+            self.assertTrue(state["variables"]["known"])
+
+    def test_contract_user_simulator_does_not_advance_on_unmatched_dialogue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite3")
+            episode = store.reset(episode_id="recovery", seed=1)
+            script = {
+                "script_id": "s1", "initial_state": "start", "variables": {},
+                "recovery_policy": {"max_recoveries": 2, "user_behavior": "请重新回答。"},
+                "states": [
+                    {"state_id": "start", "user_behavior": "开始", "terminal": False},
+                    {"state_id": "done", "user_behavior": "结束", "terminal": True},
+                ],
+                "transitions": [{
+                    "transition_id": "finish", "from_state": "start", "to_state": "done",
+                    "condition": "完成", "should_end": True, "updates": {},
+                }],
+            }
+            simulator = ContractUserSimulator(
+                store, profiles=[{"profile_id": "p1"}], scripts=[script],
+                renderer=lambda _: {
+                    "user_query": "这没有回答我的问题。", "match_status": "ambiguous",
+                    "outcome_category": "unrecognized",
+                    "reason_code": "off_topic_response",
+                },
+            )
+            simulator.reset(episode)
+            result = simulator.turn([{"role": "assistant", "content": "无关回复"}])
+            state = store.get_state(ContractUserSimulator.STATE_KEY)
+            self.assertEqual(state["state_id"], "start")
+            self.assertEqual(state["recovery_count"], 1)
+            self.assertFalse(result["should_end"])
+            self.assertEqual(result["match_status"], "ambiguous")
     def test_acceptance_scenario_runner_captures_and_reuses_values(self):
         calls = []
         def call(method, path, body, headers):
@@ -200,6 +334,46 @@ class SandboxRuntimeTest(unittest.TestCase):
             data.reset()
             self.assertEqual(data.select("items", id="1")[0]["value"], "a")
 
+    def test_manifest_validator_accepts_descriptive_foreign_key_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "schemas").mkdir()
+            (root / "rows").mkdir()
+            parent_schema = {
+                "columns": [{"name": "id"}],
+                "primary_key": ["id"],
+                "foreign_keys": [],
+            }
+            child_schema = {
+                "columns": [{"name": "id"}, {"name": "parent_id"}],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "column": "parent_id",
+                    "references_table": "parents",
+                    "references_column": "id",
+                }],
+            }
+            (root / "schemas" / "parents.json").write_text(json.dumps(parent_schema), encoding="utf-8")
+            (root / "schemas" / "children.json").write_text(json.dumps(child_schema), encoding="utf-8")
+            (root / "rows" / "parents.jsonl").write_text('{"id":"p1"}\n', encoding="utf-8")
+            (root / "rows" / "children.jsonl").write_text(
+                '{"id":"c1","parent_id":"p1"}\n', encoding="utf-8"
+            )
+            manifest = {"tables": [
+                {
+                    "table_name": "parents",
+                    "schema_file": "schemas/parents.json",
+                    "rows_file": "rows/parents.jsonl",
+                },
+                {
+                    "table_name": "children",
+                    "schema_file": "schemas/children.json",
+                    "rows_file": "rows/children.jsonl",
+                },
+            ]}
+            validated = DataManifestValidator.validate(manifest, root)
+            self.assertEqual(validated["tables"]["children"][0]["parent_id"], "p1")
+
     def test_shared_application_routes_and_authenticates(self):
         with tempfile.TemporaryDirectory() as directory:
             previous = os.environ.get("SANDBOX_TRAINER_API_KEY")
@@ -234,8 +408,9 @@ class SandboxRuntimeTest(unittest.TestCase):
                 auth = {"Authorization": "Bearer trainer-key"}
                 status, reset, _ = app.handle("POST", "/v1/reset", {"seed": 7}, auth)
                 self.assertEqual(reset["seed"], 7)
-                status, result, _ = app.handle("POST", "/v1/tools/lookup", {"name": "x"})
+                status, result, tool_headers = app.handle("POST", "/v1/tools/lookup", {"name": "x"})
                 self.assertEqual((status, result), (200, {"value": "x"}))
+                self.assertTrue(tool_headers["X-Tool-Call-ID"].startswith("call-"))
                 status, accepted, _ = app.handle(
                     "POST", "/v1/agent_response", {"content": "最终回答"}, auth
                 )
@@ -272,10 +447,87 @@ class SandboxRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(registry.execute("lookup", {"name": "x"}), {"value": "x"})
         self.assertEqual(len(events), 1)
+        self.assertIn("tool_call_id", events[0][0][1])
+        self.assertIn("duration_ms", events[0][0][1])
         with self.assertRaises(SandboxError):
             registry.execute("lookup", {})
         with self.assertRaises(SandboxError):
             registry.execute("lookup", {"name": "x", "extra": True})
+
+    def test_tool_idempotency_prevents_reexecuting_business_handler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite3")
+            store.reset(episode_id="idem", seed=1)
+            calls = []
+            tools = [{"type": "function", "function": {
+                "name": "write", "parameters": {
+                    "type": "object", "properties": {"value": {"type": "string"}},
+                    "required": ["value"], "additionalProperties": False,
+                }
+            }}]
+            registry = ContractToolRegistry(
+                tools, {"write": lambda args: calls.append(dict(args)) or {"saved": args["value"]}},
+                event_recorder=store.event,
+            )
+            first = registry.execute("write", {"value": "a"}, idem_key="same")
+            second = registry.execute("write", {"value": "a"}, idem_key="same")
+            with self.assertRaisesRegex(SandboxError, "another request"):
+                registry.execute("write", {"value": "different"}, idem_key="same")
+            self.assertEqual(first, second)
+            self.assertEqual(calls, [{"value": "a"}])
+
+    def test_shared_runtime_owns_all_declared_mutation_seams(self):
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "update",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            },
+        }]
+        calls = []
+        registry = ContractToolRegistry(tools, {"update": lambda args: calls.append(args) or {"value": args.get("value")}})
+        previous = os.environ.get("SANDBOX_MUTATION_MODE")
+        previous_key = os.environ.get("SANDBOX_TRAINER_API_KEY")
+        try:
+            os.environ["SANDBOX_MUTATION_MODE"] = "skip_business_write"
+            self.assertEqual(registry.execute("update", {"value": "x"})["mutation"], "skip_business_write")
+            self.assertEqual(calls, [])
+            os.environ["SANDBOX_MUTATION_MODE"] = "ignore_tool_arguments"
+            self.assertEqual(registry.execute("update", {"unexpected": True}), {"value": None})
+
+            with tempfile.TemporaryDirectory() as directory:
+                store = EpisodeStore(Path(directory) / "episodes.sqlite3")
+                app = SandboxApplication(
+                    episode_store=store, tool_registry=registry,
+                    observation=lambda: {}, reward=lambda: {"reward": 1.0},
+                    user_turn=lambda messages: {"user_query": "ok", "should_end": False},
+                )
+                os.environ["SANDBOX_MUTATION_MODE"] = "bypass_trainer_auth"
+                self.assertEqual(app.handle("POST", "/v1/reset", {})[0], 200)
+                os.environ["SANDBOX_MUTATION_MODE"] = "constant_reward"
+                os.environ["SANDBOX_TRAINER_API_KEY"] = "mutation-key"
+                status, reward, _ = app.handle(
+                    "GET", "/v1/reward", headers={"Authorization": "Bearer mutation-key"}
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    reward,
+                    {"reward": 0.0, "raw_reward": 0.0, "components": {"__mutation__": 0.0}},
+                )
+        finally:
+            if previous is None:
+                os.environ.pop("SANDBOX_MUTATION_MODE", None)
+            else:
+                os.environ["SANDBOX_MUTATION_MODE"] = previous
+            if previous_key is None:
+                os.environ.pop("SANDBOX_TRAINER_API_KEY", None)
+            else:
+                os.environ["SANDBOX_TRAINER_API_KEY"] = previous_key
 
     def test_noise_tool_needs_no_task_handler_and_has_no_business_effect(self):
         events = []
@@ -296,8 +548,9 @@ class SandboxRuntimeTest(unittest.TestCase):
             event_recorder=lambda *args, **kwargs: events.append((args, kwargs)),
         )
         result = registry.execute("weather", {})
-        self.assertEqual(result["category"], "unrelated")
-        self.assertIn("without changing", result["message"])
+        self.assertNotIn("category", result)
+        self.assertEqual(result, {"records": [], "count": 0})
+        self.assertNotIn("message", result)
         self.assertTrue(events[0][0][1]["noise"])
 
     def test_reward_aggregator_uses_contract_weights_and_ranges(self):
@@ -311,6 +564,62 @@ class SandboxRuntimeTest(unittest.TestCase):
         self.assertEqual(set(result["components"]), {"success", "process", "penalty"})
         with self.assertRaises(SandboxError):
             aggregator.aggregate({"success": 2})
+
+    def test_reward_aggregator_rejects_missing_declared_scores(self):
+        aggregator = ContractRewardAggregator([
+            {"id": "success", "weight": 1.0, "score_range": [0, 1]},
+        ])
+        with self.assertRaisesRegex(SandboxError, "declared metrics have no runtime score"):
+            aggregator.aggregate({})
+
+    def test_reward_gate_blocks_outcome_without_required_tool_progress(self):
+        metrics = [
+            {"id": "process", "category": "process", "score_range": [0, 1]},
+            {"id": "outcome", "category": "outcome", "score_range": [0, 1]},
+        ]
+        gate = ContractRewardGate({
+            "training_contract": {"category": "simple_agentic"},
+            "capability_dag": {"nodes": ["lookup"]},
+        }, metrics)
+        blocked = gate.apply(
+            {"process": 0.0, "outcome": 1.0},
+            {"trajectory": {"events": []}},
+        )
+        self.assertEqual(blocked, {"process": 0.0, "outcome": 0.0})
+        allowed = gate.apply(
+            {"process": 1.0, "outcome": 1.0},
+            {"trajectory": {"events": [{
+                "event": "tool_call", "payload": {"tool_name": "lookup", "noise": False},
+            }]}},
+        )
+        self.assertEqual(allowed["outcome"], 1.0)
+
+    def test_reward_gate_enforces_multi_step_dependency_order(self):
+        metrics = [{"id": "outcome", "category": "outcome", "score_range": [0, 1]}]
+        gate = ContractRewardGate({
+            "training_contract": {"category": "multi_step_agentic"},
+            "capability_dag": {
+                "nodes": ["lookup", "update"],
+                "edges": [{"from_tool": "lookup", "to_tool": "update", "via": "record_id"}],
+            },
+        }, metrics)
+        def context(names):
+            return {"trajectory": {"events": [
+                {"event": "tool_call", "payload": {"tool_name": name, "noise": False}}
+                for name in names
+            ]}}
+        self.assertEqual(gate.apply({"outcome": 1.0}, context(["update", "lookup"]))["outcome"], 0.0)
+        self.assertEqual(gate.apply({"outcome": 1.0}, context(["lookup", "update"]))["outcome"], 1.0)
+
+    def test_reward_gate_leaves_unnecessary_tool_cost_to_penalty_metric(self):
+        gate = ContractRewardGate({
+            "training_contract": {"category": "direct_response"},
+            "capability_dag": {"nodes": [], "edges": []},
+        }, [{"id": "outcome", "category": "outcome", "score_range": [0, 1]}])
+        result = gate.apply({"outcome": 1.0}, {"trajectory": {"events": [{
+            "event": "tool_call", "payload": {"tool_name": "roll_virtual_die", "noise": True},
+        }]}})
+        self.assertEqual(result["outcome"], 1.0)
 
     def test_json_schema_validator_handles_nested_values(self):
         schema = {

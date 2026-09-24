@@ -92,6 +92,11 @@ class RuntimeLLMClient:
                     time.sleep(0.5 * (2 ** attempt))
                     continue
                 raise RuntimeLLMError(f"runtime LLM HTTP failure: {exc.code}") from exc
+            except RuntimeLLMError as exc:
+                if attempt >= self.config.max_retries:
+                    raise
+                body["messages"] = [*body["messages"], {"role": "user", "content": f"Your JSON failed validation: {exc}. Return a corrected complete object matching this schema: {json.dumps(response_schema, ensure_ascii=False)}"}]
+                encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
             except (IncompleteRead, URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
                 if attempt >= self.config.max_retries:
                     raise RuntimeLLMError("runtime LLM request or response failed") from exc
@@ -104,3 +109,13 @@ class RuntimeLLMClient:
         missing = [name for name in required if name not in value]
         if missing:
             raise RuntimeLLMError(f"runtime LLM response missing fields: {missing}")
+        # Reuse the runtime's supported schema subset; import lazily to avoid
+        # the runtime adapter's module initialization cycle.
+        try:
+            from .sandbox_runtime import validate_json_schema, SandboxError
+        except ImportError:
+            from sandbox_runtime import validate_json_schema, SandboxError
+        try:
+            validate_json_schema(schema, value, "response")
+        except SandboxError as exc:
+            raise RuntimeLLMError(str(exc)) from exc
