@@ -1,5 +1,7 @@
 # env-factory
 
+生成契约、工具实现、持久化及验收的最新边界见 [一致性改造说明](docs/runtime_integrity.md)，其中区分静态评分、离线回归与真实训练 rollout 证据。
+
 ## 构建知识图谱
 
 先确认 Neo4j 可访问，并在项目根目录配置 `.env`：
@@ -83,8 +85,59 @@ WIKIPEDIA_DUMP_DB=data/wikipedia.sqlite3
 默认在 `output/task_artifacts/task-N/task.json` 写入每个任务的最终文件；可通过 `--output` 指定输出根目录。每次运行会扫描已有 `task-N`，从当前最大编号的下一号开始追加，绝不覆盖已有任务；并发进程通过原子目录预留避免编号冲突。Pipeline 运行日志默认追加写入 `output/task_generation.log`，也会输出到终端，可通过 `--log-file` 指定其他文件。日志记录任务级和阶段级开始、重试、成功、失败、耗时、产物路径和进度，不记录 Prompt 或凭据。任务默认并发生成 4 个，可通过 `--max-workers` 调整并发数。Neo4j 路径查询默认 10 秒超时，可通过 `--path-query-timeout` 调整。
 使用 `--count N` 可批量新增 N 个独立的 `task-N` 目录；失败任务会清理本次预留目录，但不会修改任何历史任务。
 
-任务环境由完整业务数据、数据说明文档、用户模拟素材、原子 Agent 动作和观测奖励设计组成，不再由任务生成阶段生成 `state`、`hidden_state` 或 `transition_rule` 记录。运行时状态、状态转移和终止执行逻辑由后续 Code Agent 在沙箱中根据业务数据和任务契约实现。
-任务生成结果不再包含 `constraints` 字段。沙箱构建脚本根据 `task.json` 中的 requirements、actions 和 metrics 派生只读的 `BUILD_CONTRACT.json`，供 Code Agent 进行阶段验收；`spec.md` 是设计说明，`BUILD_CONTRACT.json` 是构建阶段派生的外层约束。
+### 任务质量评分与过滤
+
+生成后可使用确定性离线评分器筛选训练样本。评分范围为 0–10，覆盖任务契约、Agentic 难度、环境与工具对齐、奖励可评测性、验收与训练就绪度；不调用 LLM，同一产物会得到相同结果。
+
+```bash
+uv run python examples/score_tasks.py output/task_artifacts \
+  --min-score 8 \
+  --report output/task_quality_report.json \
+  --csv output/task_quality_report.csv
+```
+
+复制合格样本到独立目录：
+
+```bash
+uv run python examples/score_tasks.py output/task_artifacts \
+  --min-score 8 \
+  --accepted-dir output/accepted_tasks
+```
+
+只提取高价值 Agentic 样本：
+
+```bash
+uv run python examples/score_tasks.py output/task_artifacts \
+  --min-score 8 \
+  --high-value-dir output/high_value_tasks
+```
+
+评分器拒绝覆盖目标目录中的同名任务。CI 中可增加 `--fail-on-low-score`，只要存在低于阈值或未通过训练资格门禁的任务便返回非零退出码。`task_quality_report.json` 同时给出描述性 `score` 与布尔 `eligible`：分数用于质量排序，资格门禁用于排除契约冲突、无效成功轨迹、语义漂移和缺少 TaskSpec 的样本，不再用人为分数封顶暗示无效样本可训练。
+
+### 沙箱离线评分与过滤
+
+`scripts/score_sandbox_offline.py` 不调用模型或网络，重新执行业务验收、pytest、契约一致性、运行时通用性、outer conformance、五类 mutation 和 training-readiness，并用可执行成功/失败轨迹代替模型语义审查。报告同样分离 `score` 与 `eligible`；任一关键门禁失败都会令 `eligible=false`，不会篡改描述性分数。
+
+评分单个沙箱：
+
+```bash
+uv run python scripts/score_sandbox_offline.py output/sandbox_loop/round-10/task-92
+```
+
+批量扫描目录并生成过滤报告：
+
+```bash
+uv run python scripts/score_sandbox_offline.py output/sandbox_loop/round-10 \
+  --threshold 8 \
+  --output output/offline_sandbox_scores.json
+```
+
+全部沙箱达到阈值时退出码为 `0`，存在低分沙箱时为 `1`，可直接用于 CI 或数据集过滤。默认还会在每个沙箱目录写入 `offline_sandbox_score.json`；传入 `--no-individual` 可只保留汇总报告。
+
+沙箱构建成功后会默认自动执行该离线评分，并写入 `offline_sandbox_score.json` 和 `offline_score.log`。如果上层流程已经安排了独立评分，可向 `develop_sandbox_with_agent.sh` 传入 `--skip-auto-score` 避免重复执行。
+
+任务环境由完整业务数据、数据说明文档、用户 FSM、原子 Agent 动作、工具契约和观测奖励设计组成。任务生成器把这些语义编译为版本化 `task_spec`，显式声明环境 archetype、初始/成功谓词、状态增量、工具输入输出/effect、能力 DAG 和奖励真值来源。episode、持久化、工具注册、User Simulator、奖励聚合与因果门禁由 EnvFactory 共享运行时实现；Code Agent 只补充无法声明化编译的少量业务 handler 或 metric extension。
+任务生成结果不再包含 `constraints` 字段。沙箱构建脚本从 `task.json` 生成只读 `BUILD_CONTRACT.json`；`development_plan.json` 由 EnvFactory 根据 TaskSpec 和 archetype 确定性生成，不由 Code Agent 重新设计平台架构。
 其中 `user_profile` 不再直接从任务描述臆造，而是从任务关键词随机选择 1 到全部关键词，并发查询其直接 `HIERARCHY` 下位节点，再由 LLM 润色生成；任务描述仅用于生成 `task_info`、状态和执行规则。
 观测指标只保留与任务目标强相关的少量关键过程指标和目标结果指标。关键过程指标使用 `hybrid`：外部 LLM 生成当前上下文下的期望工具名和参数，规则引擎再对实际工具调用进行规范化比对；工具或参数错误不作为 penalty。结果指标用于判断目标是否完成，惩罚指标仅保留直接影响任务目标的偏离或无效循环。指标包含 `id`、`category`、`type`、`scope`、`condition/criteria`、`weight` 和 `score_range`，分别用于 step/state/terminal/trajectory 级别的奖励计算。
 
