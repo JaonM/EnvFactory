@@ -142,6 +142,47 @@ def argument_sensitivity(task: dict, base_url: str, key: str) -> bool:
     return found
 
 
+def direct_mutation_probe(task: dict, base_url: str, key: str, mode: str) -> bool:
+    """Return True when the outer workflow directly observes the mutant.
+
+    Generated acceptance remains responsible for business invariants. These
+    probes cover platform-owned mutation seams so a model cannot accidentally
+    let a mutant survive merely by omitting a redundant assertion.
+    """
+    if mode == "bypass_trainer_auth":
+        status, _ = request(base_url, "GET", "/v1/observation")
+        return status != 401
+    probes = argument_probe_cases(task)
+    valid_call = (probes[0][0], probes[0][1]) if probes else None
+    if valid_call is None:
+        for scenario in task.get("acceptance_contract", {}).get("executable_scenarios", []):
+            for step in scenario.get("steps", []) if isinstance(scenario, dict) else []:
+                if isinstance(step, dict) and step.get("operation") == "tool_call":
+                    name, arguments = step.get("tool_name"), step.get("arguments", {})
+                    if isinstance(name, str) and isinstance(arguments, dict):
+                        valid_call = (name, arguments)
+                        break
+            if valid_call:
+                break
+    if mode in {"constant_tool_result", "skip_business_write"} and valid_call:
+        name, arguments = valid_call
+        request(base_url, "POST", "/v1/reset", {"episode_id": "direct-mutation-probe", "seed": 17}, key=key)
+        status, body = request(base_url, "POST", f"/v1/tools/{name}", arguments)
+        return status == 200 and isinstance(body, dict) and body.get("mutation") == mode
+    if mode == "ignore_tool_arguments":
+        tools = task.get("tools", [])
+        if tools:
+            name = tools[0].get("function", {}).get("name")
+            if isinstance(name, str):
+                status, _ = request(base_url, "POST", f"/v1/tools/{name}", {"__unexpected__": True})
+                return status != 400
+    if mode == "constant_reward":
+        request(base_url, "POST", "/v1/reset", {"episode_id": "direct-reward-probe", "seed": 17}, key=key)
+        status, body = request(base_url, "GET", "/v1/reward", key=key)
+        return status == 200 and isinstance(body, dict) and "__mutation__" in body.get("components", {})
+    return False
+
+
 def wait_health(base_url: str, process: subprocess.Popen[bytes]) -> bool:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -208,6 +249,24 @@ def main() -> int:
     if not (root / "app.py").is_file():
         raise SystemExit("mutation testing requires app.py")
 
+    # A suppressed business write is meaningful only for a stateful contract.
+    # Direct-response, read-only reference and external-capability sandboxes
+    # have no write whose absence could be observed; requiring them to kill
+    # this mutant creates an impossible and misleading acceptance gate.
+    environment_plan = task.get("environment_plan", {})
+    applicable_modes = []
+    for mode in modes:
+        if mode == "skip_business_write" and not (
+            isinstance(environment_plan, dict)
+            and environment_plan.get("mode") == "stateful"
+            and environment_plan.get("requires_persistence") is True
+            and task.get("tool_bindings")
+        ):
+            print("mutation not applicable: skip_business_write (no stateful business write)")
+            continue
+        applicable_modes.append(mode)
+    modes = applicable_modes
+
     trainer_key = os.environ.get("SANDBOX_TRAINER_API_KEY", "envfactory-mutation-test-key")
     base_env = os.environ.copy()
     base_env["SANDBOX_TRAINER_API_KEY"] = trainer_key
@@ -260,6 +319,7 @@ def main() -> int:
         acceptance_code, acceptance_output = run_acceptance(root, env)
 
         outer_code, outer_output, argument_probe_failed = 0, "HTTP conformance skipped: local TCP bind unavailable", False
+        direct_probe_failed = False
         log_file = None
         if http_available:
             port = free_port()
@@ -276,14 +336,17 @@ def main() -> int:
                                             if healthy else (125, "mutant runtime did not become healthy"))
                 if healthy and mode == "ignore_tool_arguments" and baseline_argument_sensitive:
                     argument_probe_failed = not argument_sensitivity(task, base_url, trainer_key)
+                if healthy:
+                    direct_probe_failed = direct_mutation_probe(task, base_url, trainer_key, mode)
             finally:
                 stop(process)
 
-        killed = acceptance_code != 0 or outer_code != 0 or argument_probe_failed
+        killed = acceptance_code != 0 or outer_code != 0 or argument_probe_failed or direct_probe_failed
         if killed:
             reason = ("acceptance.sh" if acceptance_code != 0 else
                       "outer conformance" if outer_code != 0 else
-                      "argument sensitivity probe")
+                      "argument sensitivity probe" if argument_probe_failed else
+                      "outer direct mutation probe")
             print(f"mutation killed: {mode} ({reason})")
         else:
             survivors.append(mode)

@@ -67,17 +67,63 @@ def validate(root: Path) -> dict[str, Any]:
     scenarios = task.get("acceptance_contract", {}).get("executable_scenarios", [])
     failures: list[dict[str, Any]] = []
     evidence: dict[str, Any] = {}
+    task_spec = task.get("task_spec")
+    if not isinstance(task_spec, dict) or task_spec.get("version") != "1.0":
+        failures.append({"gate": "task_spec_integrity", "message": "missing or invalid task_spec IR"})
+    else:
+        environment = task_spec.get("environment_contract", {})
+        goal = task_spec.get("goal_contract", {})
+        archetype = environment.get("archetype") if isinstance(environment, dict) else None
+        if not isinstance(archetype, str) or not archetype:
+            failures.append({"gate": "task_spec_integrity", "message": "environment archetype is missing"})
+        deltas = goal.get("expected_delta", []) if isinstance(goal, dict) else []
+        if environment.get("mode") == "stateful" and not isinstance(deltas, list):
+            failures.append({"gate": "state_causality", "message": "stateful goal has no expected_delta list"})
+        manifest = task.get("artifacts", {}).get("data_manifest", {})
+        baseline_values: list[Any] = []
+        for table in manifest.get("tables", []) if isinstance(manifest, dict) else []:
+            rows_file = table.get("rows_file") if isinstance(table, dict) else None
+            if not isinstance(rows_file, str):
+                continue
+            manifest_root = manifest.get("root", "") if isinstance(manifest, dict) else ""
+            rows_path = root / str(manifest_root) / rows_file
+            if rows_path.is_file():
+                for line in rows_path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        baseline_values.append(json.loads(line))
+        baseline_text = json.dumps(baseline_values, ensure_ascii=False)
+        invalid_deltas = []
+        for delta in deltas if isinstance(deltas, list) else []:
+            if not isinstance(delta, dict):
+                invalid_deltas.append(delta)
+                continue
+            before, after = delta.get("before"), delta.get("after")
+            if not isinstance(before, str) or not before or before == after or before not in baseline_text:
+                invalid_deltas.append(delta)
+        evidence["state_causality"] = {"archetype": archetype, "expected_delta": deltas, "invalid": invalid_deltas}
+        if environment.get("mode") == "stateful" and not goal.get("row_predicates"):
+            failures.append({"gate": "state_causality", "message": "stateful task requires executable row_predicates"})
+        if invalid_deltas:
+            failures.append({"gate": "state_causality", "message": "initial fixture does not satisfy expected delta preconditions", "invalid": invalid_deltas})
     kinds = {item.get("kind") for item in scenarios if isinstance(item, dict)}
     for required in ("goal_success", "goal_failure"):
         if required not in kinds:
             failures.append({"gate": "scenario_coverage", "message": f"missing {required} scenario"})
     if task.get("noise_tools") and "noise_selection" not in kinds:
         failures.append({"gate": "noise_tool_behavior", "message": "missing noise_selection scenario"})
+    # Training-readiness must be deterministic and runnable offline. Generated
+    # sandboxes expose an explicit contract-aligned evaluator mock for this
+    # purpose; production runs can override the variable to exercise a real
+    # evaluator endpoint.
+    os.environ.setdefault("SANDBOX_EVALUATOR_MOCK", "1")
     app = import_app(root)
     from sandbox_runtime import AcceptanceScenarioRunner  # imported from generated sandbox
+    from sandbox_runtime import BusinessGoalEvaluator
     token = os.environ.get("SANDBOX_TRAINER_API_KEY", "envfactory-readiness-key")
     os.environ["SANDBOX_TRAINER_API_KEY"] = token
-    runner = AcceptanceScenarioRunner(app.handle, trainer_headers={"Authorization": f"Bearer {token}"})
+    runner = AcceptanceScenarioRunner(app.handle, trainer_headers={"Authorization": f"Bearer {token}"},
+                                     business_snapshot=getattr(app, "business_snapshot", None),
+                                     mutate_business_state=getattr(app, "mutate_business_state", None))
     runs: dict[str, list[dict[str, Any]]] = {}
     for scenario in scenarios:
         if not isinstance(scenario, dict) or scenario.get("kind") not in {"goal_success", "goal_failure", "noise_selection", "counterfactual"}:
@@ -109,11 +155,18 @@ def validate(root: Path) -> dict[str, Any]:
             evidence["determinism"] = first == second
             if first != second:
                 failures.append({"gate": "determinism", "message": "same structured trajectory is not deterministic"})
+            goal = (task_spec or {}).get("goal_contract", {})
+            if goal.get("row_predicates"):
+                snapshot = getattr(app, "business_snapshot", None)
+                if snapshot is None or not BusinessGoalEvaluator.evaluate(goal["row_predicates"], snapshot()):
+                    failures.append({"gate": "state_causality", "message": "success rollout did not satisfy business postconditions"})
         except Exception as exc:
             failures.append({"gate": "determinism", "message": str(exc)})
     hard_gates = sorted({failure["gate"] for failure in failures})
     return {
         "training_ready": not failures,
+        "validation_mode": "offline_mock" if os.environ.get("SANDBOX_EVALUATOR_MOCK", "").lower() in {"1", "true", "yes"} else "live",
+        "live_rollout_verified": False,
         "hard_gates_passed": not failures,
         "failed_gates": hard_gates,
         "evidence": evidence,

@@ -1,9 +1,12 @@
 import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from env_factory.task_routing import TRAINING_CATEGORIES, training_contract
 
 
 ROOT = Path(__file__).parents[1]
@@ -19,6 +22,152 @@ def load_script(name):
 
 
 class BuildWorkflowTest(unittest.TestCase):
+    def test_training_categories_have_complete_task_and_sandbox_blueprints(self):
+        profiles = set()
+        for category in TRAINING_CATEGORIES:
+            contract = training_contract(category)
+            self.assertEqual(contract["category"], category)
+            self.assertTrue(contract["allowed_environment_modes"])
+            self.assertIn("goal_success", contract["required_scenarios"])
+            self.assertIn("goal_failure", contract["required_scenarios"])
+            self.assertTrue(contract["allowed_intents"])
+            profiles.add(contract["sandbox_profile"])
+        self.assertEqual(len(profiles), len(TRAINING_CATEGORIES))
+        self.assertEqual(training_contract("direct_response")["business_tools"], {"min": 0, "max": 0})
+        self.assertTrue(training_contract("multi_step_agentic")["dependency"]["required"])
+
+    def test_scaffold_materializes_declared_sandbox_profile(self):
+        scaffold = load_script("generate_sandbox_scaffold.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contract = {
+                "tools": [],
+                "training_category": "direct_response",
+                "training_contract": training_contract("direct_response"),
+            }
+            (root / "BUILD_CONTRACT.json").write_text(json.dumps(contract), encoding="utf-8")
+            scaffold.generate(root)
+            profile = json.loads((root / "sandbox_profile.json").read_text(encoding="utf-8"))
+            self.assertEqual(profile["sandbox_profile"], "direct_response")
+            self.assertIn("test_sandbox_profile_matches_training_contract", (root / "tests/test_scaffold_contract.py").read_text(encoding="utf-8"))
+
+    def test_sandbox_score_uses_ten_point_critical_gate_rubric(self):
+        scorer = load_script("score_sandbox.py")
+        checks = [
+            scorer.Check("delivery", 4.0, True, "ok", True),
+            scorer.Check("mutation", 3.0, False, "survived", True),
+            scorer.Check("readiness", 3.0, True, "ok", True),
+        ]
+        report = scorer.score_checks(checks, threshold=8)
+        self.assertEqual(report["score"], 7.0)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_critical_gates"], ["mutation"])
+
+        complete = [scorer.Check("all", 10.0, True, "ok", True)]
+        self.assertEqual(scorer.score_checks(complete)["score"], 10.0)
+
+    def test_sandbox_loop_is_pinned_to_high_value_tasks_and_luna(self):
+        loop = load_script("run_sandbox_build_loop.py")
+        command = loop.build_command(ROOT, 45, ROOT / "output/example", 3)
+        self.assertEqual(loop.DEFAULT_TASK_IDS, (45, 78, 92, 175))
+        self.assertIn("gpt-5.6-luna", command)
+        self.assertIn(str(ROOT / "output/task_artifacts/task-45/task.json"), command)
+        history = {"rounds": [{"round": 3, "tasks": [{
+            "task_id": "task-78", "score": {
+                "score": 10.0, "passed": True, "model": "gpt-5.6-luna",
+                "review_model": "gpt-5.6-luna",
+            }
+        }]}]}
+        self.assertIsNone(loop.reusable_result(history, 78))  # stale/unexecuted evidence cannot be reused
+
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = Path(tmp) / "task-92"
+            seed.mkdir()
+            (seed / "task_impl.py").write_text("# implementation\n", encoding="utf-8")
+            seed_history = {"rounds": [{"round": 6, "tasks": [{
+                "task_id": "task-92", "output": str(seed), "score": {"score": 4.5}
+            }]}]}
+            self.assertEqual(loop.latest_seed(seed_history, 92), seed)
+            resumed = loop.build_command(ROOT, 92, ROOT / "output/example", 3, resume=True)
+            self.assertIn("--resume", resumed)
+
+    def test_build_workflow_always_captures_terminal_status(self):
+        workflow = (ROOT / "scripts" / "develop_sandbox_with_agent.sh").read_text(encoding="utf-8")
+        self.assertIn("if run_agent_and_finalize_impl; then", workflow)
+        self.assertIn('write_status "failed" "$exit_code"', workflow)
+        self.assertNotIn("set +e\n  run_agent_and_finalize_impl", workflow)
+
+    def test_training_readiness_enables_deterministic_evaluator_mock(self):
+        validator = (ROOT / "scripts" / "validate_training_readiness.py").read_text(encoding="utf-8")
+        self.assertIn('os.environ.setdefault("SANDBOX_EVALUATOR_MOCK", "1")', validator)
+
+    def test_agentic_value_validator_rejects_placeholders_and_empty_collections(self):
+        validator = load_script("validate_agentic_training_value.py")
+        self.assertTrue(validator.has_placeholder({"source": "fixture-value"}))
+        self.assertTrue(validator.empty_critical_collection({"categories": []}))
+        self.assertFalse(validator.empty_critical_collection({"categories": ["glass"]}))
+        self.assertTrue(validator.meaningful_result({"records": [{"id": 1}], "count": 1}))
+        self.assertFalse(validator.meaningful_result({"records": [], "count": 0}))
+
+    def test_offline_scorer_requires_executable_business_semantics(self):
+        scorer = load_script("score_sandbox_offline.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {
+                "tools": [{"category": "business", "function": {
+                    "name": "lookup", "parameters": {
+                        "type": "object", "properties": {"id": {"type": "string"}},
+                        "required": ["id"],
+                    },
+                }}],
+                "noise_tools": [],
+                "acceptance_contract": {"executable_scenarios": [
+                    {"kind": "goal_success", "steps": [
+                        {"operation": "tool_call", "tool_name": "lookup", "arguments": {"id": "x"}},
+                        {"operation": "agent_response", "content": "done"},
+                        {"operation": "reward"},
+                    ]},
+                    {"kind": "goal_failure", "steps": [{"operation": "reward"}]},
+                ]},
+            }
+            (root / "task.json").write_text(json.dumps(task), encoding="utf-8")
+            evidence = {name: {"passed": True} for name in (
+                "contract_and_tool_identity", "business_acceptance", "runtime_genericity",
+                "mutation_resistance", "training_readiness", "agentic_training_value",
+            )}
+            passed, message = scorer.offline_semantic_check(root, evidence)
+            self.assertTrue(passed, message)
+            task["acceptance_contract"]["executable_scenarios"][0]["steps"][0]["arguments"] = {}
+            (root / "task.json").write_text(json.dumps(task), encoding="utf-8")
+            self.assertFalse(scorer.offline_semantic_check(root, evidence)[0])
+
+            task["tools"][0]["function"]["parameters"]["required"] = []
+            (root / "task.json").write_text(json.dumps(task), encoding="utf-8")
+            self.assertTrue(scorer.offline_semantic_check(root, evidence)[0])
+
+    def test_outer_mutation_probe_detects_platform_owned_markers(self):
+        mutation = load_script("run_mutation_tests.py")
+        task = {
+            "acceptance_contract": {"argument_probes": [{
+                "tool_name": "update_item", "arguments": {"value": "a"}
+            }]},
+            "tools": [{"function": {"name": "update_item"}}],
+        }
+        original = mutation.request
+        try:
+            mutation.request = lambda base, method, path, body=None, key=None: (
+                (200, {"mutation": "constant_tool_result"})
+                if path.startswith("/v1/tools/") else (200, {})
+            )
+            self.assertTrue(mutation.direct_mutation_probe(task, "http://sandbox", "key", "constant_tool_result"))
+            task["acceptance_contract"] = {"executable_scenarios": [{"steps": [{
+                "operation": "tool_call", "tool_name": "update_item", "arguments": {}
+            }]}]}
+            self.assertTrue(mutation.direct_mutation_probe(task, "http://sandbox", "key", "constant_tool_result"))
+            mutation.request = lambda base, method, path, body=None, key=None: (200, {})
+            self.assertTrue(mutation.direct_mutation_probe(task, "http://sandbox", "key", "bypass_trainer_auth"))
+        finally:
+            mutation.request = original
     def test_sandbox_builder_help_exposes_model_selection(self):
         completed = subprocess.run(
             ["bash", str(ROOT / "scripts" / "develop_sandbox_with_agent.sh"), "--help"],
@@ -27,12 +176,24 @@ class BuildWorkflowTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertIn("--model NAME", completed.stdout)
         self.assertIn("--review-model NAME", completed.stdout)
+        self.assertIn("--skip-auto-score", completed.stdout)
+
+    def test_successful_build_triggers_offline_scoring(self):
+        workflow = (ROOT / "scripts" / "develop_sandbox_with_agent.sh").read_text(encoding="utf-8")
+        self.assertIn('auto_score="true"', workflow)
+        self.assertIn('scripts/score_sandbox_offline.py', workflow)
+        self.assertIn('offline_sandbox_score.json', workflow)
+        loop = load_script("run_sandbox_build_loop.py")
+        self.assertIn("--skip-auto-score", loop.build_command(ROOT, 45, ROOT / "output/example", 3))
 
     def test_scaffold_generator_creates_compilable_thin_composition(self):
         generator = load_script("generate_sandbox_scaffold.py")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "BUILD_CONTRACT.json").write_text("{}", encoding="utf-8")
+            tools = [{"type": "function", "function": {"name": "lookup"}}]
+            (root / "BUILD_CONTRACT.json").write_text(
+                json.dumps({"tools": tools}), encoding="utf-8"
+            )
             generator.generate(root)
             app = (root / "app.py").read_text(encoding="utf-8")
             implementation = (root / "task_impl.py").read_text(encoding="utf-8")
@@ -40,6 +201,15 @@ class BuildWorkflowTest(unittest.TestCase):
             compile(implementation, "task_impl.py", "exec")
             self.assertIn("SandboxApplication", app)
             self.assertIn("class TaskHooks", implementation)
+            self.assertEqual(json.loads((root / "tools.json").read_text()), tools)
+            self.assertIn("USER sandbox", (root / "Dockerfile").read_text())
+            self.assertIn("pytest", (root / "requirements-dev.txt").read_text())
+            self.assertTrue((root / "docker_build.sh").stat().st_mode & 0o111)
+            completed = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q"], cwd=root,
+                text=True, capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
     def test_readiness_helpers_remove_dynamic_fields_and_find_leaks(self):
         readiness = load_script("validate_training_readiness.py")
         value = {"request_id": "a", "nested": {"timestamp": 1, "value": 2}}
@@ -62,7 +232,16 @@ class BuildWorkflowTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(validator.validate(first), [])
         self.assertEqual(first["authority"], "env_factory_outer_workflow")
-        self.assertEqual(first["nodes"][0]["scope"]["tables"], ["items"])
+        self.assertEqual(first["version"], "2.0")
+        self.assertEqual(first["nodes"][-1]["scope"]["tables"], ["items"])
+
+    def test_model_judge_is_not_a_custom_development_node(self):
+        generator = load_script("generate_development_plan.py")
+        plan = generator.build_plan({"tools": [], "metrics": [
+            {"id": "semantic_quality", "evaluator": {"kind": "external_llm_judge"}}
+        ]})
+        self.assertNotIn("metric_extensions", [node["id"] for node in plan["nodes"]])
+        self.assertEqual(plan["nodes"][-1]["scope"]["metrics"], [])
 
     def test_runtime_validator_accepts_modular_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -96,6 +275,35 @@ class BuildWorkflowTest(unittest.TestCase):
             )
             completed = subprocess.run(
                 ["python3", str(ROOT / "scripts" / "validate_sandbox_runtime.py"), "--root", str(root)],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+    def test_runtime_validator_allows_support_components_in_shared_runtime(self):
+        validator = ROOT / "scripts" / "validate_sandbox_runtime.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contract = {
+                "metrics": [{"id": "goal", "evaluator": {}}],
+                "requirements": {"runtime_interface": {"shared_runtime": {
+                    "required_components": ["AcceptanceScenarioRunner", "validate_json_schema"]
+                }}},
+            }
+            (root / "BUILD_CONTRACT.json").write_text(json.dumps(contract), encoding="utf-8")
+            (root / "sandbox_runtime.py").write_text(
+                "class AcceptanceScenarioRunner: pass\n"
+                "def validate_json_schema(): pass\n",
+                encoding="utf-8",
+            )
+            (root / "app.py").write_text(
+                "from sandbox_runtime import ContractToolRegistry, ContractRewardAggregator, SandboxApplication, ContractUserSimulator, DeclarativeMetricEvaluator\n"
+                "from runtime_llm import RuntimeLLMClient\n"
+                "contract = {}; metrics = contract.get('metrics', [])\n"
+                "def call(client): return client.json_chat([])\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [sys.executable, str(validator), "--root", str(root)],
                 text=True, capture_output=True,
             )
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)

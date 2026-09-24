@@ -41,17 +41,31 @@ def main() -> int:
         for name in production_names if (root / name).is_file()
     }
     source = "\n".join(sources.values())
+    shared_source_path = root / "sandbox_runtime.py"
+    shared_source = shared_source_path.read_text(encoding="utf-8") if shared_source_path.is_file() else ""
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if contract.get("task_spec"):
+        import importlib.util
+        template_path = Path(__file__).with_name("generate_sandbox_scaffold.py")
+        module_spec = importlib.util.spec_from_file_location("scaffold_authority", template_path)
+        template = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(template)
+        if source_path.read_text(encoding="utf-8") != template.APP_SOURCE:
+            fail("platform app.py differs from the EnvFactory scaffold; regenerate it before validation")
+        platform = Path(__file__).resolve().parents[1] / "src" / "env_factory"
+        for name in ("sandbox_runtime.py", "runtime_llm.py"):
+            if not (root / name).is_file() or (root / name).read_bytes() != (platform / name).read_bytes():
+                fail(f"platform runtime has changed: {name}")
     interface = contract.get("requirements", {}).get("runtime_interface", {})
     shared_runtime = interface.get("shared_runtime", {}) if isinstance(interface, dict) else {}
     required_components = shared_runtime.get("required_components", []) if isinstance(shared_runtime, dict) else []
     if isinstance(required_components, list):
         missing_components = [
             component for component in required_components
-            if isinstance(component, str) and component not in source
+            if isinstance(component, str) and component not in source and component not in shared_source
         ]
         if missing_components:
-            fail(f"runtime does not use required shared components: {missing_components}")
+            fail(f"runtime does not provide required shared components: {missing_components}")
     metrics = contract.get("metrics", [])
     if not isinstance(metrics, list) or not metrics:
         fail("BUILD_CONTRACT.metrics must be a non-empty list")
@@ -65,7 +79,11 @@ def main() -> int:
         fail("reward evaluator must iterate CONTRACT.metrics")
     if "DeclarativeMetricEvaluator" not in source and not re.search(r"metric\s*(?:\.|\[\s*['\"]evaluator['\"]\s*\])", source):
         fail("reward evaluator must consume metric.evaluator from the contract")
-    if "RuntimeLLMClient" not in source or "json_chat" not in source:
+    evaluator_boundary = (
+        ("RuntimeLLMClient" in source and "json_chat" in source)
+        or ("ContractEvaluatorRuntime" in source and "RuntimeLLMClient" in shared_source and "json_chat" in shared_source)
+    )
+    if not evaluator_boundary:
         fail("runtime must use RuntimeLLMClient for external evaluator/user simulation")
 
     metric_ids = [item.get("id") for item in metrics if isinstance(item, dict)]
@@ -83,6 +101,8 @@ def main() -> int:
         token in source for token in ("profiles", "scripts", "sessions")
     )):
         fail("User Simulator must load profiles, scripts, and sessions from its manifest")
+    if re.search(r"ContractUserSimulator\s*\([^)]*renderer\s*=", source, re.S):
+        fail("ContractUserSimulator must use its default external-LLM renderer; task-specific renderer injection is forbidden")
 
     # The generic runtime must expose a contract-driven tool registry and the
     # reward endpoint, while keeping reward calculation out of tool execution.

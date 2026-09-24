@@ -37,54 +37,61 @@ def build_plan(contract: dict[str, Any]) -> dict[str, Any]:
         item.get("id") for item in contract.get("metrics", [])
         if isinstance(item, dict) and item.get("id")
     ]
+    task_spec = contract.get("task_spec", {})
+    environment = task_spec.get("environment_contract", {}) if isinstance(task_spec, dict) else {}
+    archetype = environment.get("archetype", "legacy") if isinstance(environment, dict) else "legacy"
+    implementations = {
+        item.get("tool_name") for item in contract.get("tool_implementations", [])
+        if isinstance(item, dict) and item.get("tool_name")
+    }
+    noise = {
+        item.get("name") for item in contract.get("noise_tools", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    custom_tools = [name for name in tool_names if name not in noise and name not in implementations]
+    implemented_metrics = {
+        item.get("metric_id") for item in contract.get("metric_implementations", [])
+        if isinstance(item, dict) and item.get("metric_id")
+    }
+    implemented_metrics.update(item.get("id") for item in contract.get("metrics", [])
+                               if item.get("evaluator", {}).get("kind") == "external_llm_judge")
+    custom_metrics = [name for name in metrics if name not in implemented_metrics]
+    nodes: list[dict[str, Any]] = []
+    if custom_tools:
+        nodes.append({
+            "id": "task_handlers",
+            "goal": "Implement only business handlers not covered by the declarative tool compiler.",
+            "depends_on": [],
+            "inputs": ["BUILD_CONTRACT.json.task_spec.tool_contracts", "task_impl.py"],
+            "outputs": ["task_impl.py business handlers", "tests/tools"],
+            "validation": ["python3 -m pytest -q tests/tools"],
+            "scope": {"tools": custom_tools, "tables": tables, "archetype": archetype},
+        })
+    if custom_metrics:
+        nodes.append({
+            "id": "metric_extensions",
+            "goal": "Implement only metrics not covered by DeclarativeMetricEvaluator; do not alter aggregation or UserSimulator.",
+            "depends_on": ["task_handlers"] if custom_tools else [],
+            "inputs": ["BUILD_CONTRACT.json.task_spec.reward_contract", "task_impl.py"],
+            "outputs": ["task_impl.py custom metric scores", "tests/reward"],
+            "validation": ["python3 -m pytest -q tests/reward"],
+            "scope": {"metrics": custom_metrics, "archetype": archetype},
+        })
+    dependencies = [node["id"] for node in nodes]
+    nodes.append({
+        "id": "delivery",
+        "goal": "Add task-specific acceptance evidence and package the immutable EnvFactory scaffold.",
+        "depends_on": dependencies,
+        "inputs": ["task_spec", "acceptance_contract", "EnvFactory-owned scaffold"],
+        "outputs": ["acceptance.sh", "acceptance_result.json", "IMPLEMENTATION_REPORT.md"],
+        "validation": ["python3 -m pytest -q", "bash ./acceptance.sh"],
+        "scope": {"tables": tables, "tools": custom_tools, "metrics": custom_metrics, "archetype": archetype},
+    })
     return {
-        "version": "1.0",
+        "version": "2.0",
         "authority": "env_factory_outer_workflow",
-        "nodes": [
-            {
-                "id": "data_layer",
-                "goal": "Load the declared business data into isolated, deterministic episodes using the supplied runtime primitives.",
-                "depends_on": [],
-                "inputs": ["BUILD_CONTRACT.json", "data/business_data", "sandbox_runtime.py"],
-                "outputs": ["data_layer.py", "tests/data_layer"],
-                "validation": ["python3 -m pytest -q tests/data_layer"],
-                "scope": {"tables": tables},
-            },
-            {
-                "id": "tool_registry",
-                "goal": "Implement only the declared task tool handlers; schema validation, tracing and mutation hooks remain generic.",
-                "depends_on": ["data_layer"],
-                "inputs": ["BUILD_CONTRACT.json.tools", "data_layer.py"],
-                "outputs": ["task_impl.py business handlers", "tools.json", "tests/tools"],
-                "validation": ["python3 -m pytest -q tests/tools"],
-                "scope": {"tools": tool_names},
-            },
-            {
-                "id": "user_and_reward",
-                "goal": "Implement contract-driven user simulation and reward evaluation without hard-coded metric IDs or session selection.",
-                "depends_on": ["data_layer", "tool_registry"],
-                "inputs": ["BUILD_CONTRACT.json.metrics", "data/user_simulation", "runtime_llm.py"],
-                "outputs": ["task_impl.py user renderer and custom metric scores", "tests/user_simulator", "tests/reward"],
-                "validation": ["python3 -m pytest -q tests/user_simulator tests/reward"],
-                "scope": {"metrics": metrics},
-            },
-            {
-                "id": "trainer_api",
-                "goal": "Wire the supplied runtime primitives and task components to the exact declared HTTP interface.",
-                "depends_on": ["data_layer", "tool_registry", "user_and_reward"],
-                "inputs": ["BUILD_CONTRACT.json.requirements.runtime_interface", "sandbox_runtime.py"],
-                "outputs": ["app.py", "tests/trainer_api"],
-                "validation": ["python3 -m pytest -q tests/trainer_api"],
-            },
-            {
-                "id": "delivery",
-                "goal": "Package and verify the completed sandbox; do not redesign already validated modules.",
-                "depends_on": ["trainer_api"],
-                "inputs": ["all production modules", "acceptance_contract"],
-                "outputs": ["acceptance.sh", "acceptance_result.json", "Dockerfile", "docker_build.sh", "docker_run.sh", "requirements-dev.txt", "IMPLEMENTATION_REPORT.md"],
-                "validation": ["python3 -m pytest -q", "bash ./acceptance.sh"],
-            },
-        ],
+        "environment_archetype": archetype,
+        "nodes": nodes,
     }
 
 
