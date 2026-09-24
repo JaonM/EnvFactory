@@ -128,6 +128,53 @@ class TaskGeneratorTest(unittest.TestCase):
             }],
         )
 
+    def test_keywords_filter_generic_unsafe_and_malformed_candidates(self):
+        path = (
+            SceneNode("材质", ("衣物材质",)),
+            SceneNode("癌症", ("医疗诊断",)),
+            SceneNode("有效主题", ("https://invalid.example", "\ufffd乱码")),
+        )
+        with patch("env_factory.task_generator.random.choice", side_effect=lambda items: items[0]):
+            self.assertEqual(TaskGenerator._keywords(path), ("衣物材质", "有效主题"))
+
+    def test_keywords_limit_forced_topic_combinations(self):
+        path = tuple(SceneNode(f"主题{index}") for index in range(5))
+        with patch("env_factory.task_generator.random.choice", side_effect=lambda items: items[0]):
+            self.assertEqual(
+                TaskGenerator._keywords(path),
+                ("主题0", "主题1", "主题2"),
+            )
+
+    def test_keyword_filter_does_not_match_tax_inside_syntax(self):
+        self.assertEqual(TaskGenerator._normalize_keyword("syntax"), "syntax")
+
+    def test_keyword_filter_rejects_high_risk_solvent_topics(self):
+        self.assertIsNone(TaskGenerator._normalize_keyword("甲基叔丁基醚"))
+        self.assertIsNone(TaskGenerator._normalize_keyword("格氏试剂"))
+
+    def test_generate_resamples_path_when_all_keywords_are_filtered(self):
+        class ResamplingStore:
+            calls = 0
+
+            def random_scene_event_path(self, hops, attempts=8):
+                self.calls += 1
+                if self.calls == 1:
+                    return (SceneNode("数据"),)
+                return (SceneNode("服装出口"),)
+
+        captured = {}
+        with (
+            patch("env_factory.task_generator.random.randint", return_value=0),
+            patch("env_factory.task_generator.random.choice", side_effect=lambda items: items[0]),
+            patch.object(
+                TaskGenerationPipeline,
+                "generate",
+                side_effect=lambda **kwargs: captured.update(kwargs) or self._pipeline_artifacts(),
+            ),
+        ):
+            TaskGenerator(ResamplingStore(), FakeLLM()).generate(0, TaskType.EVENT)
+        self.assertEqual(captured["keywords"], ["服装出口"])
+
 
 if __name__ == "__main__":
     unittest.main()

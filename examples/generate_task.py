@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -13,13 +14,56 @@ from dotenv import load_dotenv
 from env_factory import (
     LLMClient,
     Neo4jGraphStore,
+    PipelineGenerationError,
     TaskGenerationError,
     TaskGenerator,
     TaskType,
 )
+from env_factory.task_routing import (
+    TRAINING_CATEGORIES,
+    allocate_training_routes,
+    compatible_training_categories,
+    parse_training_mix,
+    select_training_intent,
+)
 
 
-def main() -> None:
+_TASK_DIR_PATTERN = re.compile(r"task-(\d+)")
+
+
+def _existing_task_numbers(artifact_root: Path) -> list[int]:
+    if not artifact_root.is_dir():
+        return []
+    numbers: list[int] = []
+    for path in artifact_root.iterdir():
+        match = _TASK_DIR_PATTERN.fullmatch(path.name)
+        if path.is_dir() and match:
+            numbers.append(int(match.group(1)))
+    return sorted(numbers)
+
+
+def _reserve_task_directories(artifact_root: Path, count: int) -> list[tuple[int, Path]]:
+    """Atomically reserve monotonically increasing task directories.
+
+    ``mkdir(exist_ok=False)`` also prevents two concurrently running CLI
+    processes from selecting the same task number.
+    """
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    candidate = max(_existing_task_numbers(artifact_root), default=0) + 1
+    reserved: list[tuple[int, Path]] = []
+    while len(reserved) < count:
+        task_dir = artifact_root / f"task-{candidate}"
+        try:
+            task_dir.mkdir()
+        except FileExistsError:
+            candidate += 1
+            continue
+        reserved.append((candidate, task_dir))
+        candidate += 1
+    return reserved
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="从知识图谱生成长程任务")
     parser.add_argument("--hops", type=int, default=3, help="随机路径最大跳数，实际范围为 0 到该值，默认 3")
     parser.add_argument("--count", type=int, default=1, help="生成任务数量，默认 1")
@@ -34,7 +78,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=Path("output"),
-        help="任务输出根路径；最终文件写入 output/task_artifacts/task-N/task.json，默认 output",
+        help="任务输出根路径；每次运行在 task_artifacts 下追加新的 task-N，默认 output",
     )
     parser.add_argument(
         "--log-file",
@@ -80,6 +124,14 @@ def main() -> None:
         default=3,
         help="每个任务最多生成的噪声工具数量，实际数量随机为 0..N；噪声工具由共享运行时安全执行，默认 3",
     )
+    parser.add_argument("--training-category", choices=TRAINING_CATEGORIES, help="固定全部任务的训练路由类别")
+    parser.add_argument(
+        "--training-mix",
+        default="direct_response=0.20,simple_agentic=0.30,multi_step_agentic=0.50",
+        help="批次训练类别比例，默认 15/25/45/15",
+    )
+    parser.add_argument("--route-attempts", type=int, default=3, help="每个训练路由候选最多重采样次数，默认 3")
+    parser.add_argument("--stage-cache-dir", type=Path, help="可选的阶段检查点目录；相同模型、代码、提示和输入复用结果，并重新执行语义校验")
     args = parser.parse_args()
     if args.count <= 0:
         parser.error("--count 必须大于 0")
@@ -91,7 +143,20 @@ def main() -> None:
         parser.error("--max-dialogue-turns 必须至少为 4")
     if args.noise_tool_max < 0:
         parser.error("--noise-tool-max 不能小于 0")
+    if args.route_attempts <= 0:
+        parser.error("--route-attempts 必须大于 0")
+    try:
+        training_mix = parse_training_mix(args.training_mix)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.training_category and args.task_intent:
+        try:
+            select_training_intent(args.training_category, args.task_intent)
+        except ValueError as exc:
+            parser.error(str(exc))
     load_dotenv()
+    if args.stage_cache_dir:
+        os.environ["ENVFACTORY_STAGE_CACHE_DIR"] = str(args.stage_cache_dir.resolve())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.log_file.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -106,6 +171,7 @@ def main() -> None:
     )
     task_root = args.output if args.output.suffix == "" else args.output.parent
     task_root.mkdir(parents=True, exist_ok=True)
+    artifact_root = task_root / "task_artifacts"
     with Neo4jGraphStore(
         database=os.getenv("NEO4J_DATABASE", "neo4j"),
         path_query_timeout=args.path_query_timeout,
@@ -118,51 +184,81 @@ def main() -> None:
             maximum_dialogue_turns=args.max_dialogue_turns,
             noise_tool_max=args.noise_tool_max,
         )
+        reserved_tasks = _reserve_task_directories(artifact_root, args.count)
+        routes = (
+            [args.training_category] * args.count
+            if args.training_category else allocate_training_routes(
+                args.count,
+                training_mix,
+                allowed_categories=(
+                    compatible_training_categories(args.task_intent)
+                    if args.task_intent else None
+                ),
+            )
+        )
+        logging.getLogger(__name__).info(
+            "reserved incremental task ids: %s",
+            [task_number for task_number, _ in reserved_tasks],
+        )
         with ThreadPoolExecutor(max_workers=min(args.max_workers, args.count)) as executor:
-            def generate_one(index: int):
-                logging.getLogger(__name__).info("task generation started: task=%d/%d", index, args.count)
-                task_dir = task_root / "task_artifacts" / f"task-{index}"
-                # A rerun must not mix artifacts from previous attempts (for
-                # example script_1 and script-1 sessions).
-                if task_dir.exists():
-                    shutil.rmtree(task_dir)
-                return generator.generate(
-                    args.hops,
-                    args.task_type,
-                    args.task_style,
-                    artifact_dir=task_root / "task_artifacts" / f"task-{index}",
-                    task_intent=args.task_intent,
+            def generate_one(batch_index: int, task_number: int, task_dir: Path, training_category: str):
+                logging.getLogger(__name__).info(
+                    "task generation started: batch=%d/%d task_id=task-%d",
+                    batch_index, args.count, task_number,
+                )
+                last_error = None
+                for route_attempt in range(1, args.route_attempts + 1):
+                    try:
+                        return generator.generate(
+                            args.hops,
+                            args.task_type,
+                            args.task_style,
+                            artifact_dir=task_dir,
+                            task_intent=args.task_intent,
+                            training_category=training_category,
+                        )
+                    except (TaskGenerationError, PipelineGenerationError) as exc:
+                        last_error = exc
+                        logging.getLogger(__name__).warning(
+                            "training route candidate rejected: task_id=task-%d category=%s attempt=%d/%d reason=%s",
+                            task_number, training_category, route_attempt, args.route_attempts, exc,
+                        )
+                        if route_attempt < args.route_attempts:
+                            shutil.rmtree(task_dir, ignore_errors=True)
+                            task_dir.mkdir()
+                raise TaskGenerationError(
+                    f"{training_category} route exhausted {args.route_attempts} candidate(s): {last_error}"
                 )
 
             futures = {
-                executor.submit(generate_one, index): index
-                for index in range(1, args.count + 1)
+                executor.submit(generate_one, batch_index, task_number, task_dir, routes[batch_index - 1]): (
+                    batch_index, task_number, task_dir, routes[batch_index - 1]
+                )
+                for batch_index, (task_number, task_dir) in enumerate(reserved_tasks, start=1)
             }
             failed = 0
             for completed, future in enumerate(as_completed(futures), start=1):
-                index = futures[future]
+                batch_index, task_number, task_dir, training_category = futures[future]
                 try:
                     task = future.result()
                 except TaskGenerationError as exc:
                     failed += 1
-                    task_dir = task_root / "task_artifacts" / f"task-{index}"
                     if task_dir.exists():
                         shutil.rmtree(task_dir)
                     logging.getLogger(__name__).warning(
-                        "task generation skipped: task=%d/%d reason=%s",
-                        index, args.count, exc,
+                        "task generation skipped: batch=%d/%d task_id=task-%d reason=%s",
+                        batch_index, args.count, task_number, exc,
                     )
                     continue
                 except Exception:
                     failed += 1
-                    task_dir = task_root / "task_artifacts" / f"task-{index}"
                     if task_dir.exists():
                         shutil.rmtree(task_dir)
                     logging.getLogger(__name__).exception(
-                        "task generation failed: task=%d/%d", index, args.count
+                        "task generation failed: batch=%d/%d task_id=task-%d",
+                        batch_index, args.count, task_number,
                     )
                     continue
-                task_dir = task_root / "task_artifacts" / f"task-{index}"
                 task_path = task_dir / "task.json"
                 pipeline_artifacts = task.artifacts or {}
                 artifact_manifest = {
@@ -182,6 +278,9 @@ def main() -> None:
                             "task": task.desc,
                             "task_type": task.task_type.value,
                             "task_intent": task.task_intent,
+                            "training_category": pipeline_artifacts.get("training_category", training_category),
+                            "training_contract": pipeline_artifacts.get("training_contract", {}),
+                            "task_spec": pipeline_artifacts.get("task_spec", {}),
                             "complexity": task.complexity,
                             "requirements": pipeline_artifacts.get("requirements", {}),
                             "environment_plan": pipeline_artifacts.get("environment_plan", {}),
@@ -208,8 +307,8 @@ def main() -> None:
                     encoding="utf-8",
                 )
                 logging.getLogger(__name__).info(
-                    "task artifact written: task=%d/%d complexity=%s task_file=%s",
-                    index, args.count, task.complexity, task_path,
+                    "task artifact written: batch=%d/%d task_id=task-%d complexity=%s task_file=%s",
+                    batch_index, args.count, task_number, task.complexity, task_path,
                 )
                 logging.getLogger(__name__).info(
                     "task generation progress: completed=%d/%d success=%d failed=%d",
@@ -220,7 +319,8 @@ def main() -> None:
         args.count - failed, failed, task_root,
     )
     print(f"任务生成结束：成功={args.count - failed}，失败={failed}，目录={task_root / 'task_artifacts'}，日志={args.log_file}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

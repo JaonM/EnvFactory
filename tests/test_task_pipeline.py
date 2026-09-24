@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,58 @@ from env_factory.task_pipeline import PipelineGenerationError, TaskGenerationPip
 
 
 class StageRetryTest(unittest.TestCase):
+    def test_transient_llm_failure_uses_backoff_before_retry(self):
+        class FakeLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, prompt, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("LLM returned HTTP 503: Service is too busy")
+                return SimpleNamespace(content=json.dumps({"value": True}))
+
+        llm = FakeLLM()
+        pipeline = TaskGenerationPipeline(llm, retries=2)
+        with patch("env_factory.task_pipeline.time.sleep") as sleep:
+            result = pipeline._call("some_stage", "prompt", {"output": {}})
+        self.assertTrue(result["value"])
+        sleep.assert_called_once()
+
+    def test_even_turn_limit_is_recorded_as_bounded_completion(self):
+        class FakeLLM:
+            def complete(self, prompt, **kwargs):
+                if "transition_id" in prompt:
+                    return SimpleNamespace(content=json.dumps({
+                        "message": "请继续说明", "transition_id": "continue",
+                    }))
+                return SimpleNamespace(content=json.dumps({"message": "这是回答"}))
+
+        pipeline = TaskGenerationPipeline(
+            FakeLLM(), minimum_dialogue_turns=2, maximum_dialogue_turns=4,
+        )
+        result = pipeline._simulate_dialogue_session(
+            description={"task": "解释概念"},
+            environment={},
+            profile={"profile_id": "profile-1"},
+            script={
+                "script_id": "script-1", "initial_state": "asking",
+                "states": [
+                    {"state_id": "asking", "user_behavior": "继续追问", "terminal": False},
+                    {"state_id": "done", "user_behavior": "结束", "terminal": True},
+                ],
+                "transitions": [
+                    {"transition_id": "continue", "from_state": "asking", "to_state": "asking", "condition": "继续", "should_end": False, "updates": {}},
+                    {"transition_id": "finish", "from_state": "asking", "to_state": "done", "condition": "完成", "should_end": True, "updates": {}},
+                ],
+            },
+            script_id="script-1",
+            session_id="script-1-session-1",
+        )
+        self.assertEqual(result["termination_reason"], "bounded_completion")
+        self.assertTrue(result["user_end_flags"][-1])
+        self.assertEqual(result["turn_count"], 4)
+
     def test_task_description_shape_error_is_retried_with_feedback(self):
         class FakeLLM:
             def __init__(self):
@@ -47,18 +100,18 @@ class StageRetryTest(unittest.TestCase):
                 self.calls.append((prompt, kwargs))
                 if len(self.calls) == 1:
                     return SimpleNamespace(content=json.dumps({"message": "继续说明"}))
-                return SimpleNamespace(content=json.dumps({"message": "现在可以结束了", "should_end": True}))
+                return SimpleNamespace(content=json.dumps({"message": "现在可以结束了", "transition_id": "finish"}))
 
         llm = FakeLLM()
         pipeline = TaskGenerationPipeline(llm, retries=2)
         result = pipeline._call(
             "dialogue_sessions.script-1-session-1.user.1",
             "模拟用户",
-            {"output": {"message": "string", "should_end": False}},
+            {"output": {"message": "string", "transition_id": "transition-id"}},
         )
-        self.assertTrue(result["should_end"])
+        self.assertEqual(result["transition_id"], "finish")
         self.assertEqual(len(llm.calls), 2)
-        self.assertIn("should_end must be boolean", llm.calls[1][0])
+        self.assertIn("transition_id must be a string", llm.calls[1][0])
 
     def test_table_data_json_error_is_retried_with_compact_rows_contract(self):
         class FakeLLM:
@@ -84,6 +137,24 @@ class StageRetryTest(unittest.TestCase):
 
 
 class BusinessDataArtifactsTest(unittest.TestCase):
+    def test_business_fixture_values_alias_localized_count_fields(self):
+        values = TaskGenerationPipeline._business_fixture_values([{
+            "table_name": "corpus_statistics",
+            "rows": [{"table_a_撮口呼_count": 48, "table_a_开口呼_count": 312}],
+        }])
+        schema = {
+            "type": "object",
+            "properties": {
+                "撮口呼样本计数": {"type": "integer"},
+                "开口呼样本计数": {"type": "integer"},
+            },
+            "required": ["撮口呼样本计数", "开口呼样本计数"],
+        }
+        self.assertEqual(
+            TaskGenerationPipeline._schema_fixture(schema, fixture_values=values),
+            {"撮口呼样本计数": 48, "开口呼样本计数": 312},
+        )
+
     def test_stateless_manifest_has_no_business_tables(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest = TaskGenerationPipeline._materialize_business_data(
@@ -113,6 +184,70 @@ class BusinessDataArtifactsTest(unittest.TestCase):
 
 
 class AgentActionContractTest(unittest.TestCase):
+    def test_file_deliverable_detection(self):
+        self.assertTrue(TaskGenerationPipeline._requires_file_deliverable({
+            "task": "生成可打印的工作坊流程表",
+            "requirements": {"output_format": "PDF"},
+        }))
+        self.assertFalse(TaskGenerationPipeline._requires_file_deliverable({
+            "task": "用 Markdown 编写工作坊流程表",
+            "requirements": {"output_format": "Markdown"},
+        }))
+
+    def test_authoritative_reference_schema_requires_provenance(self):
+        tables = [{"columns": [{"name": "content"}]}]
+        with self.assertRaisesRegex(PipelineGenerationError, "provenance columns"):
+            TaskGenerationPipeline._validate_authoritative_source_schema(
+                task_description={"task": "验证澳门法律条文"},
+                table_definitions=tables,
+            )
+
+    def test_authoritative_reference_schema_accepts_traceable_sources(self):
+        tables = [{"columns": [
+            {"name": "content"}, {"name": "source_url"},
+            {"name": "retrieved_at"}, {"name": "content_hash"},
+        ]}]
+        TaskGenerationPipeline._validate_authoritative_source_schema(
+            task_description={"task": "验证澳门法律条文"},
+            table_definitions=tables,
+        )
+
+    def test_authoritative_reference_task_requires_supplied_source_urls(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "source URLs"):
+            TaskGenerationPipeline._validate_authoritative_task_input(
+                task_description={"task": "验证澳门法律条文"},
+                environment_mode="reference_data",
+                graph_context={"nodes": []},
+            )
+
+    def test_authoritative_reference_task_accepts_supplied_source_urls(self):
+        TaskGenerationPipeline._validate_authoritative_task_input(
+            task_description={"task": "验证澳门法律条文"},
+            environment_mode="reference_data",
+            graph_context={"sources": ["https://bo.io.gov.mo/example"]},
+        )
+
+    def test_media_generation_rejects_fabricated_runtime_input(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "fabricates runtime user input"):
+            TaskGenerationPipeline._validate_media_generation(
+                {
+                    "code": "# 模拟数据\nintervals = [1, 2]\nopen('output/result.png', 'wb')",
+                    "output_dir": "output",
+                },
+                input_media_required=True,
+                deliverable_required=True,
+                task_description={"requirements": {"output_format": "PNG"}},
+            )
+
+    def test_media_generation_requires_declared_file_format(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "declared file format"):
+            TaskGenerationPipeline._validate_media_generation(
+                {"code": "open('output/result.txt', 'w')", "output_dir": "output"},
+                input_media_required=False,
+                deliverable_required=True,
+                task_description={"requirements": {"output_format": "PDF"}},
+            )
+
     def test_extract_without_persistence_is_forced_to_stateless(self):
         plan = TaskGenerationPipeline._resolve_environment_plan(
             {"mode": "stateful", "requires_business_data": True, "requires_persistence": True, "reason": "模型过度设计"},
@@ -129,6 +264,337 @@ class AgentActionContractTest(unittest.TestCase):
             task_intent="extract",
         )
         self.assertEqual(plan["mode"], "stateful")
+
+    def test_environment_plan_normalizes_unambiguous_alias(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "text-only", "reason": "纯文本处理"},
+            task_description={"task": "整理会议日程"},
+            task_intent="schedule",
+        )
+        self.assertEqual(plan["mode"], "stateless")
+
+    def test_environment_plan_uses_deterministic_fallback_for_unknown_mode(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "planning_workspace", "reason": "模型返回了未知标签"},
+            task_description={"task": "生成一份半天工作坊时间表"},
+            task_intent="schedule",
+        )
+        self.assertEqual(plan["mode"], "stateless")
+
+    def test_environment_plan_fallback_preserves_explicit_persistence(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "database_mode"},
+            task_description={"task": "将预约写入数据库并更新记录"},
+            task_intent="execute",
+        )
+        self.assertEqual(plan["mode"], "stateful")
+
+    def test_environment_plan_upgrades_public_latest_lookup(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "stateless", "reason": "无需数据"},
+            task_description={
+                "task": "查询青岛观光森林公园并整理列表",
+                "requirements": {"factual_constraint": "仅列出公开可查的信息"},
+            },
+            task_intent="query",
+        )
+        self.assertEqual(plan["mode"], "external_capability")
+
+    def test_environment_plan_upgrades_current_market_lookup(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "stateless", "reason": "使用常识"},
+            task_description={"task": "列出当前市场上的知名运动鞋品牌"},
+            task_intent="query",
+        )
+        self.assertEqual(plan["mode"], "external_capability")
+
+    def test_environment_plan_upgrades_administrative_area_fact(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "stateless", "reason": "模型常识"},
+            task_description={"task": "把三个地名按所属省级行政区归类"},
+            task_intent="classify",
+        )
+        self.assertEqual(plan["mode"], "external_capability")
+
+    def test_environment_plan_upgrades_price_estimate_without_prices(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "stateless", "reason": "直接计算"},
+            task_description={"task": "根据菜品名称计算三人组合并预估总价"},
+            task_intent="calculate",
+        )
+        self.assertEqual(plan["mode"], "external_capability")
+
+    def test_environment_plan_uses_runtime_supplied_comparison_data(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "reference_data", "reason": "便于比较"},
+            task_description={"task": "基于用户提供的规格数据比较两款笔记本"},
+            task_intent="compare",
+        )
+        self.assertEqual(plan["mode"], "stateless")
+
+    def test_environment_plan_uses_user_supplied_recommendation_options(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "reference_data", "reason": "便于推荐"},
+            task_description={
+                "task": "从用户明确提供的周末活动选项中筛选并推荐一个选项",
+                "requirements": {"constraints": "仅依赖用户提供的列表和属性"},
+            },
+            task_intent="recommend",
+        )
+        self.assertEqual(plan["mode"], "stateless")
+
+    def test_environment_plan_keeps_parameter_only_recommendation_data_backed(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "stateless", "reason": "用户提供参数"},
+            task_description={"task": "根据用户提供的碳纤维参数推荐适合的布料选项"},
+            task_intent="recommend",
+        )
+        self.assertEqual(plan["mode"], "reference_data")
+
+    def test_environment_plan_gives_recommendations_reference_evidence(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "stateless", "reason": "可直接回答"},
+            task_description={"task": "比较两类材料并给出推荐"},
+            task_intent="recommend",
+        )
+        self.assertEqual(plan["mode"], "reference_data")
+
+    def test_environment_plan_gives_explanations_reference_evidence(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "stateless", "reason": "使用模型常识"},
+            task_description={"task": "解释一道地方菜的历史和烹饪技法"},
+            task_intent="explain",
+        )
+        self.assertEqual(plan["mode"], "reference_data")
+
+    def test_environment_plan_keeps_common_knowledge_explanation_stateless(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "reference_data", "reason": "模型过度设计资料库"},
+            task_description={"task": "解释枕头的常见用途和基本构造"},
+            task_intent="explain",
+        )
+        self.assertEqual(plan["mode"], "stateless")
+        self.assertFalse(plan["requires_business_data"])
+
+    def test_environment_plan_gives_training_plans_reference_evidence(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "stateless", "reason": "直接规划"},
+            task_description={"task": "制定四周足部稳定性训练计划"},
+            task_intent="plan",
+        )
+        self.assertEqual(plan["mode"], "reference_data")
+
+    def test_environment_plan_gives_decisions_reference_evidence(self):
+        plan = TaskGenerationPipeline._resolve_environment_plan(
+            {"mode": "stateless", "reason": "直接判断"},
+            task_description={"task": "在三类装备中决定最优先购买哪一类"},
+            task_intent="decide",
+        )
+        self.assertEqual(plan["mode"], "reference_data")
+
+    def test_task_description_repair_envelope_is_unwrapped(self):
+        repaired = {"grounding_issues": [], "output": {"task": "低风险任务", "complexity": "simple"}}
+        self.assertEqual(
+            TaskGenerationPipeline._unwrap_task_description(repaired)["task"],
+            "低风险任务",
+        )
+
+    def test_fixture_conversation_excludes_agent_claims(self):
+        selected = TaskGenerationPipeline._select_fixture_conversation([{
+            "turns": [
+                {"role": "user", "content": "预算 100 元"},
+                {"role": "agent", "content": "产品 A 价格 80 元"},
+                {"role": "user", "content": "优先耐用"},
+            ]
+        }])
+        self.assertEqual(selected, [
+            {"role": "user", "content": "预算 100 元"},
+            {"role": "user", "content": "优先耐用"},
+        ])
+
+    def test_task_scope_rejects_chain_of_thought(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "chain-of-thought"):
+            TaskGenerationPipeline._validate_task_generation_scope(
+                {"task": "输出你的思考过程和建议"}, graph_context={}
+            )
+
+    def test_task_scope_rejects_unsourced_high_stakes_advice(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "authoritative source"):
+            TaskGenerationPipeline._validate_task_generation_scope(
+                {"task": "根据腹痛症状判断是否需要用药"}, graph_context={}
+            )
+
+    def test_task_scope_rejects_unsourced_regulation_task_early(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "authoritative source"):
+            TaskGenerationPipeline._validate_task_generation_scope(
+                {"task": "根据现行法规完成合规审查"}, graph_context={}
+            )
+
+    def test_task_scope_rejects_medical_factual_explanation_without_sources(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "authoritative source"):
+            TaskGenerationPipeline._validate_task_generation_scope(
+                {"task": "解释癌症与冠状病毒感染的已知关联"}, graph_context={}
+            )
+
+    def test_data_environment_gets_a_read_action_fallback(self):
+        actions = [{"name": "比较候选", "description": "比较选项"}]
+        result = TaskGenerationPipeline._ensure_data_access_action(
+            actions, environment_mode="reference_data", table_names=["products"]
+        )
+        self.assertEqual(result[0]["name"], "读取任务参考数据")
+        self.assertEqual(result[1:], actions)
+
+    def test_data_access_capability_is_normalized_to_environment_operation(self):
+        result = TaskGenerationPipeline._normalize_data_access_capabilities(
+            [{"action_name": "读取资料", "kind": "agent_reasoning", "requires_tool": False, "reason": "读取"}],
+            actions=[{"name": "读取资料", "description": "查询参考表"}],
+            environment_mode="reference_data",
+        )
+        self.assertEqual(result[0]["kind"], "environment_operation")
+        self.assertTrue(result[0]["requires_tool"])
+
+    def test_user_script_state_machine_accepts_reachable_terminal_graph(self):
+        TaskGenerationPipeline._validate_user_script_state_machine({
+            "initial_state": "request",
+            "variables": {"budget": None},
+            "recovery_policy": {"max_recoveries": 2, "user_behavior": "请重新回答。", "handled_outcomes": ["agent_off_topic", "agent_premature_completion", "unrecognized"]},
+            "states": [
+                {"state_id": "request", "user_behavior": "提出请求", "terminal": False},
+                {"state_id": "clarify", "user_behavior": "补充预算", "terminal": False},
+                {"state_id": "done", "user_behavior": "确认结束", "terminal": True},
+            ],
+            "transitions": [
+                {"transition_id": "ask", "outcome_category": "information_required", "from_state": "request", "to_state": "clarify", "condition": "需要预算", "should_end": False, "updates": {"budget": 100}},
+                {"transition_id": "correct", "outcome_category": "user_correction", "from_state": "request", "to_state": "clarify", "condition": "纠正要求", "should_end": False, "updates": {}},
+                {"transition_id": "reject", "outcome_category": "user_rejection", "from_state": "request", "to_state": "clarify", "condition": "拒绝方案", "should_end": False, "updates": {}},
+                {"transition_id": "satisfy", "outcome_category": "goal_satisfied", "from_state": "request", "to_state": "clarify", "condition": "当前目标完成", "should_end": False, "updates": {}},
+                {"transition_id": "finish", "outcome_category": "user_acceptance", "from_state": "clarify", "to_state": "done", "condition": "用户接受", "should_end": True, "updates": {}},
+            ],
+        }, 0)
+
+    def test_deterministic_user_scripts_are_valid_and_have_requested_count(self):
+        scripts = TaskGenerationPipeline._deterministic_user_scripts(
+            description={"description": "比较两个候选并给出建议"}, count=2
+        )
+        self.assertEqual([item["script_id"] for item in scripts], ["script-1", "script-2"])
+        self.assertTrue(all(len(item["transitions"]) >= 5 for item in scripts))
+        self.assertTrue(all(
+            {transition["outcome_category"] for transition in item["transitions"]}
+            == {"goal_satisfied", "information_required", "user_correction", "user_rejection", "user_acceptance"}
+            for item in scripts
+        ))
+        for index, script in enumerate(scripts):
+            TaskGenerationPipeline._validate_user_script_state_machine(script, index)
+
+    def test_stateful_baseline_must_preserve_explicit_old_value(self):
+        description = {"task": "请把商品场景从“景观建筑”更正为“服装”。"}
+        with self.assertRaisesRegex(PipelineGenerationError, "precondition"):
+            TaskGenerationPipeline._validate_stateful_preconditions(
+                [{"table_name": "product", "rows": [{"scene": "服装"}]}],
+                task_description=description,
+                environment_mode="stateful",
+            )
+        TaskGenerationPipeline._validate_stateful_preconditions(
+            [{"table_name": "product", "rows": [{"scene": "景观建筑"}]}],
+            task_description=description,
+            environment_mode="stateful",
+        )
+
+    def test_user_script_state_machine_rejects_unreachable_state(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "unreachable"):
+            TaskGenerationPipeline._validate_user_script_state_machine({
+                "initial_state": "request",
+                "variables": {},
+                "recovery_policy": {"max_recoveries": 2, "user_behavior": "请重新回答。", "handled_outcomes": ["agent_off_topic", "agent_premature_completion", "unrecognized"]},
+                "states": [
+                    {"state_id": "request", "user_behavior": "提出请求", "terminal": False},
+                    {"state_id": "orphan", "user_behavior": "不可达", "terminal": False},
+                    {"state_id": "done", "user_behavior": "结束", "terminal": True},
+                ],
+                "transitions": [
+                    {"transition_id": "finish", "outcome_category": "user_acceptance", "from_state": "request", "to_state": "done", "condition": "完成", "should_end": True, "updates": {}},
+                    {"transition_id": "orphan-finish", "outcome_category": "user_acceptance", "from_state": "orphan", "to_state": "done", "condition": "完成", "should_end": True, "updates": {}},
+                ],
+            }, 0)
+
+    def test_user_script_state_machine_rejects_cycles(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "acyclic"):
+            TaskGenerationPipeline._validate_user_script_state_machine({
+                "initial_state": "request", "variables": {},
+                "recovery_policy": {"max_recoveries": 2, "user_behavior": "请重新回答。", "handled_outcomes": ["agent_off_topic", "agent_premature_completion", "unrecognized"]},
+                "states": [
+                    {"state_id": "request", "user_behavior": "请求", "terminal": False},
+                    {"state_id": "clarify", "user_behavior": "澄清", "terminal": False},
+                    {"state_id": "done", "user_behavior": "结束", "terminal": True},
+                ],
+                "transitions": [
+                    {"transition_id": "forward", "outcome_category": "information_required", "from_state": "request", "to_state": "clarify", "condition": "追问", "should_end": False, "updates": {}},
+                    {"transition_id": "back", "outcome_category": "user_correction", "from_state": "clarify", "to_state": "request", "condition": "重试", "should_end": False, "updates": {}},
+                    {"transition_id": "finish", "outcome_category": "user_acceptance", "from_state": "clarify", "to_state": "done", "condition": "完成", "should_end": True, "updates": {}},
+                ],
+            }, 0)
+
+    def test_dialogue_closure_detection(self):
+        self.assertTrue(TaskGenerationPipeline._looks_like_dialogue_closure("好的，就这样，谢谢！"))
+        self.assertTrue(TaskGenerationPipeline._looks_like_dialogue_closure("确认，结束对话。"))
+        self.assertTrue(TaskGenerationPipeline._looks_like_dialogue_closure("完美，谢谢！"))
+        self.assertFalse(TaskGenerationPipeline._looks_like_dialogue_closure("好的，请继续解释这个问题"))
+
+    def test_success_fixture_conversation_excludes_withdrawn_request(self):
+        withdrawn = {"turns": [
+            {"role": "user", "content": "请帮我整理原文"},
+            {"role": "agent", "content": "请提供原文"},
+            {"role": "user", "content": "今天先不弄了，改天再说"},
+        ]}
+        active = {"turns": [
+            {"role": "user", "content": "请整理这段原文：甲乙丙"},
+            {"role": "agent", "content": "好的"},
+            {"role": "user", "content": "请用 Markdown 表格"},
+        ]}
+        selected = TaskGenerationPipeline._select_fixture_conversation([withdrawn, active])
+        self.assertEqual(selected[-1]["content"], "请用 Markdown 表格")
+
+    def test_success_fixture_conversation_is_empty_when_all_requests_withdrawn(self):
+        selected = TaskGenerationPipeline._select_fixture_conversation([{
+            "turns": [{"role": "user", "content": "先不做了，取消"}],
+        }])
+        self.assertEqual(selected, [])
+
+    def test_metric_constraints_must_come_from_task(self):
+        metric = {
+            "rubric": "最终回答约 200 字",
+            "criteria": ["至少包含 2 个类别"],
+            "condition": "回答完整",
+            "evaluator": {},
+        }
+        with self.assertRaisesRegex(PipelineGenerationError, "numeric constraints"):
+            TaskGenerationPipeline._validate_metric_constraint_grounding(
+                [metric], task_description={"task": "撰写简洁的宣传文案"}
+            )
+        TaskGenerationPipeline._validate_metric_constraint_grounding(
+            [metric],
+            task_description={"task": "撰写约 200 字的宣传文案，至少包含 2 个类别"},
+        )
+
+    def test_success_fixture_enforces_declared_character_range(self):
+        description = {"requirements": ["回答限制在 100-200 字"]}
+        with self.assertRaisesRegex(PipelineGenerationError, "violates required"):
+            TaskGenerationPipeline._validate_success_fixture_constraints(
+                "太短", task_description=description
+            )
+        TaskGenerationPipeline._validate_success_fixture_constraints(
+            "字" * 120, task_description=description
+        )
+
+    def test_success_fixture_audit_rejects_ignored_latest_instruction(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "latest_instructions_satisfied"):
+            TaskGenerationPipeline._validate_success_fixture_audit({
+                "latest_instructions_satisfied": False,
+                "grounded": True,
+                "goal_completed": True,
+                "issues": ["未将IO口改成I/O口"],
+            })
+
     def test_capability_plan_separates_tools_from_reasoning_and_response(self):
         actions = [
             {"name": "查询库存"},
@@ -143,6 +609,375 @@ class AgentActionContractTest(unittest.TestCase):
         TaskGenerationPipeline._validate_capability_plan(capabilities, actions)
         with self.assertRaises(PipelineGenerationError):
             TaskGenerationPipeline._validate_capability_plan(capabilities[:2], actions)
+
+    def test_data_backed_capability_plan_requires_data_access_tool(self):
+        actions = [{"name": "读取面粉属性"}, {"name": "生成回答"}]
+        capabilities = [
+            {"action_name": "读取面粉属性", "kind": "agent_reasoning", "requires_tool": False, "reason": "读取"},
+            {"action_name": "生成回答", "kind": "agent_response", "requires_tool": False, "reason": "回答"},
+        ]
+        with self.assertRaisesRegex(PipelineGenerationError, "data access operation"):
+            TaskGenerationPipeline._validate_capability_plan(
+                capabilities, actions,
+                environment_mode="reference_data", has_business_data=True,
+            )
+
+    def test_data_grounding_audit_rejects_ambiguous_decision(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "decision_determinate"):
+            TaskGenerationPipeline._validate_data_grounding_audit({
+                "task_supported": True,
+                "decision_determinate": False,
+                "facts_consistent": True,
+                "issues": ["两个候选项具有相同优先级，无法唯一推荐"],
+            })
+
+    def test_task_grounding_audit_rejects_missing_factual_inputs(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "no_unprovided_facts"):
+            TaskGenerationPipeline._validate_task_grounding_audit({
+                "self_contained": True,
+                "no_unprovided_facts": False,
+                "expected_result_derivable": False,
+                "internally_consistent": True,
+                "issues": ["要求替换时价，但没有提供权威价格"],
+            })
+
+    def test_task_description_consistency_rejects_cross_task_list_contract(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "different deliverable"):
+            TaskGenerationPipeline._validate_task_description_consistency({
+                "task": "给出红豆薏米水的煎煮步骤、火候和时间",
+                "requirements": {
+                    "categories": ["蔬菜", "主食"],
+                    "sort_within_category": "按拼音排序",
+                    "output_format": "购物清单",
+                },
+            })
+
+    def test_task_description_consistency_accepts_matching_list_contract(self):
+        TaskGenerationPipeline._validate_task_description_consistency({
+            "task": "把食材整理成分类购物清单并排序",
+            "requirements": {
+                "categories": ["蔬菜", "主食"],
+                "sort_within_category": "按拼音排序",
+            },
+        })
+
+    def test_task_description_consistency_rejects_coding_activity_contract(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "event activity contract"):
+            TaskGenerationPipeline._validate_task_description_consistency({
+                "task": "制定癌细胞模型的代码实现计划",
+                "requirements": {
+                    "deliverable": "活动方案文档",
+                    "platform": "通用视频会议工具",
+                    "include": ["参与规则", "人员分工"],
+                },
+            })
+
+    def test_action_alignment_audit_rejects_cross_task_drift(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "not task-aligned"):
+            TaskGenerationPipeline._validate_action_alignment_audit({
+                "aligned": False,
+                "complete": True,
+                "atomic": True,
+                "issues": ["黑熊估算动作错误引用了小区借用次数"],
+            })
+
+    def test_action_grounding_rejects_cross_task_keywords(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "task-specific keyword"):
+            TaskGenerationPipeline._validate_action_grounding(
+                [{"name": "设计两天团队建设", "description": "安排北京团建活动"}],
+                task_description={"task": "制定美国东岸连锁超市考察行程"},
+                keywords=["美国东岸"],
+            )
+
+    def test_action_grounding_rejects_invented_numeric_constraints(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "invent numeric constraints"):
+            TaskGenerationPipeline._validate_action_grounding(
+                [{"name": "分配预算", "description": "为美国东岸行程按20人、每人500元分配"}],
+                task_description={"task": "制定5天美国东岸考察行程"},
+                keywords=["美国东岸"],
+            )
+
+    def test_action_grounding_rejects_partial_match_with_imported_domain(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "cross-task domain"):
+            TaskGenerationPipeline._validate_action_grounding(
+                [
+                    {"name": "识别维生素D学习目标", "description": "确认学习范围"},
+                    {"name": "设计场地布置", "description": "安排活动场地布置和宣传方式"},
+                ],
+                task_description={"task": "制定维生素D基础信息学习计划"},
+                keywords=["维生素D"],
+            )
+
+    def test_action_grounding_does_not_accept_keyword_echo_in_inputs(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "task-specific keyword"):
+            TaskGenerationPipeline._validate_action_grounding(
+                [{
+                    "name": "统计咖啡店收入",
+                    "description": "汇总每日营业额",
+                    "inputs": [{"name": "customary_law", "description": "习惯法模拟"}],
+                    "outputs": [{"name": "revenue_total"}],
+                }],
+                task_description={"task": "模拟习惯法争议解决过程"},
+                keywords=["习惯法"],
+            )
+
+    def test_action_grounding_rejects_predominantly_generic_steps(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "generic placeholders"):
+            TaskGenerationPipeline._validate_action_grounding(
+                [
+                    {"name": "接收并解析用户输入", "description": "提取历史教育材料"},
+                    {"name": "检查信息完整性", "description": "检查中国东北地区资料"},
+                    {"name": "执行诊断处理", "description": "处理教学难点"},
+                    {"name": "格式化输出结果", "description": "输出排查路径"},
+                ],
+                task_description={"task": "诊断中国东北地区历史教育的教学难点"},
+                keywords=["中国东北地区", "历史教育"],
+            )
+
+    def test_action_grounding_rejects_generic_action_paraphrases(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "generic placeholders"):
+            TaskGenerationPipeline._validate_action_grounding(
+                [
+                    {"name": "接收并规范化用户输入", "description": "处理襟边故障描述"},
+                    {"name": "检查输入完整性与明确要求", "description": "检查输入"},
+                    {"name": "生成补充信息请求", "description": "请求信息"},
+                    {"name": "格式化并输出最终结果", "description": "输出襟边诊断"},
+                ],
+                task_description={"task": "诊断襟边开裂原因"},
+                keywords=["襟边"],
+            )
+
+    def test_task_description_rejects_cross_domain_requirements(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "different business domains"):
+            TaskGenerationPipeline._validate_task_description_consistency({
+                "task": "模拟记录手脚颤抖症状的程序",
+                "requirements": {
+                    "input_format": "商品名称、单价和月销量",
+                    "output_format": "输出折扣率和总收入",
+                },
+            })
+
+    def test_task_description_rejects_ungrounded_mandarin_stress_labels(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "explicit rule"):
+            TaskGenerationPipeline._validate_task_description_consistency({
+                "task": "按普通话读音拆成音节并标出主重音和次重音",
+                "requirements": {"output_format": "Markdown表格"},
+            })
+
+    def test_task_description_rejects_absurd_cross_domain_comparison(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "unrelated food and architecture"):
+            TaskGenerationPipeline._validate_task_description_consistency({
+                "task_intent": "compare",
+                "task": "比较火腿罐头和城市街墙界面的地方特产呈现方式",
+                "requirements": {},
+            })
+
+    def test_task_description_requires_visible_candidate_input(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "candidate list"):
+            TaskGenerationPipeline._validate_task_description_consistency({
+                "task": "推荐三本适合普通读者的书",
+                "requirements": {"candidate_list_required": True},
+            })
+
+    def test_reasoning_request_is_normalized_to_concise_rationale(self):
+        normalized = TaskGenerationPipeline._normalize_reasoning_request({
+            "task": "给出逐步思考和推理过程",
+            "requirements": {"constraint": "show your reasoning"},
+        })
+        text = json.dumps(normalized, ensure_ascii=False).lower()
+        self.assertNotIn("思考过程", text)
+        self.assertNotIn("推理过程", text)
+        self.assertNotIn("show your reasoning", text)
+
+    def test_deterministic_diagnose_fallback_is_concrete(self):
+        task = TaskGenerationPipeline._deterministic_low_risk_task("diagnose")
+        self.assertIn("故障现象", task["task"])
+        self.assertIn("验证步骤", task["task"])
+
+    def test_executable_scenario_accepts_null_capture_as_empty(self):
+        TaskGenerationPipeline._validate_executable_scenarios(
+            [{
+                "scenario_id": "success-1",
+                "kind": "goal_success",
+                "steps": [
+                    {"operation": "reset", "capture": None},
+                    {"operation": "agent_response", "content": "done", "capture": None},
+                    {"operation": "reward", "capture": None},
+                ],
+                "assertions": [{"path": "$.reward", "operator": "gte", "expected": 0.5}],
+            }, {
+                "scenario_id": "failure-1",
+                "kind": "goal_failure",
+                "steps": [
+                    {"operation": "reset", "capture": None},
+                    {"operation": "agent_response", "content": "incomplete", "capture": None},
+                    {"operation": "reward", "capture": None},
+                ],
+                "assertions": [{"path": "$.reward", "operator": "lte", "expected": 0.2}],
+            }],
+            tools=[],
+            noise_tools=[],
+        )
+
+    def test_action_numeric_examples_are_replaced_when_not_grounded(self):
+        actions = TaskGenerationPipeline._normalize_action_numeric_examples(
+            [{
+                "name": "估算费用",
+                "description": "例如按1000元和6个月估算",
+                "inputs": [], "outputs": [],
+                "preconditions": ["已有1000元示例"], "effects": [],
+            }],
+            task_description={"task": "根据用户提供金额和期限估算费用"},
+        )
+        self.assertNotIn("1000", json.dumps(actions, ensure_ascii=False))
+        self.assertNotIn("6个月", json.dumps(actions, ensure_ascii=False))
+
+    def test_capability_plan_rejects_response_composition_tool(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "response composition"):
+            TaskGenerationPipeline._validate_capability_plan(
+                [{
+                    "action_name": "生成Markdown对比表格",
+                    "kind": "environment_operation",
+                    "requires_tool": True,
+                    "reason": "调用格式化工具",
+                }],
+                [{"name": "生成Markdown对比表格"}],
+            )
+
+    def test_data_keyword_alignment_rejects_cross_task_fixture(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "environment data omits"):
+            TaskGenerationPipeline._validate_data_keyword_alignment(
+                [{"table_name": "candidate_city", "rows": [{"name": "A市"}]}],
+                task_description={"task": "判断日语和阿依努语哪一种符合多式综合语"},
+                keywords=["多式综合语", "日语", "阿依努语"],
+            )
+
+    def test_data_keyword_alignment_accepts_matching_fixture(self):
+        TaskGenerationPipeline._validate_data_keyword_alignment(
+            [{"table_name": "language", "rows": [{"name": "阿依努语"}]}],
+            task_description={"task": "判断日语和阿依努语哪一种符合多式综合语"},
+            keywords=["多式综合语", "日语", "阿依努语"],
+        )
+
+    def test_success_fixture_length_normalization_trims_to_explicit_limit(self):
+        content = "甲" * 125
+        normalized = TaskGenerationPipeline._normalize_success_fixture_length(
+            content,
+            task_description={"requirements": {"length": "80-120字"}},
+        )
+        self.assertEqual(len(normalized), 120)
+        TaskGenerationPipeline._validate_success_fixture_constraints(
+            normalized,
+            task_description={"requirements": {"length": "80-120字"}},
+        )
+
+    def test_structured_output_unwraps_common_model_envelopes(self):
+        audit = {
+            "output": {
+                "self_contained": True,
+                "no_unprovided_facts": True,
+                "expected_result_derivable": True,
+                "internally_consistent": True,
+                "issues": [],
+            },
+            "type": "object",
+        }
+        normalized = TaskGenerationPipeline._unwrap_structured_output(
+            audit,
+            expected_fields={
+                "self_contained", "no_unprovided_facts",
+                "expected_result_derivable", "internally_consistent", "issues",
+            },
+        )
+        TaskGenerationPipeline._validate_task_grounding_audit(normalized)
+
+    def test_stage_result_normalizes_output_with_metadata(self):
+        normalized = TaskGenerationPipeline._normalize_stage_result(
+            {"output": {"actions": [{"name": "read"}]}, "type": "object"},
+            payload={"output": {"actions": []}},
+        )
+        self.assertEqual(normalized, {"actions": [{"name": "read"}]})
+
+    def test_stage_result_normalizes_nested_json_string(self):
+        normalized = TaskGenerationPipeline._normalize_stage_result(
+            {"result": '{"output":{"metrics":[],"observation_schema":{},"reward_formula":{}}}'},
+            payload={"output": {
+                "metrics": [], "observation_schema": {}, "reward_formula": {},
+            }},
+        )
+        self.assertEqual(set(normalized), {"metrics", "observation_schema", "reward_formula"})
+
+    def test_stage_result_shape_reports_missing_fields_for_retry(self):
+        with self.assertRaisesRegex(ValueError, "reward_formula"):
+            TaskGenerationPipeline._validate_stage_result_shape(
+                {"metrics": [], "observation_schema": {}},
+                payload={"output": {
+                    "metrics": [], "observation_schema": {}, "reward_formula": {},
+                }},
+            )
+
+    def test_stage_result_shape_rejects_empty_required_array(self):
+        with self.assertRaisesRegex(ValueError, "non-empty array"):
+            TaskGenerationPipeline._validate_stage_result_shape(
+                {"actions": []},
+                payload={"output": {"actions": [{"name": "string"}]}},
+            )
+
+    def test_stage_result_shape_allows_empty_optional_binding_array(self):
+        TaskGenerationPipeline._validate_stage_result_shape(
+            {"tool_bindings": []},
+            payload={"output": {"tool_bindings": [{"tool_name": "string"}]}},
+        )
+
+    def test_metric_constraint_grounding_ignores_boolean_control_values(self):
+        metrics = [{
+            "rubric": "无无效循环",
+            "condition": "invalid_loop_count == 0 and completed == 1",
+            "evaluator": {},
+        }]
+        TaskGenerationPipeline._validate_metric_constraint_grounding(
+            metrics, task_description={"task": "完成任务且避免无效循环"}
+        )
+
+    def test_ungrounded_numeric_metric_is_dropped_without_losing_valid_metric(self):
+        metrics = [
+            {"id": "invented", "rubric": "回答至少 50 字", "evaluator": {}},
+            {"id": "valid", "rubric": "回答忠实于输入", "evaluator": {}},
+        ]
+        retained = TaskGenerationPipeline._drop_ungrounded_numeric_metrics(
+            metrics, task_description={"task": "根据输入生成回答"}
+        )
+        self.assertEqual([item["id"] for item in retained], ["valid"])
+
+    def test_deterministic_low_risk_task_preserves_intent(self):
+        task = TaskGenerationPipeline._deterministic_low_risk_task("calculate")
+        self.assertEqual(task["task_intent"], "calculate")
+        self.assertIn("用户提供", task["task"])
+        TaskGenerationPipeline._validate_task_generation_scope(task, graph_context={})
+
+    def test_reference_data_outcome_is_normalized_to_response_judge(self):
+        metrics = [{
+            "id": "outcome_recommendation_persisted",
+            "category": "outcome",
+            "type": "rule-based",
+            "scope": "state",
+            "condition": "recommendation persisted",
+            "rubric": "推荐结果正确且有依据",
+            "evaluator": {
+                "kind": "business_state_rule", "source": "runtime_rule",
+                "assertion": "recommendation_persisted == true",
+                "score_mapping": {"true": 1, "false": 0},
+            },
+        }]
+        normalized = TaskGenerationPipeline._normalize_metrics_for_environment(
+            metrics, environment_mode="reference_data"
+        )
+        self.assertEqual(normalized[0]["type"], "model-based")
+        self.assertEqual(normalized[0]["evaluator"]["kind"], "external_llm_judge")
+        self.assertEqual(
+            normalized[0]["evaluation_inputs"],
+            ["final_agent_response", "business_data"],
+        )
 
     def test_actions_use_semantic_atomic_fields(self):
         action = {
@@ -161,8 +996,48 @@ class AgentActionContractTest(unittest.TestCase):
         with self.assertRaises(PipelineGenerationError):
             TaskGenerationPipeline._validate_actions([invalid])
 
+    def test_deterministic_actions_preserve_task_keyword(self):
+        actions = TaskGenerationPipeline._deterministic_actions(
+            task_description={"task": "分析表音文字的构词特点"},
+            keywords=["表音文字"],
+            environment_mode="stateless",
+        )
+        TaskGenerationPipeline._validate_actions(actions)
+        self.assertTrue(any("表音文字" in action["name"] for action in actions))
+
+    def test_deterministic_actions_include_reference_data_read(self):
+        actions = TaskGenerationPipeline._deterministic_actions(
+            task_description={"task": "根据库存记录给出补货建议"},
+            keywords=["库存"],
+            environment_mode="reference_data",
+        )
+        self.assertTrue(any("读取" in action["name"] for action in actions))
+
+    def test_deterministic_actions_include_external_lookup(self):
+        actions = TaskGenerationPipeline._deterministic_actions(
+            task_description={"task": "查询天气并规划行程"},
+            keywords=["天气"],
+            environment_mode="external_capability",
+        )
+        self.assertTrue(any("查询" in action["name"] for action in actions))
+
 
 class OpenAIToolArtifactTest(unittest.TestCase):
+    def test_success_scenario_uses_fixture_when_model_omits_agent_response(self):
+        scenarios = TaskGenerationPipeline._normalize_executable_scenarios(
+            [{
+                "scenario_id": "success",
+                "kind": "goal_success",
+                "steps": [{"operation": "agent_response", "content": ""}],
+                "assertions": [{"path": "$.reward", "operator": "gte", "expected": 0.6}],
+            }],
+            success_content="完整且经过验证的成功回答",
+        )
+        self.assertEqual(
+            scenarios[0]["steps"][0]["content"],
+            "完整且经过验证的成功回答",
+        )
+
     def test_noise_audit_identifies_materially_useful_tool(self):
         unsafe = TaskGenerationPipeline._validate_noise_tool_audit(
             [{"name": "route_lookup", "is_safe_noise": False, "reason": "可提供排查证据"}],
@@ -176,6 +1051,52 @@ class OpenAIToolArtifactTest(unittest.TestCase):
             noise_names={"roll_virtual_die"},
         )
         self.assertEqual(unsafe, set())
+
+    def test_noise_tool_cannot_claim_external_side_effect(self):
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "book_restaurant_table",
+                "description": "预订餐厅座位",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+        with self.assertRaisesRegex(PipelineGenerationError, "side effect"):
+            TaskGenerationPipeline._validate_noise_tool_safety([tool])
+
+    def test_read_only_noise_tool_may_describe_booking_information(self):
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "search_academic_workshop_venue",
+                "description": "搜索学术研讨会场地及其预订状态，只返回公开信息。",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+        TaskGenerationPipeline._validate_noise_tool_safety([tool])
+
+    def test_read_only_estimator_may_reference_order_lifecycle(self):
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "estimate_shipping_time",
+                "description": "用于下单后估算运输时间，只返回预计天数，不创建或修改订单。",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+        TaskGenerationPipeline._validate_noise_tool_safety([tool])
+
+    def test_noise_tool_description_cannot_hide_external_side_effect(self):
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "manage_academic_workshop_venue",
+                "description": "用于预订研讨会场地并提交预约请求。",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+        with self.assertRaisesRegex(PipelineGenerationError, "side effect"):
+            TaskGenerationPipeline._validate_noise_tool_safety([tool])
 
     def test_fallback_noise_tool_avoids_business_tool_name_collision(self):
         tool, metadata = TaskGenerationPipeline._fallback_noise_tool(
@@ -314,6 +1235,27 @@ class OpenAIToolArtifactTest(unittest.TestCase):
 
 
 class RewardContractTest(unittest.TestCase):
+    def test_reference_data_outcome_cannot_score_preloaded_state_alone(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "cannot by itself prove"):
+            TaskGenerationPipeline._validate_task_readiness(
+                capability_plan=[{
+                    "action_name": "查询法规", "requires_tool": True,
+                }],
+                tool_bindings=[{"action_name": "查询法规", "tool_name": "search_law"}],
+                noise_tools=[],
+                metrics=[{
+                    "id": "outcome", "category": "outcome", "type": "rule-based",
+                    "evaluator": {"kind": "business_state_rule"},
+                }],
+                metric_implementations=[{"metric_id": "outcome"}],
+                business_scenarios=[
+                    {"kind": "goal_success"}, {"kind": "goal_failure"},
+                ],
+                environment_mode="reference_data",
+                has_business_data=True,
+                require_noise=False,
+            )
+
     def test_noise_penalty_is_compiled_as_deterministic_rule(self):
         metrics = [{
             "id": "penalty_noise_old", "category": "penalty", "type": "model-based",
@@ -412,6 +1354,37 @@ class RewardContractTest(unittest.TestCase):
                 scenarios[:2], tools=tools, noise_tools=[{"name": "weather"}]
             )
 
+    def test_multi_step_route_requires_capture_ref_dependency(self):
+        tools = [
+            {"function": {"name": "search", "parameters": {"type": "object", "properties": {}}}},
+            {"function": {"name": "inspect", "parameters": {
+                "type": "object", "properties": {"item_id": {"type": "string"}},
+                "required": ["item_id"],
+            }}},
+        ]
+        def scenarios(arguments, capture=None):
+            first = {"operation": "tool_call", "tool_name": "search", "arguments": {}}
+            if capture:
+                first["capture"] = capture
+            return [
+                {"scenario_id": "ok", "kind": "goal_success", "steps": [
+                    first,
+                    {"operation": "tool_call", "tool_name": "inspect", "arguments": arguments},
+                ], "assertions": [{"path": "$.reward", "operator": "gte", "expected": 0.8}]},
+                {"scenario_id": "bad", "kind": "goal_failure", "steps": [
+                    {"operation": "reward"},
+                ], "assertions": [{"path": "$.reward", "operator": "lte", "expected": 0.2}]},
+            ]
+        with self.assertRaisesRegex(PipelineGenerationError, "capture/\\$ref dependency"):
+            TaskGenerationPipeline._validate_executable_scenarios(
+                scenarios({"item_id": "item-1"}), tools=tools, noise_tools=[],
+                training_category="multi_step_agentic",
+            )
+        TaskGenerationPipeline._validate_executable_scenarios(
+            scenarios({"item_id": {"$ref": "selected_id"}}, {"selected_id": "$.items[0].id"}),
+            tools=tools, noise_tools=[], training_category="multi_step_agentic",
+        )
+
     def test_executable_scenario_identity_is_normalized(self):
         scenarios = TaskGenerationPipeline._normalize_executable_scenarios([
             {"scenario_id": "runtime_reset_replay", "steps": []},
@@ -442,6 +1415,62 @@ class RewardContractTest(unittest.TestCase):
         success = next(item for item in scenarios if item["kind"] == "goal_success")
         self.assertIn("agent_response", [step["operation"] for step in success["steps"]])
 
+    def test_business_scenario_fixture_uses_real_rows_and_nonempty_arrays(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "material_categories": {"type": "array", "items": {"type": "string"}},
+                "reference_data": {"type": "string"},
+            },
+            "required": ["material_categories", "reference_data"],
+        }
+        tools = [{"type": "function", "function": {
+            "name": "lookup", "description": "查询", "parameters": schema,
+        }}]
+        scenarios = TaskGenerationPipeline._build_business_scenario_baseline(
+            task_description={"expected_result": "完成比较"}, tools=tools,
+            noise_tools=[], data_tables=[{
+                "table_name": "material_category",
+                "rows": [{"material_category": "玻璃材料"}, {"material_category": "透光材料"}],
+            }],
+        )
+        success = next(item for item in scenarios if item["kind"] == "goal_success")
+        arguments = next(
+            step["arguments"] for step in success["steps"]
+            if step["operation"] == "tool_call"
+        )
+        self.assertEqual(arguments["material_categories"], ["玻璃材料", "透光材料"])
+        self.assertEqual(arguments["reference_data"], "material_category")
+        TaskGenerationPipeline._validate_executable_scenarios(
+            scenarios, tools=tools, noise_tools=[]
+        )
+
+    def test_goal_success_rejects_empty_required_array_and_placeholder(self):
+        tools = [{"function": {"name": "lookup", "parameters": {
+            "type": "object", "properties": {
+                "items": {"type": "array", "items": {"type": "string"}},
+                "source": {"type": "string"},
+            }, "required": ["items", "source"],
+        }}}]
+        def scenarios(arguments):
+            return [
+                {"scenario_id": "ok", "kind": "goal_success", "steps": [
+                    {"operation": "tool_call", "tool_name": "lookup", "arguments": arguments},
+                ], "assertions": [{"path": "$.reward", "operator": "gte", "expected": 0.8}]},
+                {"scenario_id": "bad", "kind": "goal_failure", "steps": [
+                    {"operation": "reward"},
+                ], "assertions": [{"path": "$.reward", "operator": "lte", "expected": 0.2}]},
+            ]
+        with self.assertRaisesRegex(PipelineGenerationError, "non-empty array"):
+            TaskGenerationPipeline._validate_executable_scenarios(
+                scenarios({"items": [], "source": "catalog"}), tools=tools, noise_tools=[]
+            )
+        with self.assertRaisesRegex(PipelineGenerationError, "placeholder"):
+            TaskGenerationPipeline._validate_executable_scenarios(
+                scenarios({"items": ["fixture-value"], "source": "catalog"}),
+                tools=tools, noise_tools=[],
+            )
+
     def test_declarative_metric_implementation_validation(self):
         metrics = [{"id": "done", "type": "rule-based", "score_range": [0, 1]}]
         specs = [{
@@ -465,6 +1494,16 @@ class RewardContractTest(unittest.TestCase):
         with self.assertRaisesRegex(PipelineGenerationError, "raw final_agent_response"):
             TaskGenerationPipeline._validate_metric_implementations(specs, metrics)
 
+    def test_business_state_cannot_contain_final_agent_response(self):
+        metrics = [{"id": "consistent", "type": "rule-based", "score_range": [0, 1]}]
+        specs = [{
+            "metric_id": "consistent", "source": "business_state",
+            "path": "$.final_agent_response.choice", "operator": "eq", "expected": "A",
+            "score_mapping": {"pass": 1, "fail": 0},
+        }]
+        with self.assertRaisesRegex(PipelineGenerationError, "through business_state"):
+            TaskGenerationPipeline._validate_metric_implementations(specs, metrics)
+
     def test_document_rules_are_promoted_before_dsl_compilation(self):
         metrics = [{
             "id": "count", "category": "outcome", "type": "rule-based",
@@ -480,6 +1519,38 @@ class RewardContractTest(unittest.TestCase):
         self.assertEqual(metrics[0]["type"], "model-based")
         self.assertEqual(metrics[0]["evaluator"]["kind"], "external_llm_judge")
         self.assertNotIn("condition", metrics[0])
+
+    def test_response_business_join_is_promoted_to_model_judge(self):
+        metrics = [{
+            "id": "consistent", "category": "outcome", "type": "rule-based",
+            "condition": "回答与数据一致", "rubric": "回答与数据一致",
+            "evaluator": {
+                "kind": "business_state_rule", "source": "runtime_rule",
+                "source_fields": ["final_agent_response", "business_data.items"],
+                "assertion": "final_agent_response 中的选择存在于业务数据",
+                "score_mapping": {"true": 1, "false": 0},
+            },
+        }]
+        TaskGenerationPipeline._promote_mixed_response_business_rules(metrics)
+        self.assertEqual(metrics[0]["type"], "model-based")
+        self.assertEqual(
+            metrics[0]["evaluation_inputs"],
+            ["business_data", "final_agent_response"],
+        )
+
+    def test_observation_schema_is_canonical_even_when_model_returns_empty(self):
+        schema = TaskGenerationPipeline._canonical_observation_schema({})
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(schema["properties"]["final_agent_response"]["type"], "string")
+        self.assertEqual(schema["properties"]["public_observation"]["type"], "object")
+
+    def test_fixture_conversation_prefers_rich_user_input(self):
+        sessions = [
+            {"turns": [{"role": "user", "content": "改一下菜单"}]},
+            {"turns": [{"role": "user", "content": "红烧肉68元，清蒸鲈鱼时价，请保持菜品不变"}]},
+        ]
+        selected = TaskGenerationPipeline._select_fixture_conversation(sessions)
+        self.assertIn("红烧肉68元", selected[0]["content"])
 
     def test_noise_penalty_removes_duplicate_nested_noise_reference(self):
         metrics = [{

@@ -14,13 +14,57 @@ import random
 import re
 import time
 import uuid
+import os
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 from .llm import LLMClient
+from .stage_cache import StageCache
 
 logger = logging.getLogger(__name__)
+
+NORMAL_DIALOGUE_OUTCOMES = frozenset({
+    "goal_satisfied", "information_required", "user_correction",
+    "user_rejection", "user_acceptance",
+})
+RECOVERY_DIALOGUE_OUTCOMES = frozenset({
+    "agent_off_topic", "agent_premature_completion", "unrecognized",
+})
+
+HIGH_STAKES_MARKERS = (
+    "法律", "法规", "法条", "政策文件", "合规", "法律意见",
+    "医疗", "诊断", "用药", "食物中毒", "腹痛", "呕吐", "腹泻",
+    "肚子不舒服", "手脚颤抖", "震颤", "就医", "疾病", "症状", "癌症", "癌细胞", "器官移植", "移植排斥",
+    "mhc", "冠状病毒", "sars", "投资", "证券", "税务", "投资建议",
+    "乙醚", "丙酮", "甲醇", "乙醇", "甲基叔丁基醚", "有机镁化合物", "格氏试剂",
+    "偏三甲苯", "危险溶剂", "替代溶剂", "化学品安全", "萃取操作",
+    "溶剂混合", "混合液体", "体积收缩", "体积膨胀",
+    "legal", "regulation", "compliance", "legal advice", "medical",
+    "diagnosis", "medication", "food poisoning", "investment",
+    "investment advice", "securities", "tax",
+)
+
+CROSS_TASK_DOMAIN_MARKERS = (
+    "候选城市", "选择最优城市", "城市事实", "住宿评分", "团队建设",
+    "团建活动", "场地布置", "宣传方式", "参与人数", "路由器日志",
+    "家庭网络", "断网", "网络故障", "设备现象", "设备日志", "日志记录",
+    "购物清单", "候选地点", "野餐计划", "野餐活动",
+    "生活成本",
+)
+
+GENERIC_ACTION_NAMES = frozenset({
+    "接收并解析用户输入", "识别用户输入", "检查信息完整性", "请求补充信息",
+    "执行诊断处理", "执行处理", "格式化输出结果", "生成最终回答",
+    "接收用户输入", "解析用户输入", "处理数据", "分析数据",
+})
+
+GENERIC_ACTION_MARKERS = (
+    "接收并", "解析用户输入", "检查输入", "检查信息", "补充信息",
+    "执行诊断处理", "执行处理", "格式化并输出", "格式化输出", "生成最终",
+    "receive input", "parse user input", "check input", "process data", "format output",
+)
 
 
 class PipelineGenerationError(ValueError):
@@ -63,18 +107,37 @@ class TaskGenerationPipeline:
         self.maximum_dialogue_turns = maximum_dialogue_turns
         self.retries = retries
         self.noise_tool_max = noise_tool_max
+        revision = hashlib.sha256(b"".join(
+            source.read_bytes() for source in sorted(Path(__file__).parent.glob("*.py"))
+        )).hexdigest()
+        provider_hash = hashlib.sha256(str(getattr(llm, "base_url", "")).encode()).hexdigest()
+        self.stage_cache = StageCache(os.getenv("ENVFACTORY_STAGE_CACHE_DIR"), revision=revision,
+                                      model=str(getattr(llm, "model", "unknown")) + ":" + provider_hash)
 
     def _call(self, stage: str, system: str, payload: dict[str, Any]) -> dict[str, Any]:
         started = time.perf_counter()
+        cache_key = self.stage_cache.key(stage, system, payload)
+        cached = self.stage_cache.read(cache_key)
+        if cached is not None:
+            self._validate_stage_result_shape(cached, payload=payload)
+            logger.info("pipeline stage cache hit: stage=%s", stage)
+            return cached
         logger.info("pipeline stage started: stage=%s", stage)
         last_error: Exception | None = None
         for attempt in range(1, self.retries + 1):
             try:
                 effective_system = system
+                if stage.startswith("capability_plan"):
+                    effective_system += (
+                        "\n每个 capability 必须声明 dependencies 数组，元素只能是输入动作原名。"
+                        "这是信息或状态的真实依赖，不是书写顺序。multi_step_agentic 必须具有至少两个环境操作，"
+                        "并明确一个环境操作如何消费前序环境操作产生的信息；其 dependencies 必须引用前序环境动作。"
+                        "推理和最终回答不能用来凑环境依赖。该图与是否给予过程奖励无关。"
+                    )
                 if stage == "agent_actions" or stage.startswith("agent_actions."):
                     effective_system += (
                         "\n本阶段的输入隔离规则优先级最高：只允许使用 payload 中的 task_description、"
-                        "business_model 和 dialogue_sessions。business_model 只有实体、表、字段、关系和约束定义，"
+                        "business_model 和 environment_plan。business_model 只有实体、表、字段、关系和约束定义，"
                         "不得索取、猜测或使用业务数据行、数据文档、隐藏真值、内部记录、具体字段值或数据库 ID；"
                         "如果旧提示提到完整业务环境，以本条输入隔离规则和实际 payload 为准。"
                     )
@@ -110,11 +173,7 @@ class TaskGenerationPipeline:
                 value = _json(response.content)
                 if not isinstance(value, dict):
                     raise TypeError("stage result must be a JSON object")
-                # Some OpenAI-compatible providers wrap structured output in
-                # a single `output` object. Normalize that envelope once so
-                # every pipeline stage can consume the same contract.
-                if set(value) == {"output"} and isinstance(value.get("output"), dict):
-                    value = value["output"]
+                value = self._normalize_stage_result(value, payload=payload)
                 if stage == "task_description":
                     task_value = value.get("task")
                     if not isinstance(task_value, str) or not task_value.strip():
@@ -143,10 +202,11 @@ class TaskGenerationPipeline:
                         raise ValueError(
                             f"{stage} response must contain a non-empty message/content string"
                         )
-                    if ".user." in stage and not isinstance(value.get("should_end"), bool):
+                    if ".user." in stage and not isinstance(value.get("transition_id"), str):
                         raise ValueError(
-                            f"{stage} response should_end must be boolean"
+                            f"{stage} response transition_id must be a string"
                         )
+                self._validate_stage_result_shape(value, payload=payload)
                 logger.info(
                     "pipeline stage completed: stage=%s attempt=%d duration_ms=%.1f result_keys=%s",
                     stage,
@@ -154,6 +214,7 @@ class TaskGenerationPipeline:
                     (time.perf_counter() - started) * 1000,
                     sorted(value.keys()),
                 )
+                self.stage_cache.write(cache_key, stage, value)
                 return value
             except Exception as exc:
                 last_error = exc
@@ -165,6 +226,14 @@ class TaskGenerationPipeline:
                     (time.perf_counter() - started) * 1000,
                     exc,
                 )
+                if attempt < self.retries and self._is_transient_llm_error(exc):
+                    delay = min(8.0, float(2 ** attempt)) + random.uniform(0.0, 0.5)
+                    logger.info(
+                        "transient LLM failure; backing off before retry: stage=%s delay_seconds=%.2f",
+                        stage,
+                        delay,
+                    )
+                    time.sleep(delay)
         logger.error(
             "pipeline stage failed: stage=%s attempts=%d duration_ms=%.1f error=%s",
             stage,
@@ -173,6 +242,79 @@ class TaskGenerationPipeline:
             last_error,
         )
         raise PipelineGenerationError(f"stage {stage} failed: {last_error}") from last_error
+
+    @staticmethod
+    def _normalize_stage_result(
+        value: dict[str, Any], *, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Normalize common provider envelopes against the declared output example."""
+        expected = payload.get("output")
+        expected_keys = set(expected) if isinstance(expected, dict) else set()
+        current: Any = value
+        for _ in range(4):
+            if not isinstance(current, dict):
+                break
+            if expected_keys and expected_keys.issubset(current):
+                return current
+            nested: Any = None
+            for envelope in ("output", "result", "data"):
+                candidate = current.get(envelope)
+                if isinstance(candidate, str):
+                    try:
+                        candidate = _json(candidate)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                if isinstance(candidate, dict) and (
+                    not expected_keys
+                    or expected_keys.intersection(candidate)
+                    or any(key in candidate for key in ("output", "result", "data"))
+                ):
+                    nested = candidate
+                    break
+            if nested is None:
+                break
+            current = nested
+        return current if isinstance(current, dict) else value
+
+    @staticmethod
+    def _validate_stage_result_shape(
+        value: dict[str, Any], *, payload: dict[str, Any]
+    ) -> None:
+        """Fail inside `_call` so shape errors receive feedback and a retry."""
+        expected = payload.get("output")
+        if not isinstance(expected, dict) or not expected:
+            return
+        missing = sorted(key for key in expected if key not in value)
+        if missing:
+            raise ValueError(f"stage response is missing required output fields: {missing}")
+        for key, example in expected.items():
+            actual = value.get(key)
+            if isinstance(example, bool) and not isinstance(actual, bool):
+                raise ValueError(f"stage response field {key!r} must be boolean")
+            if isinstance(example, str) and (
+                not isinstance(actual, str) or not actual.strip()
+            ):
+                raise ValueError(f"stage response field {key!r} must be a non-empty string")
+            if isinstance(example, dict) and not isinstance(actual, dict):
+                raise ValueError(f"stage response field {key!r} must be an object")
+            if isinstance(example, list):
+                if not isinstance(actual, list):
+                    raise ValueError(f"stage response field {key!r} must be an array")
+                required_non_empty_arrays = {
+                    "actions", "user_profiles", "user_scripts", "entities",
+                    "tables", "rows", "capabilities", "metrics", "decisions",
+                }
+                if example and key in required_non_empty_arrays and not actual:
+                    raise ValueError(f"stage response field {key!r} must be a non-empty array")
+
+    @staticmethod
+    def _is_transient_llm_error(error: Exception) -> bool:
+        text = str(error).lower()
+        return any(marker in text for marker in (
+            "http 429", "http 502", "http 503", "http 504",
+            "too many requests", "service is too busy", "temporarily unavailable",
+            "timed out", "timeout", "connection reset",
+        ))
 
     def _simulate_dialogue_session(
         self,
@@ -190,18 +332,36 @@ class TaskGenerationPipeline:
         turns: list[dict[str, str]] = []
         termination_reason: str | None = None
         user_end_flags: list[bool] = []
+        states = {
+            str(item["state_id"]): item for item in script.get("states", [])
+            if isinstance(item, dict) and isinstance(item.get("state_id"), str)
+        }
+        transitions_by_source: dict[str, list[dict[str, Any]]] = {}
+        for transition in script.get("transitions", []):
+            if isinstance(transition, dict):
+                transitions_by_source.setdefault(str(transition.get("from_state")), []).append(transition)
+        current_state = str(script.get("initial_state"))
+        state_trace = [current_state]
+        machine_variables = dict(script.get("variables", {}))
 
         while len(turns) < self.maximum_dialogue_turns:
+            available_transitions = transitions_by_source.get(current_state, [])
+            if not available_transitions:
+                termination_reason = "user_script_end"
+                break
             user_result = self._call(
                 f"dialogue_sessions.{session_id}.user.{len(turns) + 1}",
-                "你是 User LLM，只能按照用户画像和用户剧本扮演用户。用户剧本是嵌套决策树：根据当前对话和用户画像，"
-                "选择一个 condition 与当前情况匹配的分支，沿 next 进入下一个节点；每轮只选择一个分支，不要把多个分支"
-                "拼接成一条不符合树结构的行为。围绕当前任务进行口语化提问、补充、澄清、接受、拒绝、纠正、犹豫、沉默"
-                "或表达不确定。不要替 Agent 完成任务，不要查看或猜测业务数据中的隐藏真值。消费剧本分支中的 should_end 标志；只有剧本判断用户应停止提问且达到最少对话轮数时才将 should_end 设为 true，否则必须为 false。",
+                "你是 User LLM，只能按照用户画像和用户状态机扮演用户。根据 current_state 的 user_behavior 和当前对话，"
+                "从 available_transitions 中选择且只选择一个 condition 匹配的 transition_id，并生成这一状态下的口语化用户消息。"
+                "不得跳到未列出的状态，不得合并多个 transition，不得替 Agent 完成任务，也不得查看或猜测隐藏真值。"
+                "达到 minimum_turns 前不要选择 should_end=true 的 transition。",
                 {"task_description": description, "user_profile": profile, "user_script": script,
+                 "current_state": states.get(current_state),
+                 "current_variables": machine_variables,
+                 "available_transitions": available_transitions,
                  "conversation": turns, "minimum_turns": self.minimum_dialogue_turns,
                  "maximum_turns": self.maximum_dialogue_turns,
-                 "output": {"message": "string", "should_end": False}},
+                 "output": {"message": "string", "transition_id": "transition-id"}},
             )
             # OpenAI-compatible chat providers commonly call the generated
             # text `content`; the pipeline contract uses `message`. Accept
@@ -209,11 +369,30 @@ class TaskGenerationPipeline:
             message = user_result.get("message") or user_result.get("content")
             if not isinstance(message, str) or not message.strip():
                 raise PipelineGenerationError(f"{session_id} user response must contain message/content")
-            should_end = user_result.get("should_end")
-            if not isinstance(should_end, bool):
-                raise PipelineGenerationError(f"{session_id} user response should_end must be boolean")
+            transition_id = user_result.get("transition_id")
+            selected = next(
+                (item for item in available_transitions if item.get("transition_id") == transition_id),
+                None,
+            )
+            if selected is None:
+                eligible = [
+                    item for item in available_transitions
+                    if len(turns) + 1 >= self.minimum_dialogue_turns
+                    or not item.get("should_end")
+                ]
+                selected = (eligible or available_transitions)[0]
+                logger.warning(
+                    "%s selected invalid transition %r from state %s; using %s",
+                    session_id, transition_id, current_state, selected.get("transition_id"),
+                )
+            can_end = len(turns) + 1 >= self.minimum_dialogue_turns
+            should_end = bool(selected.get("should_end")) and can_end
             turns.append({"role": "user", "content": message.strip()})
             user_end_flags.append(should_end)
+            if should_end or not selected.get("should_end"):
+                machine_variables.update(selected.get("updates", {}))
+                current_state = str(selected["to_state"])
+                state_trace.append(current_state)
             if len(turns) >= self.minimum_dialogue_turns and should_end:
                 termination_reason = "user_script_end"
                 break
@@ -244,8 +423,19 @@ class TaskGenerationPipeline:
             "turns": turns,
             "turn_count": len(turns),
             "user_end_flags": user_end_flags,
+            "state_trace": state_trace,
+            "final_variables": machine_variables,
             "termination_reason": termination_reason or "max_turns_reached",
         }
+        # With an even turn limit the final slot is normally an Agent answer,
+        # so the User LLM never gets another turn in which it can emit
+        # should_end=true. Treat that completed request/answer pair as a
+        # bounded completion instead of misclassifying the whole session as a
+        # failed non-converging dialogue. The explicit reason remains
+        # observable to readiness reporting.
+        if result["termination_reason"] == "max_turns_reached" and user_end_flags:
+            user_end_flags[-1] = True
+            result["termination_reason"] = "bounded_completion"
         logger.info(
             "dialogue session completed: session=%s script=%s turns=%d termination=%s duration_ms=%.1f",
             session_id,
@@ -271,6 +461,7 @@ class TaskGenerationPipeline:
         task_intent: str = "query",
         graph_context: dict[str, Any],
         artifact_dir: str | Path | None = None,
+        training_category: str = "multi_step_agentic",
     ) -> dict[str, Any]:
         pipeline_started = time.perf_counter()
         logger.info(
@@ -307,11 +498,34 @@ class TaskGenerationPipeline:
         }
         if task_intent not in intent_rules:
             raise PipelineGenerationError(f"unsupported task_intent: {task_intent}")
+        category_rules = {
+            "direct_response": "生成 simple 的直接回答任务。用户输入必须足以完成任务；不要虚构业务数据依赖或业务工具。正确策略是不调用工具，若提供噪声工具则调用它应受罚。",
+            "simple_agentic": "生成 simple 的单步 Agentic 任务。必须存在一个模型常识无法替代的信息缺口或状态操作，并可由一个必要业务工具完成；工具结果必须决定最终回答。",
+            "multi_step_agentic": "生成 standard 或 complex 的多步 Agentic 任务。至少需要两个业务工具，且至少一个后续工具参数或分支必须依赖前序工具的公开结果。",
+        }
+        if training_category not in category_rules:
+            raise PipelineGenerationError(f"unsupported training_category: {training_category}")
+        from .task_routing import select_training_intent
+        try:
+            select_training_intent(training_category, task_intent)
+        except ValueError as exc:
+            raise PipelineGenerationError(str(exc)) from exc
         # 1. Task description.
+        has_source_urls = bool(re.search(
+            r"https?://[^\s\"']+", json.dumps(graph_context, ensure_ascii=False), re.I
+        ))
+        source_safety_hint = ""
+        if not has_source_urls:
+            source_safety_hint = (
+                " 当前 graph_context 不含可核验来源 URL，因此禁止把医疗诊断、用药、法律、合规、"
+                "税务、证券或投资建议设为任务目标；即使关键词涉及这些领域，也必须改写成无需权威"
+                "事实的低风险语言处理任务。"
+            )
         description = self._call(
             "task_description",
-            f"根据主题和关键词生成真实用户任务。任务意图已经固定为 {task_intent}：{intent_rules[task_intent]}。必须严格遵循该意图，不得用其他意图替换它。必须明确目标、上下文、约束、预期结果和复杂度事实。只有任务确实需要图片、音频、视频或文件输入时，requirements.input_modalities 才能包含对应媒体类型；否则只使用 text 或 structured_data。",
+            f"根据主题和关键词生成真实用户任务。任务意图已经固定为 {task_intent}：{intent_rules[task_intent]}。必须严格遵循该意图，不得用其他意图替换它。训练路由已经固定为 {training_category}：{category_rules[training_category]} 不得把简单任务机械拆成多个查询，也不得为满足工具数量虚构数据源。若当前关键词不足以形成该路由要求，可以忽略弱相关关键词并围绕最有信息量的关键词设计真实业务场景。必须明确目标、上下文、约束、预期结果和复杂度事实。任务必须能由用户运行时提供的信息、明确声明的业务资料或工具能力完成；不得要求 Agent 猜测价格、成分、属性或排名等未提供事实。修改或验证任务若涉及事实替换，必须在上下文或 requirements 中给出权威替换值或判断规则，或者允许 Agent 向用户澄清。当前 Agent 运行时只能提交自然语言最终回答，不能上传或返回 PDF、PNG、DOCX、XLSX、PPTX 等二进制文件；除非任务明确提供了可执行文件交付能力，否则 output_format 必须是文本、Markdown、JSON 或表格内容，禁止让 Agent 声称已经生成不可验证的文件。只有任务确实需要图片、音频、视频或文件输入时，requirements.input_modalities 才能包含对应媒体类型；否则只使用 text 或 structured_data。{source_safety_hint}",
             {"keywords": keywords, "task_type": task_type, "style": style, "task_intent": task_intent,
+             "training_category": training_category,
              "graph_context": graph_context,
              "output": {"task": "string", "task_intent": task_intent, "goal": "string", "context": [], "expected_result": "string", "complexity": "simple|standard|complex", "requirements": {}}},
         )
@@ -323,25 +537,182 @@ class TaskGenerationPipeline:
             raise PipelineGenerationError(
                 f"task_description.task_intent must be {task_intent!r}, got {returned_intent!r}"
             )
+        grounding_error: PipelineGenerationError | None = None
+        for grounding_attempt in range(1, self.retries + 1):
+            audit = self._call(
+                "task_description_grounding_audit",
+                "独立审查任务是否可完成且内部一致。self_contained 表示任务或明确约定的运行时用户输入提供了完成目标所需的信息；no_unprovided_facts 表示任务不要求 Agent 猜测价格、成分、属性、排名或其他事实；expected_result_derivable 表示预期结论可以从已声明输入、业务资料或工具能力推出；internally_consistent 表示 task、goal、context、expected_result、requirements 全部描述同一组对象、约束和交付物，不得混入其他任务的地点、产品、人物或字段。允许任务明确要求信息不足时向用户澄清。issues 必须具体。",
+                {
+                    "task_description": description,
+                    "output": {
+                        "self_contained": True,
+                        "no_unprovided_facts": True,
+                        "expected_result_derivable": True,
+                        "internally_consistent": True,
+                        "issues": [],
+                    },
+                },
+            )
+            audit = self._unwrap_structured_output(
+                audit,
+                expected_fields={
+                    "self_contained", "no_unprovided_facts",
+                    "expected_result_derivable", "internally_consistent", "issues",
+                },
+            )
+            try:
+                self._validate_task_grounding_audit(audit)
+                self._validate_task_description_consistency(description)
+                self._validate_task_generation_scope(
+                    description, graph_context=graph_context
+                )
+                grounding_error = None
+                break
+            except PipelineGenerationError as exc:
+                grounding_error = exc
+                logger.warning(
+                    "task description grounding failed: attempt=%d/%d error=%s",
+                    grounding_attempt, self.retries, exc,
+                )
+                if grounding_attempt >= self.retries:
+                    break
+                repaired_description = self._call(
+                    "task_description.grounding_repair",
+                    "修复任务描述，使任务能够由用户运行时输入、明确业务资料或工具能力完成。补充缺失的权威值或规则，或明确要求 Agent 在信息不足时向用户澄清；不得直接编造隐藏答案。必须逐条解决 grounding_issues 中的真实校验错误。若错误指出缺少权威来源，必须彻底移除医疗诊断、食物中毒判断、用药、法律、合规、税务、证券或投资建议等高风险目标，并在保持 task_intent 的前提下改写为无需权威事实的低风险主题；仅改措辞但保留高风险目标不算修复。不得要求输出思考过程、推理过程或隐藏思维链，只能要求简短结论依据。保持原 task_intent 不变，返回完整任务描述对象。",
+                    {
+                        "task_description": description,
+                        "grounding_issues": [str(exc)] + list(audit.get("issues", [])),
+                        "task_intent": task_intent,
+                        "output": description,
+                    },
+                )
+                description = self._unwrap_task_description(repaired_description)
+                if (
+                    not isinstance(description.get("task"), str)
+                    or not description["task"].strip()
+                    or description.get("task_intent", task_intent) != task_intent
+                    or description.get("complexity") not in {"simple", "standard", "complex"}
+                ):
+                    raise PipelineGenerationError(
+                        "repaired task description is structurally invalid"
+                    )
+        if grounding_error is not None:
+            if "hidden chain-of-thought" in str(grounding_error):
+                description = self._normalize_reasoning_request(description)
+                self._validate_task_description_consistency(description)
+                try:
+                    self._validate_task_generation_scope(
+                        description, graph_context=graph_context
+                    )
+                    grounding_error = None
+                except PipelineGenerationError as exc:
+                    grounding_error = exc
+            if grounding_error is not None and not has_source_urls and "high-stakes task requires" in str(grounding_error):
+                logger.warning(
+                    "grounding repair retained a high-stakes target; regenerating an independent low-risk task"
+                )
+                description = self._call(
+                    "task_description.low_risk_fallback",
+                    f"重新生成一个全新的低风险用户任务，保持 task_intent={task_intent}（{intent_rules[task_intent]}），但不要沿用上一版主题或措辞。当前没有权威来源 URL，任务及所有字段中禁止出现或要求医疗、诊断、疾病判断、用药、法律、法规、合规、专利、税务、证券、投资建议。可以忽略会诱发这些主题的关键词。任务必须仅依赖用户明确提供的文本或结构化输入即可完成，并输出完整任务描述对象。",
+                    {
+                        "unsafe_keywords": keywords,
+                        "task_type": task_type,
+                        "style": style,
+                        "task_intent": task_intent,
+                        "output": {
+                            "task": "string", "task_intent": task_intent,
+                            "goal": "string", "context": [],
+                            "expected_result": "string",
+                            "complexity": "simple|standard|complex",
+                            "requirements": {},
+                        },
+                    },
+                )
+                if (
+                    description.get("task_intent") != task_intent
+                    or description.get("complexity") not in {"simple", "standard", "complex"}
+                ):
+                    raise PipelineGenerationError(
+                        "low-risk fallback changed task_intent or returned invalid complexity"
+                    )
+                try:
+                    self._validate_task_generation_scope(
+                        description, graph_context=graph_context
+                    )
+                except PipelineGenerationError:
+                    description = self._deterministic_low_risk_task(task_intent)
+                fallback_audit = self._call(
+                    "task_description.low_risk_fallback_audit",
+                    "审查新任务是否自包含、无需未提供事实、预期结果可从输入推出，且 task、goal、context、expected_result、requirements 的对象和约束完全一致。只返回指定布尔字段和 issues。",
+                    {
+                        "task_description": description,
+                        "output": {
+                            "self_contained": True,
+                            "no_unprovided_facts": True,
+                            "expected_result_derivable": True,
+                            "internally_consistent": True,
+                            "issues": [],
+                        },
+                    },
+                )
+                self._validate_task_grounding_audit(fallback_audit)
+                self._validate_task_description_consistency(description)
+                self._validate_task_generation_scope(
+                    description, graph_context=graph_context
+                )
+                grounding_error = None
+            elif grounding_error is not None:
+                logger.warning(
+                    "grounding repairs exhausted; using deterministic low-risk task: %s",
+                    grounding_error,
+                )
+                description = self._deterministic_low_risk_task(task_intent)
+                self._validate_task_description_consistency(description)
+                self._validate_task_generation_scope(
+                    description, graph_context=graph_context
+                )
+                grounding_error = None
+        # Repairs and low-risk fallback may replace the complete description.
+        # Never assemble the artifact with the pre-repair task/complexity.
+        task_desc = description["task"]
+        complexity = description["complexity"]
         requirements = description.get("requirements")
         if not isinstance(requirements, dict):
             requirements = {"input_modalities": ["text"]}
         input_modalities = requirements.get("input_modalities", ["text"])
-        media_required = isinstance(input_modalities, list) and any(
+        input_media_required = isinstance(input_modalities, list) and any(
             item in {"image", "audio", "video", "file"} for item in input_modalities
         )
+        deliverable_required = self._requires_file_deliverable(description)
+        media_required = input_media_required or deliverable_required
 
         environment_candidate = self._call(
             "environment_plan",
-            "判断任务运行时真正需要的环境模式。stateless 表示只处理用户提供的文本或结构化输入，不需要预置业务数据或持久化；reference_data 表示需要只读业务资料；stateful 表示任务明确要求创建、修改、审批、排程、交易或持久化业务状态；external_capability 表示核心依赖搜索、天气、计算或其他外部能力。不要因为后续对话可能提出扩展请求而选择 stateful；只依据 task_description 中明确的任务目标和预期结果。",
+            "判断任务运行时真正需要的环境模式。stateless 表示只处理用户提供的文本或结构化输入，不需要预置业务数据或持久化；reference_data 表示需要只读业务资料；stateful 表示任务明确要求创建、修改、审批、排程、交易或持久化业务状态；external_capability 表示核心依赖搜索、天气、计算或其他外部能力。training_category=direct_response 时必须选择 stateless；其他训练类别必须选择能支持必要业务工具的非 stateless 模式。不要因为后续对话可能提出扩展请求而选择 stateful；只依据 task_description 中明确的任务目标和预期结果。",
             {
-                "task_description": description,
+                "task_description": description, "training_category": training_category,
                 "task_intent": task_intent,
                 "output": {"mode": "stateless|reference_data|stateful|external_capability", "requires_business_data": False, "requires_persistence": False, "reason": "string"},
             },
         )
         environment_plan = self._resolve_environment_plan(
             environment_candidate, task_description=description, task_intent=task_intent
+        )
+        if training_category == "direct_response":
+            environment_plan = {
+                "mode": "stateless",
+                "requires_business_data": False,
+                "requires_persistence": False,
+                "reason": "direct_response curriculum route",
+            }
+        elif environment_plan["mode"] == "stateless":
+            raise PipelineGenerationError(
+                f"{training_category} requires a non-stateless environment with a necessary business tool"
+            )
+        self._validate_authoritative_task_input(
+            task_description=description,
+            environment_mode=environment_plan["mode"],
+            graph_context=graph_context,
         )
 
         materialized_dir = Path(artifact_dir) if artifact_dir is not None else Path("output/task_artifacts") / f"task-{uuid.uuid4().hex}"
@@ -367,19 +738,23 @@ class TaskGenerationPipeline:
         # 2b. Design atomic table schemas, without rows yet.
             table_design = self._call(
             "environment_table_design",
-            "根据任务描述和最小必要业务实体设计可持久化的原子数据库表。对需要持久化的关系数据遵循第三范式（3NF）：每个表表达一个清晰主题，字段依赖候选键、依赖整个键且不通过非键字段传递依赖；使用主键、外键和必要的关联表表达关系。优先使用最少数量的表完整覆盖任务；只有确有独立生命周期、独立访问需求或必要的一对多/多对多业务关系时才拆表，否则将信息作为字段、枚举、JSON 或文本保存。每张表说明存在必要性，并声明主键、外键、字段类型、可见性、索引和约束。输出表定义。",
+            "根据任务描述和最小必要业务实体设计可持久化的原子数据库表。对需要持久化的关系数据遵循第三范式（3NF）：每个表表达一个清晰主题，字段依赖候选键、依赖整个键且不通过非键字段传递依赖；使用主键、外键和必要的关联表表达关系。优先使用最少数量的表完整覆盖任务；只有确有独立生命周期、独立访问需求或必要的一对多/多对多业务关系时才拆表，否则将信息作为字段、枚举、JSON 或文本保存。如果任务要求推荐唯一最佳项、排序、判断是否合规或选择首选项，表结构必须包含足以确定该结论的优先级、适配分数、首选标记、规则结果或理由字段，不能只建立无方向的多对多关联。法律、法规、政策、医疗、投资、税务等权威参考资料必须带 source_url、retrieved_at 和 content_hash 字段，且来源必须可追溯；不得由模型凭空编写权威原文。每张表说明存在必要性，并声明主键、外键、字段类型、可见性、索引和约束。输出表定义。",
             {"task_description": description, "entities": entity_plan["entities"],
              "output": {"tables": [{"table_name": "string", "description": "string", "columns": [{"name": "string", "type": "string", "description": "string", "nullable": False}], "primary_key": ["id"], "foreign_keys": [], "indexes": [], "constraints": []}]}},
         )
             table_definitions = table_design.get("tables")
             self._validate_table_definitions(table_definitions)
+            self._validate_authoritative_source_schema(
+                task_description=description,
+                table_definitions=table_definitions,
+            )
 
         # 2c. Generate each table's rows independently so tables can be built
         # concurrently and retried without regenerating unrelated data.
             def generate_table(table: dict[str, Any]) -> dict[str, Any]:
                 result = self._call(
                 f"environment_table_data.{table['table_name']}",
-                "根据已确认的单张表结构生成完整但紧凑、真实、可直接插入数据库的业务数据。本阶段只返回顶层 {\"rows\": [...]}；rows 必须非空，每行覆盖全部字段，主键唯一。不要返回 table、columns、schema、markdown 或解释文字；字符串中的双引号、反斜杠和换行必须按 JSON 规则转义，文本字段保持简短。",
+                "根据已确认的单张表结构生成完整但紧凑、真实、可直接插入数据库的初始业务数据。本阶段只返回顶层 {\"rows\": [...]}；rows 必须非空，每行覆盖全部字段，主键唯一。对于创建、修改、审批、排程等 stateful 任务，rows 必须表示 Agent 执行任务之前的基线状态：明确要求从旧值改为新值时必须保存旧值，绝不能提前写入目标终态或完成标记。不要返回 table、columns、schema、markdown 或解释文字；字符串中的双引号、反斜杠和换行必须按 JSON 规则转义，文本字段保持简短。",
                 {"task_description": description, "entities": entity_plan["entities"], "table": table,
                  "output": {"rows": []}},
             )
@@ -407,7 +782,7 @@ class TaskGenerationPipeline:
         # 2d. Check cross-table consistency and return actual business records.
             consistency = self._call(
             "environment_data_consistency",
-            "检查并修正完整业务表数据，校验主键唯一、外键存在、字段类型、必填字段、业务关系和任务覆盖度。返回修正后的 data_tables 与 records。",
+            "检查并修正完整初始业务表数据，校验主键唯一、外键存在、字段类型、必填字段、业务关系和任务覆盖度。stateful 任务的 rows 是每个 episode reset 后的执行前基线，不是任务完成后的最终状态；任务明确要求从旧值改为新值时，基线必须包含旧值且不得提前包含目标终态。任务要求唯一推荐、排序、合规判断或首选结论时，数据必须提供唯一且可追溯的决定性证据；不得同时保留多个等价候选却在预期答案中武断指定其中一个。所有结论所引用的数值、属性和理由必须与 rows 精确一致。返回修正后的 data_tables 与 records。",
             {"task_description": description, "entities": entity_plan["entities"], "tables": data_tables,
              "output": {"data_tables": data_tables, "records": []}},
         )
@@ -417,8 +792,85 @@ class TaskGenerationPipeline:
             if not isinstance(records, list):
                 raise PipelineGenerationError("environment_data_consistency.records must be a list")
 
+            grounding_error: PipelineGenerationError | None = None
+            for grounding_attempt in range(1, self.retries + 1):
+                audit = self._call(
+                    "environment_data_grounding_audit",
+                    "独立审查业务数据是否足以完成任务。task_supported 表示 rows 覆盖任务所需事实；decision_determinate 表示任务要求唯一推荐、排序、合规判断或首选结论时，数据存在唯一且可追溯的决定性证据，没有多个等价候选；facts_consistent 表示预期结论引用的数值、属性、关系和理由与 rows 精确一致。若任务不要求唯一决策，decision_determinate 应为 true。issues 必须具体说明问题。",
+                    {
+                        "task_description": description,
+                        "data_tables": data_tables,
+                        "output": {
+                            "task_supported": True,
+                            "decision_determinate": True,
+                            "facts_consistent": True,
+                            "issues": [],
+                        },
+                    },
+                )
+                audit = self._unwrap_structured_output(
+                    audit,
+                    expected_fields={
+                        "task_supported", "decision_determinate",
+                        "facts_consistent", "issues",
+                    },
+                )
+                try:
+                    self._validate_data_grounding_audit(audit)
+                    self._validate_data_keyword_alignment(
+                        data_tables,
+                        task_description=description,
+                        keywords=keywords,
+                    )
+                    self._validate_stateful_preconditions(
+                        data_tables,
+                        task_description=description,
+                        environment_mode=environment_plan["mode"],
+                    )
+                    grounding_error = None
+                    break
+                except PipelineGenerationError as exc:
+                    grounding_error = exc
+                    logger.warning(
+                        "environment data grounding failed: attempt=%d/%d error=%s",
+                        grounding_attempt, self.retries, exc,
+                    )
+                    if grounding_attempt >= self.retries:
+                        break
+                    repaired = self._call(
+                        "environment_data_consistency.repair",
+                        "根据独立 grounding 审计问题和确定性校验错误修正表结构与 rows。必须保持主键、外键和字段类型合法，数据内容必须直接覆盖 task_description 中的任务主题和 required_grounding_keywords。stateful 任务必须保留执行前基线：从旧值改为新值时 rows 必须含旧值、不得提前含目标终态。并让推荐、排序、合规判断或首选结论具有唯一、可追溯且数值一致的证据。返回完整 data_tables 与 records。",
+                        {
+                            "task_description": description,
+                            "data_tables": data_tables,
+                            "grounding_issues": audit.get("issues", []),
+                            "validation_error": str(exc),
+                            "required_grounding_keywords": self._task_relevant_keywords(
+                                description, keywords
+                            ),
+                            "output": {"data_tables": data_tables, "records": records},
+                        },
+                    )
+                    data_tables = repaired.get("data_tables")
+                    try:
+                        self._validate_data_tables(data_tables)
+                    except PipelineGenerationError as repair_error:
+                        grounding_error = repair_error
+                        logger.warning(
+                            "environment data repair remained structurally invalid: attempt=%d/%d error=%s",
+                            grounding_attempt, self.retries, repair_error,
+                        )
+                        continue
+                    records = repaired.get("records", [])
+                    if not isinstance(records, list):
+                        raise PipelineGenerationError(
+                            "environment_data_consistency.repair.records must be a list"
+                        )
+            if grounding_error is not None:
+                raise grounding_error
+
         # 2e. Write the persistence handoff document from final tables.
-            document_prompt = "根据最终业务表和完整 rows 编写给 Code Agent 的 data_document。说明每张表的用途、字段、类型、可见性、主键、外键、索引、约束、初始化顺序、关系和持久化要求。返回非空、完整、可执行的 Markdown 文档，至少包含每张表的初始化说明和字段说明。文档只解释最终数据。"
+            document_prompt = "根据已验证的初始业务表和完整 rows 编写给 Code Agent 的 data_document。说明这些 rows 是每个 episode reset 后、Agent 执行任务之前的基线状态，并说明每张表的用途、字段、类型、可见性、主键、外键、索引、约束、初始化顺序、关系和持久化要求。不得把目标终态描述成初始化数据。返回非空、完整、可执行的 Markdown 文档，至少包含每张表的初始化说明和字段说明。"
             document_payload = {"task_description": description, "entities": entity_plan["entities"], "data_tables": data_tables,
                             "output": {"data_document": "# 业务数据说明\n"}}
             data_document: str | None = None
@@ -449,30 +901,63 @@ class TaskGenerationPipeline:
                 data_tables,
                 data_document,
                 materialized_dir,
+                environment_mode=environment_plan["mode"],
             )
 
         media_generation = {"required": False, "language": "python", "code": "", "dependencies": [], "entrypoint": "", "output_dir": ""}
         if media_required:
-            media_result = self._call(
-                "environment_media_generation",
-                "根据任务描述和最终业务数据编写用于生成任务相关媒体数据的 Python 程序。生成与任务直接相关的媒体文件和必要元数据，返回依赖、入口和输出目录。媒体识别和媒体评测不属于本阶段。",
-                {"task_description": description, "data_tables": data_tables, "data_document": data_document,
-                 "output": {"media_generation": media_generation | {"required": True}}},
-            )
-            media_generation = media_result.get("media_generation")
+            media_error: PipelineGenerationError | None = None
+            for media_attempt in range(1, self.retries + 1):
+                repair_hint = ""
+                if media_error is not None:
+                    repair_hint = (
+                        f"\n上一版未通过校验：{media_error}。请返回修复后的完整 media_generation；"
+                        "不得返回说明文字或省略必填字段。"
+                    )
+                media_result = self._call(
+                    "environment_media_generation" if media_attempt == 1 else "environment_media_generation.repair",
+                    "根据任务描述和最终业务数据编写可执行的 Python 交付程序。任务要求输出 PDF、图片、音频、视频或其他文件时，程序必须真实生成该交付文件；任务依赖用户运行时提供的图片、文件或结构化数据时，程序必须通过命令行参数或明确输入路径读取它们，不得硬编码模拟业务数据、伪造用户照片或用占位内容冒充结果。允许生成明确标识为 acceptance fixture 的测试输入，但测试输入与运行时交付逻辑必须分离。代码必须包含 main 入口、创建输出目录并返回依赖、入口和输出目录。媒体识别和质量评测不属于本阶段。" + repair_hint,
+                    {"task_description": description, "data_tables": data_tables, "data_document": data_document,
+                     "output": {"media_generation": media_generation | {"required": True}}},
+                )
+                media_result = self._unwrap_structured_output(
+                    media_result, expected_fields={"media_generation"}
+                )
+                candidate_media = media_result.get("media_generation") if isinstance(media_result, dict) else None
+                try:
+                    if (
+                        not isinstance(candidate_media, dict)
+                        or candidate_media.get("required") is not True
+                        or candidate_media.get("language") != "python"
+                        or not isinstance(candidate_media.get("code"), str)
+                        or not candidate_media["code"].strip()
+                        or not isinstance(candidate_media.get("dependencies", []), list)
+                        or not isinstance(candidate_media.get("entrypoint"), str)
+                        or not candidate_media.get("entrypoint", "").strip()
+                        or not isinstance(candidate_media.get("output_dir"), str)
+                    ):
+                        raise PipelineGenerationError(
+                            "media task requires executable Python media_generation code, dependencies, entrypoint and output_dir"
+                        )
+                    self._validate_media_generation(
+                        candidate_media,
+                        input_media_required=input_media_required,
+                        deliverable_required=deliverable_required,
+                        task_description=description,
+                    )
+                    media_generation = candidate_media
+                    media_error = None
+                    break
+                except PipelineGenerationError as exc:
+                    media_error = exc
+                    logger.warning(
+                        "media generation validation failed: attempt=%d/%d error=%s",
+                        media_attempt, self.retries, exc,
+                    )
+            if media_error is not None:
+                raise media_error
         if not media_required:
             media_generation = {"required": False, "language": "python", "code": "", "dependencies": [], "entrypoint": "", "output_dir": ""}
-        elif (
-            not isinstance(media_generation, dict)
-            or media_generation.get("required") is not True
-            or media_generation.get("language") != "python"
-            or not isinstance(media_generation.get("code"), str)
-            or not media_generation["code"].strip()
-            or not isinstance(media_generation.get("dependencies", []), list)
-            or not isinstance(media_generation.get("entrypoint"), str)
-            or not isinstance(media_generation.get("output_dir"), str)
-        ):
-            raise PipelineGenerationError("media task requires executable Python media_generation code, dependencies, entrypoint and output_dir")
         environment = {"records": records, "data_tables": data_tables, "data_document": data_document,
                        "media_generation": media_generation}
         # Do not embed the generated rows (or the consistency-stage record
@@ -533,108 +1018,27 @@ class TaskGenerationPipeline:
             seen_profile_ids.add(profile_id)
             normalized_profiles.append(profile)
         profiles = normalized_profiles
-        script_prompt = (
-            "根据当前任务描述和完整业务环境数据设计多样的用户行为剧本。每个剧本必须是可执行的嵌套决策树，"
-            "根节点和每个后续节点都包含 node_id、user_behavior、branches；每个 branches 元素包含 branch_id、"
-            "condition、next，next 是下一个同结构节点。根据当前对话中 Agent 的回答选择满足 condition 的分支，"
-            "不要把多个分支合并成一条线性行为。尽可能生成丰富但互不重复的分支，通常每个剧本生成 4-8 个有意义的"
-            "分支和 2-4 层路径，覆盖信息补充、追问、接受、拒绝、纠正、犹豫、沉默、转移话题和结束等情况；"
-                "分支必须围绕任务描述、实际业务实体、字段、公开记录和 Agent 可执行目标。每个分支必须增加布尔字段 should_end，"
-                "表示该分支下用户是否停止提问；只有真正结束的分支为 true，其他分支为 false，并且每个剧本至少包含一个 true 分支。"
-                "可引用公开业务事实，但不得泄露隐藏真值、评测规则或实现细节。每个剧本提供非空 script_id 字符串。"
+        # FSM topology is an executable protocol owned by EnvFactory, not
+        # creative task content.  Asking a medium model to regenerate the same
+        # graph caused avoidable cycles, missing outcome classes and invalid
+        # terminal edges.  Keep task-specific wording in the goal/profile, but
+        # construct the complete eight-outcome protocol deterministically.
+        user_scripts = self._deterministic_user_scripts(
+            description=description,
+            count=self.script_count,
         )
-        script_payload = {
-            "task_description": description,
-            "environment": environment,
-            "count": self.script_count,
-            "output": {"user_scripts": [{
-                "script_id": "script-1",
-                "goal": "...",
-                "tree": {"node_id": "root", "user_behavior": "...", "branches": [{
-                    "branch_id": "branch-1",
-                    "condition": "...",
-                    "should_end": False,
-                    "next": {"node_id": "node-1", "user_behavior": "...", "branches": []},
-                }, {
-                    "branch_id": "branch-2",
-                    "condition": "用户表示问题已解决",
-                    "should_end": True,
-                    "next": {"node_id": "node-2", "user_behavior": "结束对话", "branches": []},
-                }]},
-            }]},
-        }
-        user_scripts: list[dict[str, Any]] | None = None
-        script_error: PipelineGenerationError | None = None
-        for script_attempt in range(1, self.retries + 1):
-            repair_hint = ""
-            if script_error is not None:
-                repair_hint = (
-                    f"\n上一版用户剧本未通过结构校验，必须修复以下错误并重新输出全部剧本：{script_error}。"
-                    "不要只返回修复片段。"
-                )
-            scripts_result = self._call(
-                "user_scripts" if script_attempt == 1 else "user_scripts.repair",
-                script_prompt + repair_hint,
-                script_payload,
-            )
-            try:
-                raw_scripts = self._list(
-                    scripts_result.get("user_scripts"),
-                    "user_scripts",
-                    minimum=self.script_count,
-                )
-                candidate_scripts: list[dict[str, Any]] = []
-                seen_script_ids: set[str] = set()
-                for index, raw_script in enumerate(raw_scripts[:self.script_count], start=1):
-                    if not isinstance(raw_script, dict):
-                        raise PipelineGenerationError(f"user_scripts[{index - 1}] must be an object")
-                    normalized_script = dict(raw_script)
-                    raw_id = normalized_script.get("script_id") or normalized_script.get("id")
-                    script_id = raw_id.strip() if isinstance(raw_id, str) else ""
-                    if not script_id or script_id in seen_script_ids:
-                        original_id = script_id or "<missing>"
-                        candidate_index = index
-                        script_id = f"script-{candidate_index}"
-                        while script_id in seen_script_ids:
-                            candidate_index += 1
-                            script_id = f"script-{candidate_index}"
-                        logger.warning(
-                            "normalized user script id: index=%d original=%s normalized=%s",
-                            index - 1,
-                            original_id,
-                            script_id,
-                        )
-                    normalized_script["script_id"] = script_id
-                    self._validate_user_script_tree(normalized_script, index - 1)
-                    seen_script_ids.add(script_id)
-                    candidate_scripts.append(normalized_script)
-                user_scripts = candidate_scripts
-                break
-            except PipelineGenerationError as exc:
-                script_error = exc
-                logger.warning(
-                    "user script validation failed: attempt=%d/%d error=%s",
-                    script_attempt,
-                    self.retries,
-                    exc,
-                )
-        if user_scripts is None:
-            raise script_error or PipelineGenerationError("user_scripts generation failed")
 
-        # 4. Generate sessions by two independent role prompts: the User LLM
-        # follows the script, while the Agent LLM answers from task data.
+        # 4. Materialize deterministic offline fixtures. Runtime user behavior
+        # is produced by ContractUserSimulator + an external LLM; generated
+        # conversations must never become replay data or hidden task truth.
         script_ids = {str(item["script_id"]) for item in user_scripts}
         sessions: list[dict[str, Any]] = []
         for script in user_scripts[:self.script_count]:
             script_id = str(script.get("script_id") or script.get("id"))
             for session_index in range(self.sessions_per_script):
-                # Each session combines one task-specific script with a
-                # randomly selected persona, so the same script is exercised
-                # with different communication styles and decision patterns.
                 profile = random.choice(profiles)
-                sessions.append(self._simulate_dialogue_session(
+                sessions.append(self._deterministic_dialogue_fixture(
                     description=description,
-                    environment=environment,
                     profile=profile,
                     script=script,
                     script_id=script_id,
@@ -669,18 +1073,23 @@ class TaskGenerationPipeline:
             ):
                 raise PipelineGenerationError("dialogue session user_end_flags must match user turns")
             if session.get("termination_reason") not in {
-                "user_script_end", "max_turns_reached",
+                "user_script_end", "bounded_completion", "max_turns_reached",
             }:
                 raise PipelineGenerationError("dialogue session requires a valid termination_reason")
+            state_trace = session.get("state_trace")
+            if not isinstance(state_trace, list) or not state_trace or any(
+                not isinstance(state_id, str) or not state_id for state_id in state_trace
+            ):
+                raise PipelineGenerationError("dialogue session requires a non-empty state_trace")
             session_counts[script_id] = session_counts.get(script_id, 0) + 1
         if set(session_counts) != script_ids or any(
             session_counts.get(script_id, 0) < self.sessions_per_script for script_id in script_ids
         ):
             raise PipelineGenerationError("every user script must have the required number of sessions")
 
-        # 5. Decompose Agent actions to irreducible Agent-visible operations.
-        # Simulated dialogues reveal realistic interaction boundaries; they do
-        # not define transitions or rewards.
+        # 5. Decompose actions from the stable task/environment contract. User
+        # simulation is a downstream policy stress test and must not redefine
+        # business capabilities or tools.
         business_model = {
             "entities": entity_plan["entities"],
             "tables": [
@@ -696,28 +1105,130 @@ class TaskGenerationPipeline:
                 for table in table_definitions
             ],
         }
-        actions = self._call(
-            "agent_actions",
-            "根据任务描述、环境计划、业务模型和模拟对话反推 Agent 必须做的原子动作。模拟对话只能提供任务范围内的行为证据，不得把用户临时提出但 task_description 未要求的保存、写库、查询确认或其他扩展请求提升为正式动作。environment_plan.mode=stateless 时禁止生成任何读取或修改数据库、持久化状态或调用外部系统的动作。凡是仅根据用户输入和通用语言能力进行识别、比较、提取、格式化和最终表达的步骤都属于 Agent 自身推理或回答。每个输出动作必须不可再拆，并提供 atomicity_rationale、inputs、outputs、preconditions、effects。",
-            {"task_description": description, "business_model": business_model,
-             "environment_plan": environment_plan,
-             "dialogue_sessions": sessions,
-             "output": {"actions": [{"name": "string", "description": "string", "atomicity_rationale": "string", "inputs": [{"name": "string", "description": "string"}], "outputs": [{"name": "string", "description": "string"}], "preconditions": ["string"], "effects": ["string"]}]}},
+        # Freeze machine-checkable business goals before actions, tools,
+        # rewards and acceptance are proposed by independent model calls.
+        semantic_goal = None
+        if environment_plan["mode"] == "stateful":
+            from .task_spec import TaskSpecError, validate_goal_contract
+            goal_error = None
+            for attempt in range(self.retries):
+                candidate = self._call("business_goal_contract", "把题面明确要求的最终业务状态转换为 row_predicates。每项 table/where 定位目标，values 是期望字段值，count 是同时满足 where 和 values 的记录数；删除用 count=0，新增用目标属性定位。仅使用给定表字段和题面目标；初始数据必须尚未满足完整目标。禁止凭空扩大目标。", {
+                    "task_description": description, "tables": data_tables,
+                    "validation_error": goal_error,
+                    "output": {"row_predicates": [{"table": "string", "where": {}, "values": {}, "count": 1}]},
+                })
+                try:
+                    validate_goal_contract(candidate, data_tables)
+                    semantic_goal = {"row_predicates": candidate["row_predicates"], "requires_state_change": True}
+                    break
+                except TaskSpecError as exc:
+                    goal_error = str(exc)
+            if semantic_goal is None:
+                raise PipelineGenerationError(f"business goal contract invalid: {goal_error}")
+        action_payload = {
+            "goal_fields": [{"table": item["table"], "fields": sorted(set(item["where"]) | set(item["values"]))}
+                            for item in (semantic_goal or {}).get("row_predicates", [])],
+            "task_description": description, "business_model": business_model,
+            "environment_plan": environment_plan,
+            "required_grounding_keywords": self._task_relevant_keywords(
+                description, keywords
+            ),
+            "output": {"actions": [{"name": "string", "description": "string", "atomicity_rationale": "string", "inputs": [{"name": "string", "description": "string"}], "outputs": [{"name": "string", "description": "string"}], "preconditions": ["string"], "effects": ["string"]}]},
+        }
+        action_list: list[dict[str, Any]] | None = None
+        action_error: PipelineGenerationError | None = None
+        for action_attempt in range(1, self.retries + 1):
+            repair_hint = ""
+            if action_error is not None:
+                repair_hint = (
+                    f"\n上一版动作未通过校验：{action_error}。必须重新输出完整 actions，"
+                    "删除与任务实体、输入和目标无关的动作，并补齐遗漏的目标步骤。"
+                )
+            actions = self._call(
+                "agent_actions" if action_attempt == 1 else "agent_actions.repair",
+                "根据任务描述、环境计划和业务模型反推 Agent 必须做的原子动作。不得把用户模拟阶段可能出现的临时扩展请求提升为正式动作。environment_plan.mode=stateless 时禁止生成任何读取或修改数据库、持久化状态或调用外部系统的动作。凡是仅根据用户输入和通用语言能力进行识别、比较、提取、格式化和最终表达的步骤都属于 Agent 自身推理或回答。每个输出动作必须不可再拆，并提供 atomicity_rationale、inputs、outputs、preconditions、effects。动作中的每个业务对象、数值来源和操作都必须能在 task_description 或 business_model 中找到依据，严禁复用其他任务的实体。" + repair_hint,
+                action_payload,
+            )
+            try:
+                candidate_actions = self._list(actions.get("actions"), "agent_actions")
+                candidate_actions = self._normalize_action_numeric_examples(
+                    candidate_actions, task_description=description
+                )
+                self._validate_actions(candidate_actions)
+                self._validate_action_grounding(
+                    candidate_actions,
+                    task_description=description,
+                    keywords=keywords,
+                )
+                if environment_plan["mode"] == "external_capability" and not any(
+                    any(marker in f"{item.get('name', '')} {item.get('description', '')}".lower()
+                        for marker in ("查询", "检索", "搜索", "获取", "lookup", "search", "retrieve"))
+                    for item in candidate_actions if isinstance(item, dict)
+                ):
+                    raise PipelineGenerationError(
+                        "external-capability task requires an explicit lookup action"
+                    )
+                action_audit = self._call(
+                    "agent_actions.audit",
+                    "独立审查动作是否与任务严格对齐。aligned 表示没有引入任务中不存在的实体、数据集或目标；complete 表示动作足以完成任务目标；atomic 表示动作边界清晰。issues 必须具体指出漂移或遗漏。",
+                    {
+                        "task_description": description,
+                        "business_model": business_model,
+                        "actions": candidate_actions,
+                        "output": {
+                            "aligned": True, "complete": True,
+                            "atomic": True, "issues": [],
+                        },
+                    },
+                )
+                self._validate_action_alignment_audit(action_audit)
+                action_list = candidate_actions
+                action_error = None
+                break
+            except PipelineGenerationError as exc:
+                action_error = exc
+                action_payload["previous_invalid_actions"] = (
+                    candidate_actions if "candidate_actions" in locals() else []
+                )
+                action_payload["validation_error"] = str(exc)
+                logger.warning(
+                    "agent action validation failed: attempt=%d/%d error=%s",
+                    action_attempt, self.retries, exc,
+                )
+        if action_list is None:
+            logger.warning(
+                "agent action proposals remained invalid; using deterministic baseline: %s",
+                action_error,
+            )
+            action_list = self._deterministic_actions(
+                task_description=description,
+                keywords=keywords,
+                environment_mode=environment_plan["mode"],
+            )
+            self._validate_actions(action_list)
+            self._validate_action_grounding(
+                action_list, task_description=description, keywords=keywords
+            )
+        action_list = self._ensure_data_access_action(
+            action_list,
+            environment_mode=environment_plan["mode"],
+            table_names=[str(table.get("table_name")) for table in table_definitions],
         )
-        action_list = self._list(actions.get("actions"), "agent_actions")
-        self._validate_actions(action_list)
 
         # Classify semantic actions before tool generation.  Environment
         # operations may become tools; reasoning and response composition
         # remain the policy's responsibility and must not be outsourced.
         capability_payload = {
+            "training_category": training_category,
             "task_description": description,
             "business_model": business_model,
+            "environment_plan": environment_plan,
             "agent_actions": action_list,
             "output": {"capabilities": [{
                 "action_name": "string",
                 "kind": "environment_operation|agent_reasoning|agent_response",
                 "requires_tool": True,
+                "dependencies": [],
                 "reason": "string",
             }]},
         }
@@ -732,12 +1243,23 @@ class TaskGenerationPipeline:
                 )
             capability_result = self._call(
                 "capability_plan" if capability_attempt == 1 else "capability_plan.repair",
-                "将每个原子 Agent 动作分类为 environment_operation、agent_reasoning 或 agent_response。只有必须读取或修改沙箱私有业务状态、调用外部系统或使用确定性专用能力的动作才是 environment_operation 且 requires_tool=true。比较、分析、筛选、选择、解释、总结和生成最终自然语言回答通常属于 agent_reasoning 或 agent_response，requires_tool=false。必须逐一覆盖输入动作，action_name 必须原样引用，不得新增、删除或改名。" + repair_hint,
+                "将每个原子 Agent 动作分类为 environment_operation、agent_reasoning 或 agent_response。只有必须读取或修改沙箱私有业务状态、调用外部系统或使用确定性专用能力的动作才是 environment_operation 且 requires_tool=true。business_model 只包含表和字段定义，不包含 Agent 可见的数据行；environment_plan 为 reference_data 或 stateful 时，读取表中具体记录、属性值、关系或隐藏事实必须分类为 environment_operation，不能伪装成从业务模型推理。比较、分析、筛选、选择、解释、总结和生成最终自然语言回答通常属于 agent_reasoning 或 agent_response，requires_tool=false。必须逐一覆盖输入动作，action_name 必须原样引用，不得新增、删除或改名。" + repair_hint,
                 capability_payload,
             )
             try:
                 candidate_capabilities = self._list(capability_result.get("capabilities"), "capabilities")
-                self._validate_capability_plan(candidate_capabilities, action_list)
+                candidate_capabilities = self._normalize_data_access_capabilities(
+                    candidate_capabilities,
+                    actions=action_list,
+                    environment_mode=environment_plan["mode"],
+                )
+                self._validate_capability_plan(
+                    candidate_capabilities,
+                    action_list,
+                    environment_mode=environment_plan["mode"],
+                    has_business_data=bool(business_model["tables"]),
+                    training_category=training_category,
+                )
                 capability_plan = candidate_capabilities
                 break
             except PipelineGenerationError as exc:
@@ -789,10 +1311,11 @@ class TaskGenerationPipeline:
             }
             for index, category in enumerate(noise_categories)
         ]
-        tool_prompt = "根据任务描述、模拟对话和已经确认可工具化的环境操作，生成标准 OpenAI Function Tool 定义。此阶段不得读取或参考完整业务环境数据、业务数据行、数据文档、隐藏真值、数据库记录或其原始字段值；工具定义只能从任务描述、对话中出现的公开信息和环境操作的业务语义推导。不得为比较、分析、选择、解释、总结或最终回答增加工具。工具设计要依据动作 inputs/outputs，确定自然的工具名、描述、参数名、类型、枚举值、必填性和参数说明；不要把业务数据中的具体记录、内部主键、数据库 ID、隐藏真值或用户确认 ID 写入工具定义。用户交互不生成 ask_user 工具，用户回复通过独立的 UserSimulator HTTP 接口获得。无 Agent 输入时使用 properties={}、required=[]。如果没有环境操作，tools 必须是空数组。输出标准工具 schema，并为顶层参数、嵌套对象属性和 array items schema 提供 description；数组对象同时定义 items.properties 和 items.required。每个业务工具在 tool_bindings 中只使用 tool_name 和 action_name；不要输出 trainer_action。严格按照 payload.noise_spec 的数量和顺序生成噪声工具。噪声工具必须是完整的标准 OpenAI Function Tool：unrelated 与当前任务完全无关；related_irrelevant 与任务主题相关但不影响任务目标完成。噪声工具不得绑定原子动作、不得修改任务关键业务数据、不得被奖励指标视为任务进展。每个工具必须根据其真实能力使用具体、可理解的 snake_case 名称；payload.output 中 semantic_function_name_N 只是结构占位符，严禁原样返回，也不得使用 noise_tool_N、tool_N、function_N 等占位名称。"
+        tool_prompt = "根据任务描述和已经确认可工具化的环境操作，生成标准 OpenAI Function Tool 定义。严格遵守 payload.training_category：direct_response 不生成业务工具；simple_agentic 生成恰好一个必要业务工具；multi_step_agentic 至少生成两个具有真实依赖或分支关系的业务工具。此阶段不得读取或参考模拟对话、完整业务数据行、数据文档、隐藏真值、数据库记录或其原始字段值；工具定义只能从稳定任务契约和环境操作的业务语义推导。不得为比较、分析、选择、解释、总结或最终回答增加工具。工具设计要依据动作 inputs/outputs，确定自然的工具名、描述、参数名、类型、枚举值、必填性和参数说明；不要把业务数据中的具体记录、内部主键、数据库 ID、隐藏真值或用户确认 ID 写入工具定义。用户交互不生成 ask_user 工具，用户回复通过独立的 UserSimulator HTTP 接口获得。无 Agent 输入时使用 properties={}、required=[]。如果没有环境操作，tools 必须是空数组。输出标准工具 schema，并为顶层参数、嵌套对象属性和 array items schema 提供 description；数组对象同时定义 items.properties 和 items.required。每个业务工具在 tool_bindings 中只使用 tool_name 和 action_name；不要输出 trainer_action。严格按照 payload.noise_spec 的数量和顺序生成噪声工具。噪声工具必须是完整的标准 OpenAI Function Tool：unrelated 与当前任务完全无关；related_irrelevant 与任务主题相关但不影响任务目标完成。噪声工具必须是纯只读查询或无状态计算：只能返回信息，不得预订、预约、创建、修改、删除、提交、发送、购买或执行任何外部操作；名称使用 search、lookup、get、list、estimate、calculate 等只读动词，不得使用 book、reserve、create、update、delete、submit、send、purchase、order 等写操作动词。噪声工具不得绑定原子动作、不得修改任务关键业务数据、不得被奖励指标视为任务进展。每个工具必须根据其真实能力使用具体、可理解的 snake_case 名称；payload.output 中 semantic_function_name_N 只是结构占位符，严禁原样返回，也不得使用 noise_tool_N、tool_N、function_N 等占位名称。"
         tool_payload = {"task_description": description,
-                        "dialogue_sessions": sessions,
+                        "capability_plan": capability_plan,
                         "agent_actions": tool_actions,
+                        "training_category": training_category,
                         "noise_spec": {"count": noise_count, "categories": noise_categories,
                                        "category_definitions": {
                                            "unrelated": "与当前任务完全无关",
@@ -832,6 +1355,7 @@ class TaskGenerationPipeline:
                     )
                 self._fill_tool_schema_descriptions(candidate_noise_tools)
                 self._validate_tools(candidate_noise_tools)
+                self._validate_noise_tool_safety(candidate_noise_tools)
                 if any(item["function"]["name"] == "ask_user" for item in candidate_noise_tools):
                     raise PipelineGenerationError("noise_tools 不能定义 ask_user")
                 primary_names = {item["function"]["name"] for item in candidate_tools}
@@ -900,14 +1424,95 @@ class TaskGenerationPipeline:
                     if not all(isinstance(value, str) and value.strip() for value in (tool_name, action_name)):
                         raise PipelineGenerationError("each tool binding needs tool_name and action_name")
                     if tool_name not in primary_names:
+                        # Providers sometimes bind a generated noise tool even
+                        # though noise tools must never map to business actions.
+                        # Dropping that binding is lossless; coverage of every
+                        # real business tool is checked below.
+                        if tool_name in noise_names or tool_name in {
+                            item.get("name") for item in candidate_noise_metadata
+                            if isinstance(item, dict)
+                        }:
+                            logger.info(
+                                "discarding non-business tool binding: tool=%s action=%s",
+                                tool_name, action_name,
+                            )
+                            continue
                         raise PipelineGenerationError("tool binding references an unknown tool")
                     if action_name not in tool_action_names:
                         raise PipelineGenerationError("tool binding references an action that is not tool-eligible")
                     normalized_bindings.append({"tool_name": tool_name, "action_name": action_name})
+                deduplicated_bindings: dict[str, dict[str, str]] = {}
+                for binding in normalized_bindings:
+                    deduplicated_bindings.setdefault(binding["tool_name"], binding)
+                if len(deduplicated_bindings) != len(normalized_bindings):
+                    logger.warning(
+                        "deduplicated repeated business tool bindings: removed=%d",
+                        len(normalized_bindings) - len(deduplicated_bindings),
+                    )
+                normalized_bindings = list(deduplicated_bindings.values())
                 if {item["tool_name"] for item in normalized_bindings} != primary_names:
                     raise PipelineGenerationError("every business tool must have exactly one tool binding")
-                if len({item["tool_name"] for item in normalized_bindings}) != len(normalized_bindings):
-                    raise PipelineGenerationError("business tool bindings must not be duplicated")
+                business_count = len(normalized_bindings)
+                if training_category == "direct_response" and business_count:
+                    raise PipelineGenerationError("direct_response must not define business tools")
+                if training_category == "simple_agentic" and business_count != 1:
+                    raise PipelineGenerationError("simple_agentic requires exactly one business tool")
+                if training_category == "multi_step_agentic" and business_count < 2:
+                    raise PipelineGenerationError("multi_step_agentic requires at least two business tools")
+                if environment_plan["mode"] == "external_capability" and not primary_names:
+                    raise PipelineGenerationError(
+                        "external-capability task requires at least one business tool"
+                    )
+                if (
+                    environment_plan["mode"] == "reference_data"
+                    and business_model["tables"]
+                    and not candidate_tools
+                ):
+                    data_action = next(
+                        (
+                            item.get("action_name") for item in capability_plan
+                            if isinstance(item, dict)
+                            and item.get("kind") == "environment_operation"
+                            and item.get("requires_tool") is True
+                        ),
+                        None,
+                    )
+                    if not isinstance(data_action, str) or not data_action.strip():
+                        raise PipelineGenerationError(
+                            "data-backed task has no tool-eligible data access action"
+                        )
+                    fallback_name = "read_task_reference_data"
+                    if fallback_name in noise_names:
+                        fallback_name = "read_business_reference_data"
+                    fallback_business_tool = {
+                        "type": "function",
+                        "function": {
+                            "name": fallback_name,
+                            "description": "读取完成当前任务所需的沙箱业务参考数据。",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {
+                                        "type": "string",
+                                        "description": "用户目标或需要读取的数据范围。",
+                                    }
+                                },
+                                "required": ["query"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                    self._validate_tools([fallback_business_tool])
+                    candidate_tools = [fallback_business_tool]
+                    normalized_bindings = [{
+                        "tool_name": fallback_name,
+                        "action_name": data_action,
+                    }]
+                    primary_names = {fallback_name}
+                    logger.warning(
+                        "injected deterministic data access tool: action=%s tool=%s",
+                        data_action, fallback_name,
+                    )
                 tool_list = candidate_tools + candidate_noise_tools
                 tool_bindings = normalized_bindings
                 noise_tool_metadata = candidate_noise_metadata
@@ -917,6 +1522,29 @@ class TaskGenerationPipeline:
                 logger.warning("openai tool schema validation failed: attempt=%d/%d error=%s", tool_attempt, self.retries, exc)
         if tool_list is None:
             raise tool_error or PipelineGenerationError("openai tool generation failed")
+        # Noise is implemented over independent read-only fixtures. Its public
+        # result never contains the private noise label or usefulness verdict.
+        for metadata in noise_tool_metadata:
+            if str(metadata["name"]).startswith("roll_virtual_die"):
+                continue
+            noise_function = next(tool["function"] for tool in tool_list if tool["function"]["name"] == metadata["name"])
+            fixture_error = None
+            for attempt in range(self.retries):
+                fixture = self._call("noise_tool_fixture", "为此只读工具生成独立的小型合成数据集，至少两行。所有参数必须通过 parameter_columns 映射到记录字段，使用精确匹配过滤。数据必须符合工具描述，不包含噪声标签、任务答案或评价信息。仅支持此查询语义；若工具语义不能用精确过滤表达则返回 supported=false。", {
+                    "function": noise_function, "validation_error": fixture_error,
+                    "output": {"supported": True, "records": [], "parameter_columns": {}},
+                })
+                rows, mapping = fixture.get("records"), fixture.get("parameter_columns")
+                properties = noise_function.get("parameters", {}).get("properties", {})
+                if (fixture.get("supported") is True and isinstance(rows, list) and len(rows) >= 2
+                    and all(isinstance(row, dict) for row in rows) and isinstance(mapping, dict)
+                    and set(mapping) == set(properties)
+                    and all(isinstance(column, str) and all(column in row for row in rows) for column in mapping.values())):
+                    metadata.update(records=rows, parameter_columns=mapping)
+                    break
+                fixture_error = "fixture must support exact filtering, contain two rows and map every parameter to a present column"
+            else:
+                raise PipelineGenerationError(f"noise fixture for {metadata['name']} is not executable: {fixture_error}")
         tools_manifest = self._materialize_tools(tool_list, materialized_dir)
 
         implementation_result = self._call(
@@ -935,19 +1563,25 @@ class TaskGenerationPipeline:
                 }]},
             },
         )
-        tool_implementations = implementation_result.get("specs", [])
-        if not isinstance(tool_implementations, list):
-            tool_implementations = []
-        try:
-            self._validate_tool_implementations(
-                tool_implementations, tools=candidate_tools, tables=business_model["tables"]
-            )
-        except PipelineGenerationError as exc:
-            # Declarative compilation is an optimization.  Invalid optional
-            # Specs must not discard an otherwise valid task; the sandbox
-            # builder can still implement those business handlers explicitly.
-            logger.warning("tool implementation specs ignored: %s", exc)
-            tool_implementations = []
+        tool_implementations = []
+        proposed_specs = implementation_result.get("specs", [])
+        for proposed in proposed_specs if isinstance(proposed_specs, list) else []:
+            for attempt in range(self.retries):
+                try:
+                    self._validate_tool_implementations(
+                        [*tool_implementations, proposed], tools=candidate_tools, tables=business_model["tables"]
+                    )
+                    tool_implementations.append(proposed)
+                    break
+                except PipelineGenerationError as exc:
+                    if attempt + 1 == self.retries:
+                        logger.warning("single declarative implementation needs custom handler: %s", exc)
+                        break
+                    repaired = self._call("tool_implementation_specs.repair", "仅修复给定的声明式工具实现，保持工具业务语义。输出 spec 对象；不能表达时返回 spec=null。不要修改其他工具。", {
+                        "spec": proposed, "validation_error": str(exc), "business_model": business_model,
+                        "tools": candidate_tools, "output": {"spec": {}},
+                    })
+                    proposed = repaired.get("spec")
 
         # 7a. Identify the small set of goal-critical steps before creating
         # process metrics. Ordinary tools are not process-reward candidates.
@@ -993,6 +1627,7 @@ class TaskGenerationPipeline:
         # 7b. Design executable observations and rewards from key steps.
         reward_prompt = "根据任务、业务数据模型、原子动作和工具定义生成紧凑、可执行的 observation 与 reward 设计。只保留与任务目标完成强相关的关键过程指标和目标结果指标，不为普通动作机械创建指标；如果任务无需关键工具动作或可直接生成答案，process 指标可以为空；如果存在关键工具动作，每个关键动作或关键动作链都可以有对应过程指标，不限制过程指标数量。观测指标不得依赖任务生成阶段的 user_profiles、user_scripts 或 dialogue_sessions 等模拟产物；evaluation_inputs 只能引用沙箱运行时实际产生的 conversation、public_observation、available_tools、tool_call、tool_results、business_data、final_agent_response、terminal_observation 等输入。每个 metric 必须同时生成机器可执行的 evaluator 对象，不能只有自然语言 condition/criteria：evaluator.kind 必须声明评估器类型，evaluator.source 必须声明 runtime_rule 或 external_llm，evaluator.score_mapping 必须声明如何把评估结果映射到 score_range。关键过程指标必须是 hybrid，并使用 evaluator.kind=hybrid_tool_call、evaluator.source=external_llm、evaluator.comparison=exact_tool_name_and_canonical_arguments，以及 target_action、evaluation_inputs、criteria 和固定 condition=llm_expected_tool_call_exact_match。沙箱 Code Agent 根据这个指标在实现评估器时调用外部 LLM，结合当前运行时 Context、可用工具和 criteria 生成期望的工具名和参数真值；然后由规则引擎对 Agent 实际 tool_call 的工具名和规范化参数进行确定性精确比对。任务 JSON 不要嵌入 LLM prompt、output_schema 或嵌套 expected-call 配置；不要用 LLM 直接给最终过程分数，也不要把工具选择错误或参数错误设计成 penalty。结果指标只判断任务目标是否完成或关键业务数据是否达到目标，优先使用可量化的业务数据变化；rule-based 必须声明 evaluator.kind=business_state_rule、document_rule 或 trajectory_rule，明确 source_fields、assertion 和 score_mapping；model-based 必须声明 evaluator.kind=external_llm_judge、source=external_llm；hybrid 结果指标必须同时声明 evaluator.kind=hybrid_outcome、rule 和 external_llm 字段。惩罚指标只有在直接影响任务目标时才保留，用于偏离用户诉求、无效循环或业务数据偏离预期，不评价工具选择或参数错误。每个 metric 包含 id、category、type、scope、rubric、weight、score_range 和 evaluator；rule-based 或 hybrid 提供 condition，model-based 或 hybrid 提供 evaluation_inputs 和 criteria。process/outcome 分数范围为 [0,1]，penalty 分数范围为 [-1,0]；所有 process 与 outcome 指标的权重合计为 1，所有 penalty 指标的权重合计为 1，且 outcome 权重合计大于 process 权重合计。reward_formula 必须把所有 process/outcome 项放在同一个正反馈加权和中，把 penalty 项放在独立的负反馈加权和中，不得分别归一化 process 和 outcome；标准公式为 R = clip(sum(w_i*score_i, category in {process,outcome}) + sum(w_j*score_j, category == penalty), -1, 1)，该公式在分数范围和权重归一化成立时落在 [-1,1]。category 取 process、outcome、penalty。所有 rubric、criteria、assertion 和 description 必须是简短单句，禁止输出长篇解释或回显输入数据。"
         reward_prompt += " payload.key_steps 是上一阶段确认的关键步骤。process 指标只能评价这些 key_steps 中的 action_name；不得为非关键读取、噪声工具、可选探索或每个工具机械创建过程奖励。先使用 key_steps 判断是否确实需要过程奖励，再生成最少且必要的 process metrics。"
+        reward_prompt += " metric 的 rubric、criteria、condition 和 assertion 中不得新增任务描述未提出的数量、字数、比例、时间或最低条目数；只能检验任务中已有的明确约束。"
         reward_prompt += " 优先使用可执行的 runtime_rule 结果指标，并将多个关键动作合并为最少必要的过程指标。"
         if environment_plan["mode"] == "stateless":
             reward_prompt += " 当前任务是 stateless：不得生成 process 指标，不得以 business_data 或数据库变化作为成功条件。结果指标必须根据运行时 conversation 与 final_agent_response 评价任务完成度、忠实性和格式；噪声工具调用只能作为轨迹惩罚。"
@@ -1008,6 +1643,7 @@ class TaskGenerationPipeline:
             ],
         }
         reward_payload = {"task_description": description, "environment": reward_environment,
+                          "goal_contract": semantic_goal,
                           "environment_plan": environment_plan,
                           "agent_actions": {"actions": action_list},
                           "tools": tool_list, "key_steps": key_steps, "output": {"observation_schema": {}, "metrics": [{
@@ -1051,11 +1687,25 @@ class TaskGenerationPipeline:
                 candidate_metrics = self._list(candidate_rewards.get("metrics"), "metrics")
                 candidate_metrics = self._normalize_metric_types(candidate_metrics)
                 candidate_metrics = self._normalize_metric_evaluators(candidate_metrics)
+                candidate_metrics = self._normalize_metrics_for_environment(
+                    candidate_metrics, environment_mode=environment_plan["mode"]
+                )
+                candidate_metrics = self._drop_ungrounded_numeric_metrics(
+                    candidate_metrics, task_description=description
+                )
+                if noise_tool_metadata:
+                    self._ensure_deterministic_noise_penalty(
+                        candidate_metrics,
+                        noise_names=[str(item["name"]) for item in noise_tool_metadata],
+                    )
                 candidate_metrics = self._normalize_metric_weights(candidate_metrics)
                 candidate_rewards["metrics"] = candidate_metrics
                 self._validate_metrics(candidate_metrics, key_steps=key_steps)
                 self._validate_metrics_for_environment(
                     candidate_metrics, environment_mode=environment_plan["mode"]
+                )
+                self._validate_metric_constraint_grounding(
+                    candidate_metrics, task_description=description
                 )
                 # Build the formula from the validated metric weights instead
                 # of trusting an independently generated expression. Positive
@@ -1072,18 +1722,42 @@ class TaskGenerationPipeline:
                 reward_error = exc
                 logger.warning("observation/reward validation failed: attempt=%d/%d error=%s", reward_attempt, self.retries, exc)
         if rewards is None:
-            raise reward_error or PipelineGenerationError("observations_rewards generation failed")
+            logger.warning(
+                "observation/reward proposals remained invalid; using deterministic baseline: %s",
+                reward_error,
+            )
+            baseline_metrics = [{
+                "id": "outcome_task_completion",
+                "category": "outcome",
+                "type": "model-based",
+                "scope": "terminal",
+                "evaluation_inputs": ["conversation", "final_agent_response"],
+                "criteria": [
+                    "最终回答是否完成任务目标并遵守任务描述中的格式和约束。",
+                    "最终回答是否仅使用对话、工具结果和环境中可验证的信息。",
+                ],
+                "evaluator": {
+                    "kind": "external_llm_judge", "source": "external_llm",
+                    "score_mapping": {"full": 1, "partial": 0.5, "missing": 0},
+                },
+                "score_range": [0, 1], "weight": 1,
+                "rubric": "完整、可靠地完成用户请求。",
+            }]
+            if noise_tool_metadata:
+                self._ensure_deterministic_noise_penalty(
+                    baseline_metrics,
+                    noise_names=[str(item["name"]) for item in noise_tool_metadata],
+                )
+            rewards = {
+                "observation_schema": {},
+                "metrics": baseline_metrics,
+                "reward_formula": self._canonical_reward_formula(baseline_metrics),
+            }
+            self._validate_metrics(baseline_metrics, key_steps=key_steps)
         if noise_tool_metadata:
-            self._ensure_deterministic_noise_penalty(
-                rewards["metrics"],
-                noise_names=[str(item["name"]) for item in noise_tool_metadata],
-            )
-            rewards["metrics"] = self._normalize_metric_weights(rewards["metrics"])
+            # Already normalized before validation; keep the postcondition
+            # explicit for future call-site changes.
             self._validate_metrics(rewards["metrics"], key_steps=key_steps)
-            self._validate_metrics_for_environment(
-                rewards["metrics"], environment_mode=environment_plan["mode"]
-            )
-            rewards["reward_formula"] = self._canonical_reward_formula(rewards["metrics"])
 
         # final_agent_response is stored by the shared runtime as a raw string.  A
         # document_rule such as $.tea_varieties therefore invents structure
@@ -1091,6 +1765,7 @@ class TaskGenerationPipeline:
         # evaluating it with the external judge instead of compiling a bogus
         # JSON path.
         self._promote_unstructured_document_rules(rewards["metrics"])
+        self._promote_mixed_response_business_rules(rewards["metrics"])
         rewards["reward_formula"] = self._canonical_reward_formula(rewards["metrics"])
 
         metric_impl_result = self._call(
@@ -1151,6 +1826,9 @@ class TaskGenerationPipeline:
             rewards["metrics"], environment_mode=environment_plan["mode"]
         )
         rewards["reward_formula"] = self._canonical_reward_formula(rewards["metrics"])
+        rewards["observation_schema"] = self._canonical_observation_schema(
+            rewards.get("observation_schema")
+        )
 
         acceptance_seed = self._build_acceptance_contract(
             task_description=description,
@@ -1163,6 +1841,7 @@ class TaskGenerationPipeline:
             reward_formula=rewards["reward_formula"],
         )
         acceptance_payload = {
+            "goal_contract": semantic_goal,
             "task_description": description,
             "data_manifest": data_manifest,
             "business_tables": data_tables,
@@ -1216,25 +1895,40 @@ class TaskGenerationPipeline:
             acceptance_contract = acceptance_seed
 
         executable_payload = {
+            "goal_contract": semantic_goal,
+            "capability_dependencies": key_steps,
                 "task_description": description,
+                "training_category": training_category,
                 "business_tables": data_tables,
                 "tools": tool_list,
+                "tool_implementations": tool_implementations,
                 "noise_tools": noise_tool_metadata,
                 "key_steps": key_steps,
                 "metrics": rewards["metrics"],
-                "output": {"scenarios": []},
+                "output": {"scenarios": [{
+                    "scenario_id": "goal_success",
+                    "kind": "goal_success",
+                    "steps": [
+                        {"step_id": "lookup", "operation": "tool_call", "tool_name": "declared_tool", "arguments": {}, "capture": {"record_id": "$.records[0].id"}, "expected_status": 200},
+                        {"step_id": "update", "operation": "tool_call", "tool_name": "declared_tool", "arguments": {"id": {"$ref": "record_id"}}, "expected_status": 200},
+                    ],
+                    "assertions": [{"source": "step:update", "path": "$.status", "operator": "exists", "expected": True}],
+                }]},
         }
         business_scenarios: list[Any] | None = None
         executable_error: PipelineGenerationError | None = None
         success_fixture = self._select_success_response_fixture(
             task_description=description, sessions=sessions
         )
+        fixture_conversation = self._select_fixture_conversation(sessions)
         try:
             fixture_result = self._call(
                 "acceptance_success_fixture",
-                "根据任务描述和结果指标生成一份真正完成任务的最终回答，用作成功验收 fixture。回答必须直接解决具体任务，包含指标要求的实质内容，不能只复述输出格式、提纲或评分标准。只返回 content 字段。",
+                "根据任务描述、用户消息、公开环境数据和结果指标生成一份真正完成任务的最终回答，用作成功验收 fixture。只有任务描述、用户消息和 grounding_environment 才是事实来源；不得沿用模拟 Agent 先前产生的事实。必须忠实保留用户提供的实体、数值、规则和格式范围；不得新增未提供的价格、成分、属性、排行、安全阈值、操作时长或其他业务事实。信息不足时应明确缺口并请求澄清，不能伪造完整答案。回答必须直接解决具体任务，不能只复述输出格式、提纲或评分标准。只返回 content 字段。",
                 {
                     "task_description": description,
+                    "representative_conversation": fixture_conversation,
+                    "grounding_environment": environment,
                     "metrics": [
                         {key: metric.get(key) for key in ("id", "rubric", "criteria")}
                         for metric in rewards["metrics"] if metric.get("category") == "outcome"
@@ -1242,38 +1936,181 @@ class TaskGenerationPipeline:
                     "output": {"content": "完整成功回答"},
                 },
             )
+            fixture_result = self._unwrap_structured_output(
+                fixture_result, expected_fields={"content"}
+            )
             candidate_fixture = fixture_result.get("content")
             if isinstance(candidate_fixture, str) and len(candidate_fixture.strip()) >= 100:
                 success_fixture = candidate_fixture.strip()
         except PipelineGenerationError as exc:
             logger.warning("success response fixture generation failed; using dialogue-derived fallback: %s", exc)
+        fixture_audit_error: PipelineGenerationError | None = None
+        for fixture_attempt in range(1, self.retries + 1):
+            success_fixture = self._normalize_success_fixture_length(
+                success_fixture, task_description=description
+            )
+            fixture_audit = self._call(
+                "acceptance_success_fixture_audit",
+                "独立审查成功回答 fixture。latest_instructions_satisfied 表示回答遵循用户消息中最后出现的格式、措辞、增删、纠正和撤销要求；grounded 表示每项价格、属性、适用性、排行、安全阈值、操作时长等事实均可在任务、用户消息或 grounding_environment 中找到，不能把模型常识当作验收真值；goal_completed 表示回答完成当前有证据支持的目标，确实缺少必要输入时准确说明缺口并请求补充也算完成。issues 必须具体指出遗漏或无来源断言。",
+                {
+                    "task_description": description,
+                    "representative_conversation": fixture_conversation,
+                    "grounding_environment": environment,
+                    "candidate_response": success_fixture,
+                    "output": {
+                        "latest_instructions_satisfied": True,
+                        "grounded": True,
+                        "goal_completed": True,
+                        "issues": [],
+                    },
+                },
+            )
+            fixture_audit = self._unwrap_structured_output(
+                fixture_audit,
+                expected_fields={
+                    "latest_instructions_satisfied", "grounded",
+                    "goal_completed", "issues",
+                },
+            )
+            try:
+                self._validate_success_fixture_audit(fixture_audit)
+                self._validate_success_fixture_constraints(
+                    success_fixture, task_description=description
+                )
+                fixture_audit_error = None
+                break
+            except PipelineGenerationError as exc:
+                fixture_audit_error = exc
+                logger.warning(
+                    "success fixture audit failed: attempt=%d/%d error=%s",
+                    fixture_attempt, self.retries, exc,
+                )
+                if fixture_attempt >= self.retries:
+                    break
+                try:
+                    repaired_fixture = self._call(
+                        "acceptance_success_fixture.repair",
+                        "根据审查问题重写完整最终回答。必须执行代表性对话中最后有效的用户指令，后指令覆盖前指令；不得只解释规则，不得保留已被撤销的要求，不得编造事实。只返回 content。",
+                        {
+                            "task_description": description,
+                            "representative_conversation": fixture_conversation,
+                            "previous_response": success_fixture,
+                            "issues": list(fixture_audit.get("issues", [])) + [str(exc)],
+                            "output": {"content": "修复后的完整成功回答"},
+                        },
+                    )
+                    repaired_fixture = self._unwrap_structured_output(
+                        repaired_fixture, expected_fields={"content"}
+                    )
+                except (PipelineGenerationError, ValueError) as repair_exc:
+                    logger.warning(
+                        "success fixture repair call failed: attempt=%d/%d error=%s",
+                        fixture_attempt, self.retries, repair_exc,
+                    )
+                    continue
+                repaired_content = repaired_fixture.get("content")
+                if not isinstance(repaired_content, str) or len(repaired_content.strip()) < 20:
+                    fixture_audit_error = PipelineGenerationError(
+                        "repaired success fixture is empty or too short"
+                    )
+                    logger.warning(
+                        "success fixture repair remained invalid: attempt=%d/%d error=%s",
+                        fixture_attempt, self.retries, fixture_audit_error,
+                    )
+                    continue
+                success_fixture = repaired_content.strip()
+        if fixture_audit_error is not None:
+            latest_user_message = next(
+                (
+                    turn.get("content") for turn in reversed(fixture_conversation)
+                    if isinstance(turn, dict) and turn.get("role") == "user"
+                    and isinstance(turn.get("content"), str)
+                ),
+                "",
+            )
+            try:
+                final_fallback = self._call(
+                    "acceptance_success_fixture.final_fallback",
+                    "独立生成最终成功回答。latest_user_message 是最高优先级指令；必须直接执行其中已经做出的选择、修改和格式要求，不得再次询问确认，不得列出被拒绝的候选方案。只返回 content。",
+                    {
+                        "task_description": description,
+                        "representative_conversation": fixture_conversation,
+                        "latest_user_message": latest_user_message,
+                        "grounding_environment": environment,
+                        "output": {"content": "严格执行最后用户指令的完整回答"},
+                    },
+                )
+                final_fallback = self._unwrap_structured_output(
+                    final_fallback, expected_fields={"content"}
+                )
+                fallback_content = final_fallback.get("content")
+                if not isinstance(fallback_content, str) or len(fallback_content.strip()) < 20:
+                    raise PipelineGenerationError("final success fixture fallback is empty or too short")
+                fallback_content = self._normalize_success_fixture_length(
+                    fallback_content.strip(), task_description=description
+                )
+                fallback_audit = self._call(
+                    "acceptance_success_fixture.final_fallback_audit",
+                    "严格审查候选回答是否执行最后用户指令、基于已提供事实并完成目标。只返回指定布尔字段和 issues。",
+                    {
+                        "task_description": description,
+                        "representative_conversation": fixture_conversation,
+                        "candidate_response": fallback_content,
+                        "grounding_environment": environment,
+                        "output": {
+                            "latest_instructions_satisfied": True,
+                            "grounded": True,
+                            "goal_completed": True,
+                            "issues": [],
+                        },
+                    },
+                )
+                self._validate_success_fixture_audit(fallback_audit)
+                self._validate_success_fixture_constraints(
+                    fallback_content, task_description=description
+                )
+                success_fixture = fallback_content
+                fixture_audit_error = None
+                logger.warning("recovered success fixture with independent final fallback")
+            except (PipelineGenerationError, ValueError) as fallback_exc:
+                logger.warning("final success fixture fallback failed: %s", fallback_exc)
+        if fixture_audit_error is not None:
+            raise fixture_audit_error
         executable_baseline = self._build_business_scenario_baseline(
             task_description=description,
             tools=tool_list,
             noise_tools=noise_tool_metadata,
+            data_tables=data_tables,
             success_content=success_fixture,
         )
+        executable_payload["output"] = {"scenarios": [{"kind": "goal_success", "steps": [
+            {"operation": "tool_call", "tool_name": "string", "arguments": {}, "capture": {}}
+        ]}]}
         for executable_attempt in range(1, self.retries + 1):
             repair_hint = ""
             if executable_error is not None:
                 repair_hint = (
                     f"\n上一版轨迹未通过校验：{executable_error}。必须返回完整 scenarios，"
-                    "每个场景都要有非空 assertions；必须同时包含 goal_success、goal_failure，"
-                    "存在噪声工具时还必须包含 noise_selection。"
+                    "只修复 goal_success 的业务调用；不要生成平台控制步骤或断言。"
                 )
             executable_result = self._call(
                 "acceptance_executable_scenarios" if executable_attempt == 1 else "acceptance_executable_scenarios.repair",
-                "生成机器可执行的业务验收轨迹，不能输出自然语言步骤。至少包含 goal_success 和 goal_failure；存在噪声工具时增加 noise_selection。使用 operation=reset、tool_call、agent_response、observation、reward、replay、business_snapshot、mutate_business_state；goal_success 使用 agent_response.content 提交最终回答后再取 reward。每步可用 step_id、capture，后续参数可用 {$ref: 变量名}。assertions 使用 source=step:<step_id> 或 variables、JSON path 和有限 operator。成功轨迹只能使用业务工具推进目标，失败或噪声轨迹必须验证不会获得成功奖励。所有工具、参数、表、字段和值必须来自输入，不得使用 Python、SQL 或表达式字符串。" + repair_hint,
+                "只规划一条真实业务成功路径。返回 scenarios=[{kind: goal_success, steps: [...]}]，steps 只能包含 operation=tool_call、tool_name、arguments 和可选 capture。不得生成 reset、agent_response、reward 或 assertions，它们由平台编译。参数来自题面和给定数据，capture 为变量名到工具结果 JSONPath 的映射（例如 $.records[0].id），后续参数使用 {$ref: 变量名}。多步任务必须具有真实的数据依赖，禁止凭空凑调用。必须遵守 goal_contract 和 capability_dependencies。工具、表、字段和数据必须来自输入；不允许代码、SQL、占位值或绕过工具直接修改状态。" + repair_hint,
                 executable_payload,
             )
             candidate_scenarios = self._normalize_executable_scenarios(
-                executable_result.get("scenarios", [])
+                executable_result.get("scenarios", []),
+                success_content=success_fixture,
+            )
+            candidate_scenarios = self._compile_business_scenario_structure(
+                candidate_scenarios, executable_baseline
             )
             if not candidate_scenarios:
                 candidate_scenarios = executable_baseline
             try:
                 self._validate_executable_scenarios(
-                    candidate_scenarios, tools=tool_list, noise_tools=noise_tool_metadata
+                    candidate_scenarios, tools=tool_list, noise_tools=noise_tool_metadata,
+                    training_category=training_category,
                 )
                 business_scenarios = candidate_scenarios
                 break
@@ -1282,7 +2119,8 @@ class TaskGenerationPipeline:
                 logger.warning("business executable scenarios invalid: attempt=%d/%d error=%s", executable_attempt, self.retries, exc)
         if business_scenarios is None:
             self._validate_executable_scenarios(
-                executable_baseline, tools=tool_list, noise_tools=noise_tool_metadata
+                executable_baseline, tools=tool_list, noise_tools=noise_tool_metadata,
+                training_category=training_category,
             )
             logger.warning(
                 "business executable scenario proposals remained invalid; using deterministic baseline: %s",
@@ -1324,25 +2162,85 @@ class TaskGenerationPipeline:
         max_turn_sessions = sum(
             session.get("termination_reason") == "max_turns_reached" for session in sessions
         )
+        bounded_sessions = sum(
+            session.get("termination_reason") == "bounded_completion" for session in sessions
+        )
         if max_turn_sessions:
             readiness_warnings.append(
                 f"{max_turn_sessions}/{len(sessions)} dialogue sessions reached the turn limit"
+            )
+        if bounded_sessions:
+            readiness_warnings.append(
+                f"{bounded_sessions}/{len(sessions)} dialogue sessions used bounded completion"
             )
         if complexity != declared_complexity:
             readiness_warnings.append(
                 f"complexity normalized from {declared_complexity} to {complexity}"
             )
+        from .task_routing import training_contract as build_training_contract
+        training_blueprint = build_training_contract(training_category)
+        scenario_kinds = {
+            item.get("kind") for item in business_scenarios if isinstance(item, dict)
+        }
+        missing_scenarios = set(training_blueprint["required_scenarios"]) - scenario_kinds
+        if missing_scenarios:
+            raise PipelineGenerationError(
+                "final consistency: training skeleton is missing scenarios: "
+                + ", ".join(sorted(missing_scenarios))
+            )
+        self._validate_training_contract_consistency(
+            task_description=description,
+            training_contract=training_blueprint,
+            keywords=keywords,
+            environment_mode=environment_plan["mode"],
+            data_tables=data_tables,
+            actions=action_list,
+            tools=tool_list,
+            tool_bindings=tool_bindings,
+            metrics=rewards["metrics"],
+            success_fixture=success_fixture,
+        )
         self._validate_task_readiness(
+            environment_mode=environment_plan["mode"],
+            has_business_data=bool(data_tables),
             capability_plan=capability_plan,
             tool_bindings=tool_bindings,
             noise_tools=noise_tool_metadata,
             metrics=rewards["metrics"],
             metric_implementations=metric_implementations,
             business_scenarios=business_scenarios,
+            task_description=description,
+            data_tables=data_tables,
+            media_generation=media_generation,
+            success_fixture=success_fixture,
             require_noise=self.noise_tool_max > 0,
         )
+        from .task_spec import TaskSpecError, compile_task_spec
+        try:
+            task_spec = compile_task_spec(
+                task_description=description,
+                training_category=training_category,
+                environment_plan=environment_plan,
+                data_manifest=data_manifest,
+                data_tables=data_tables,
+                tools=tool_list,
+                noise_tools=noise_tool_metadata,
+                tool_bindings=tool_bindings,
+                tool_implementations=tool_implementations,
+                actions=action_list,
+                key_steps=key_steps,
+                metrics=rewards["metrics"],
+                executable_scenarios=business_scenarios,
+                semantic_goal=semantic_goal,
+                capability_plan=capability_plan,
+            )
+        except TaskSpecError as exc:
+            raise PipelineGenerationError(f"task_spec compilation failed: {exc}") from exc
         result = {
             "task": task_desc.strip(), "task_type": task_type, "task_intent": task_intent,
+            "training_category": training_category,
+            "training_contract": training_blueprint,
+            "task_spec": task_spec,
             "complexity": complexity,
             "requirements": requirements,
             "environment_plan": environment_plan,
@@ -1389,8 +2287,12 @@ class TaskGenerationPipeline:
         return result
 
     @staticmethod
-    def _schema_fixture(schema: dict[str, Any]) -> Any:
-        """Create a type-valid, data-independent tool request template."""
+    def _schema_fixture(
+        schema: dict[str, Any], *, field_name: str = "",
+        fixture_values: dict[str, list[Any]] | None = None,
+    ) -> Any:
+        """Create a non-empty request fixture, preferring generated business rows."""
+        fixture_values = fixture_values or {}
         if "default" in schema:
             return schema["default"]
         enum = schema.get("enum")
@@ -1399,14 +2301,77 @@ class TaskGenerationPipeline:
         kind = schema.get("type")
         if kind == "object":
             properties = schema.get("properties", {})
-            return {name: TaskGenerationPipeline._schema_fixture(value) for name, value in properties.items() if name in schema.get("required", [])}
+            return {
+                name: TaskGenerationPipeline._schema_fixture(
+                    value, field_name=name, fixture_values=fixture_values
+                )
+                for name, value in properties.items()
+                if name in schema.get("required", [])
+            }
         if kind == "array":
-            return []
+            values = fixture_values.get(field_name, [])
+            singular_name = (
+                f"{field_name[:-3]}y" if field_name.endswith("ies")
+                else field_name[:-1] if field_name.endswith("s") else field_name
+            )
+            if not values:
+                values = fixture_values.get(singular_name, [])
+            if values:
+                return values[: min(3, len(values))]
+            return [TaskGenerationPipeline._schema_fixture(
+                schema.get("items", {}), field_name=singular_name,
+                fixture_values=fixture_values,
+            )]
         if kind == "integer" or kind == "number":
+            values = fixture_values.get(field_name, [])
+            if values and isinstance(values[0], (int, float)) and not isinstance(values[0], bool):
+                return values[0]
             return 1
         if kind == "boolean":
             return True
-        return "fixture-value"
+        values = fixture_values.get(field_name, [])
+        if values:
+            return values[0]
+        description = str(schema.get("description", ""))
+        example_match = re.search(r"(?:例如|示例|如)\s*[:：]?\s*([^，。；,;]+)", description)
+        if example_match:
+            return example_match.group(1).strip(" '\"`")
+        return f"任务输入中的{field_name or '值'}"
+
+    @staticmethod
+    def _business_fixture_values(data_tables: list[dict[str, Any]]) -> dict[str, list[Any]]:
+        """Index real generated row values for deterministic acceptance fixtures."""
+        values: dict[str, list[Any]] = {}
+        table_names: list[str] = []
+        for table in data_tables:
+            table_name = table.get("table_name")
+            if isinstance(table_name, str) and table_name:
+                table_names.append(table_name)
+            for row in table.get("rows", []):
+                if not isinstance(row, dict):
+                    continue
+                for name, value in row.items():
+                    if value in (None, "", [], {}):
+                        continue
+                    bucket = values.setdefault(str(name), [])
+                    if value not in bucket:
+                        bucket.append(value)
+                    # Tool schemas often use localized business labels while
+                    # generated tables use storage-oriented snake_case names
+                    # (for example 撮口呼样本计数 vs table_a_撮口呼_count).
+                    # Index conservative aliases so executable positive paths
+                    # use a real correlated row instead of the numeric fallback 1.
+                    alias = re.sub(r"^(?:table|表)[_-]?[a-z0-9]+[_-]", "", str(name), flags=re.I)
+                    alias = alias.replace("_count", "样本计数").replace("count", "样本计数")
+                    alias = alias.replace("_", "")
+                    if alias and alias != str(name):
+                        alias_bucket = values.setdefault(alias, [])
+                        if value not in alias_bucket:
+                            alias_bucket.append(value)
+        if table_names:
+            values["reference_data"] = table_names
+            values["data_source"] = table_names
+        return values
 
     @classmethod
     def _build_acceptance_contract(
@@ -1649,7 +2614,8 @@ class TaskGenerationPipeline:
 
     @staticmethod
     def _validate_executable_scenarios(
-        scenarios: Any, *, tools: list[dict[str, Any]], noise_tools: list[dict[str, Any]]
+        scenarios: Any, *, tools: list[dict[str, Any]], noise_tools: list[dict[str, Any]],
+        training_category: str | None = None,
     ) -> None:
         if not isinstance(scenarios, list) or not scenarios:
             raise PipelineGenerationError("executable business scenarios must be a non-empty list")
@@ -1667,6 +2633,44 @@ class TaskGenerationPipeline:
         }
         kinds: set[str] = set()
         ids: set[str] = set()
+
+        def validate_value(value: Any, schema: dict[str, Any], path: str) -> None:
+            if isinstance(value, dict) and set(value) == {"$ref"}:
+                if not isinstance(value["$ref"], str) or not value["$ref"].strip():
+                    raise PipelineGenerationError(f"{path} has an invalid reference")
+                return
+            kind = schema.get("type")
+            if kind == "array":
+                if not isinstance(value, list) or not value:
+                    raise PipelineGenerationError(f"{path} must be a non-empty array")
+                for item_index, item in enumerate(value):
+                    validate_value(item, schema.get("items", {}), f"{path}[{item_index}]")
+            elif kind == "object":
+                if not isinstance(value, dict) or not value:
+                    raise PipelineGenerationError(f"{path} must be a non-empty object")
+                properties = schema.get("properties", {})
+                for required_name in schema.get("required", []):
+                    if required_name not in value:
+                        raise PipelineGenerationError(f"{path} misses required field {required_name}")
+                for child_name, child_value in value.items():
+                    if child_name in properties:
+                        validate_value(child_value, properties[child_name], f"{path}.{child_name}")
+            elif kind == "string":
+                if not isinstance(value, str) or not value.strip():
+                    raise PipelineGenerationError(f"{path} must be a non-empty string")
+                lowered = value.strip().lower()
+                if any(marker in lowered for marker in (
+                    "fixture-value", "placeholder", "todo", "sample-value", "test-value"
+                )):
+                    raise PipelineGenerationError(f"{path} uses a placeholder value")
+        def references(value: Any) -> set[str]:
+            if isinstance(value, dict):
+                if set(value) == {"$ref"} and isinstance(value.get("$ref"), str):
+                    return {value["$ref"]}
+                return set().union(*(references(item) for item in value.values())) if value else set()
+            if isinstance(value, list):
+                return set().union(*(references(item) for item in value)) if value else set()
+            return set()
         for index, scenario in enumerate(scenarios):
             if not isinstance(scenario, dict) or not isinstance(scenario.get("scenario_id"), str):
                 raise PipelineGenerationError(f"executable_scenarios[{index}] is invalid")
@@ -1678,6 +2682,8 @@ class TaskGenerationPipeline:
             if not isinstance(steps, list) or not steps:
                 raise PipelineGenerationError(f"executable_scenarios[{index}] requires steps")
             captures: set[str] = set()
+            success_business_calls = 0
+            has_dependency_edge = False
             for step in steps:
                 if not isinstance(step, dict) or step.get("operation") not in allowed_operations:
                     raise PipelineGenerationError(f"executable_scenarios[{index}] has invalid operation")
@@ -1687,19 +2693,46 @@ class TaskGenerationPipeline:
                         raise PipelineGenerationError(f"executable_scenarios[{index}] references invalid tool")
                     if scenario["kind"] == "goal_success" and name in noise_names:
                         raise PipelineGenerationError("goal_success scenario cannot use noise tools")
+                    if scenario["kind"] == "goal_success":
+                        success_business_calls += 1
+                        step_refs = references(arguments)
+                        if step_refs:
+                            if not step_refs <= captures:
+                                raise PipelineGenerationError(
+                                    f"executable_scenarios[{index}] references an uncaptured value"
+                                )
+                            has_dependency_edge = True
                     schema = tool_schemas[name]
                     if set(arguments) - set(schema.get("properties", {})):
                         raise PipelineGenerationError(f"executable_scenarios[{index}] has unknown tool arguments")
                     if set(schema.get("required", [])) - set(arguments):
                         raise PipelineGenerationError(f"executable_scenarios[{index}] misses required tool arguments")
+                    if scenario["kind"] == "goal_success":
+                        for argument_name in schema.get("required", []):
+                            validate_value(
+                                arguments[argument_name],
+                                schema.get("properties", {}).get(argument_name, {}),
+                                f"executable_scenarios[{index}].{name}.{argument_name}",
+                            )
                 if step["operation"] == "agent_response" and (
                     not isinstance(step.get("content"), str) or not step["content"].strip()
                 ):
                     raise PipelineGenerationError(f"executable_scenarios[{index}] has invalid agent response")
-                capture = step.get("capture", {})
-                if capture and (not isinstance(capture, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in capture.items())):
+                capture = step.get("capture") or {}
+                if not isinstance(capture, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in capture.items()):
                     raise PipelineGenerationError(f"executable_scenarios[{index}] capture is invalid")
                 captures.update(capture)
+            if scenario["kind"] == "goal_success":
+                if training_category == "direct_response" and success_business_calls:
+                    raise PipelineGenerationError("direct_response success must not call business tools")
+                if training_category == "simple_agentic" and success_business_calls != 1:
+                    raise PipelineGenerationError("simple_agentic success requires exactly one business tool call")
+                if training_category == "multi_step_agentic" and (
+                    success_business_calls < 2 or not has_dependency_edge
+                ):
+                    raise PipelineGenerationError(
+                        "multi_step_agentic success requires two business calls and a capture/$ref dependency"
+                    )
             assertions = scenario.get("assertions", [])
             if not isinstance(assertions, list) or not assertions:
                 raise PipelineGenerationError(f"executable_scenarios[{index}] requires assertions")
@@ -1745,6 +2778,7 @@ class TaskGenerationPipeline:
         task_description: dict[str, Any],
         tools: list[dict[str, Any]],
         noise_tools: list[dict[str, Any]],
+        data_tables: list[dict[str, Any]] | None = None,
         success_content: str | None = None,
     ) -> list[dict[str, Any]]:
         noise_names = {
@@ -1753,6 +2787,7 @@ class TaskGenerationPipeline:
         business_tools = [
             tool for tool in tools if tool.get("function", {}).get("name") not in noise_names
         ]
+        fixture_values = cls._business_fixture_values(data_tables or [])
         success_steps: list[dict[str, Any]] = [
             {"operation": "reset", "body": {"episode_id": "goal-success", "seed": 17}, "expected_status": 200}
         ]
@@ -1762,7 +2797,9 @@ class TaskGenerationPipeline:
                 "step_id": f"business_tool_{index}",
                 "operation": "tool_call",
                 "tool_name": function["name"],
-                "arguments": cls._schema_fixture(function["parameters"]),
+                "arguments": cls._schema_fixture(
+                    function["parameters"], fixture_values=fixture_values
+                ),
                 "expected_status": 200,
             })
         success_steps.extend([
@@ -1831,7 +2868,78 @@ class TaskGenerationPipeline:
         )
 
     @staticmethod
-    def _normalize_executable_scenarios(scenarios: Any) -> list[dict[str, Any]]:
+    def _select_fixture_conversation(sessions: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """Choose the richest success-path conversation, excluding withdrawals."""
+        candidates = [
+            session.get("turns", []) for session in sessions
+            if isinstance(session, dict) and isinstance(session.get("turns"), list)
+        ]
+        if not candidates:
+            return []
+        active_candidates = [
+            turns for turns in candidates
+            if not TaskGenerationPipeline._conversation_withdraws_request(turns)
+        ]
+        if active_candidates:
+            candidates = active_candidates
+        else:
+            # A cancellation trajectory is useful for interaction coverage but
+            # cannot serve as the goal-success acceptance fixture.
+            return []
+        selected = max(
+            candidates,
+            key=lambda turns: sum(
+                len(str(turn.get("content", "")))
+                for turn in turns if isinstance(turn, dict) and turn.get("role") == "user"
+            ),
+        )
+        # Previous Agent turns are candidate answers, not evidence. Reusing
+        # them here can turn an early hallucination into acceptance truth.
+        return [
+            {"role": "user", "content": str(turn.get("content", ""))}
+            for turn in selected
+            if isinstance(turn, dict) and turn.get("role") == "user"
+        ]
+
+    @staticmethod
+    def _conversation_withdraws_request(turns: list[Any]) -> bool:
+        user_messages = [
+            str(turn.get("content", "")) for turn in turns
+            if isinstance(turn, dict) and turn.get("role") == "user"
+        ]
+        if not user_messages:
+            return False
+        tail = user_messages[-1].lower()
+        withdrawal_markers = (
+            "不用了", "不弄了", "先不做", "先不弄", "暂停", "取消",
+            "撤销", "改天再", "下次再", "以后再", "到此为止",
+            "never mind", "cancel", "stop here", "not now", "another time",
+        )
+        return any(marker in tail for marker in withdrawal_markers)
+
+    @staticmethod
+    def _compile_business_scenario_structure(
+        proposals: list[dict[str, Any]], baseline: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Models fill business calls; platform owns lifecycle and assertions."""
+        import copy
+        result = copy.deepcopy(baseline)
+        success = next((item for item in proposals if item.get("kind") == "goal_success"), None)
+        if success is None:
+            return result
+        calls = [copy.deepcopy(step) for step in success.get("steps", [])
+                 if isinstance(step, dict) and step.get("operation") == "tool_call"]
+        compiled = next(item for item in result if item.get("kind") == "goal_success")
+        for index, step in enumerate(calls):
+            step["step_id"] = f"business_tool_{index + 1}"
+            step["expected_status"] = 200
+        compiled["steps"] = [compiled["steps"][0], *calls, *compiled["steps"][-2:]]
+        return result
+
+    @staticmethod
+    def _normalize_executable_scenarios(
+        scenarios: Any, *, success_content: str = ""
+    ) -> list[dict[str, Any]]:
         """Canonicalize business scenario identity without changing its semantics."""
         if not isinstance(scenarios, list):
             return []
@@ -1883,6 +2991,19 @@ class TaskGenerationPipeline:
                 unique_id = f"{base_id}_{suffix}"
                 suffix += 1
             item["scenario_id"] = unique_id
+            if kind == "goal_success" and success_content.strip():
+                steps = item.get("steps")
+                if isinstance(steps, list):
+                    for step in steps:
+                        if (
+                            isinstance(step, dict)
+                            and step.get("operation") == "agent_response"
+                            and (
+                                not isinstance(step.get("content"), str)
+                                or not step["content"].strip()
+                            )
+                        ):
+                            step["content"] = success_content.strip()
             used_ids.add(unique_id)
             normalized.append(item)
         return normalized
@@ -1936,6 +3057,48 @@ class TaskGenerationPipeline:
                 f"noise audit must cover every noise tool; missing={sorted(noise_names - seen)}"
             )
         return unsafe
+
+    @staticmethod
+    def _validate_noise_tool_safety(tools: list[Any]) -> None:
+        """Noise tools must not claim real-world writes the shared runtime cannot perform."""
+        mutation_name_prefixes = (
+            "book_", "reserve_", "create_", "update_", "delete_", "submit_", "send_",
+            "purchase_", "order_",
+        )
+        read_only_name_prefixes = (
+            "search_", "lookup_", "get_", "list_", "find_", "estimate_",
+            "calculate_", "check_", "convert_", "preview_", "inspect_",
+        )
+        embedded_mutation_name = re.compile(
+            r"(?:^|_)(?:book|reserve|create|update|delete|submit|send|purchase|order)(?:_|$)"
+        )
+        # Descriptions often mention read-only fields such as "booking status" or
+        # "预订信息".  Match an explicit operation claim instead of rejecting any
+        # occurrence of a mutation-related noun.
+        mutation_description_patterns = (
+            r"\b(?:book|reserve|create|update|delete|submit|send|purchase|order)s?\b"
+            r"\s+(?:a|an|the|new|user|customer|external|real-world)?\s*"
+            r"(?:booking|reservation|record|request|message|email|order|purchase|resource)",
+            r"(?:执行|进行|发起|完成)(?:实际|外部|真实)?"
+            r"(?:预订|预约|创建|修改|更新|删除|提交|发送|购买|下单)",
+            r"(?:预订|预约|创建|修改|更新|删除|提交|发送|购买|下单)"
+            r"(?:场地|座位|记录|请求|消息|邮件|订单|商品|资源)",
+        )
+        for tool in tools:
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = str(function.get("name", "")).lower()
+            description = str(function.get("description", "")).lower()
+            if name.startswith(read_only_name_prefixes) and not embedded_mutation_name.search(name):
+                claims_mutation = False
+            else:
+                claims_mutation = name.startswith(mutation_name_prefixes) or any(
+                    re.search(pattern, description, re.I)
+                    for pattern in mutation_description_patterns
+                )
+            if claims_mutation:
+                raise PipelineGenerationError(
+                    f"noise tool {function.get('name')} claims a side effect; use a read-only distractor"
+                )
 
     @staticmethod
     def _fallback_noise_tool(
@@ -2103,6 +3266,7 @@ class TaskGenerationPipeline:
                     "SandboxApplication",
                     "ContractToolRegistry",
                     "ContractRewardAggregator",
+                    "ContractRewardGate",
                     "DeclarativeMetricEvaluator",
                     "AcceptanceScenarioRunner",
                     "ContractUserSimulator",
@@ -2217,6 +3381,10 @@ class TaskGenerationPipeline:
                         "properties": {
                             "user_query": {"type": "string", "description": "模拟用户生成的自然语言查询。"},
                             "should_end": {"type": "boolean", "description": "用户是否停止继续提问。"},
+                            "match_status": {"type": "string", "description": "实时对话为 matched、unmatched 或 ambiguous。"},
+                            "outcome_category": {"type": "string", "description": "固定的八类对话结果之一。"},
+                            "reason_code": {"type": "string", "description": "分支匹配或恢复原因。"},
+                            "termination_reason": {"type": "string", "description": "结束时为 completed 或 unresolved_dialogue。"},
                         },
                         "required": ["user_query", "should_end"],
                         "additionalProperties": False,
@@ -2280,7 +3448,7 @@ class TaskGenerationPipeline:
         shared_runtime = interface.get("shared_runtime")
         required_shared = {
             "EpisodeStore", "ManifestDataStore", "DeclarativeToolCompiler", "SandboxApplication", "ContractToolRegistry",
-            "ContractRewardAggregator", "DeclarativeMetricEvaluator", "AcceptanceScenarioRunner", "ContractUserSimulator",
+            "ContractRewardAggregator", "ContractRewardGate", "DeclarativeMetricEvaluator", "AcceptanceScenarioRunner", "ContractUserSimulator",
             "validate_json_schema"
         }
         if (
@@ -2424,12 +3592,124 @@ class TaskGenerationPipeline:
             names.add(name)
 
     @staticmethod
-    def _validate_capability_plan(capabilities: list[Any], actions: list[Any]) -> None:
+    def _deterministic_actions(
+        *, task_description: dict[str, Any], keywords: list[str], environment_mode: str
+    ) -> list[dict[str, Any]]:
+        """Build a minimal grounded plan after repeated action-model drift."""
+        relevant = TaskGenerationPipeline._task_relevant_keywords(
+            task_description, keywords
+        )
+        subject = relevant[0] if relevant else str(task_description.get("task", "任务"))[:16]
+        actions: list[dict[str, Any]] = []
+
+        def action(name: str, description: str, output: str) -> dict[str, Any]:
+            return {
+                "name": name,
+                "description": description,
+                "atomicity_rationale": "该动作只完成一个明确阶段，不合并后续判断或表达。",
+                "inputs": [{"name": "task_input", "description": "用户提供的任务输入与约束。"}],
+                "outputs": [{"name": output, "description": f"完成{name}后得到的可验证结果。"}],
+                "preconditions": ["已获得当前阶段所需输入。"],
+                "effects": [f"产生{output}，不引入任务外事实。"],
+            }
+
+        if environment_mode in {"reference_data", "stateful"}:
+            actions.append(action(
+                f"读取{subject}任务数据", f"读取沙箱中与{subject}任务直接相关的记录。", "task_records"
+            ))
+        elif environment_mode == "external_capability":
+            actions.append(action(
+                f"查询{subject}外部信息", f"通过声明的外部能力获取与{subject}直接相关的信息。", "external_facts"
+            ))
+        actions.extend([
+            action(f"分析{subject}任务输入", f"依据任务约束分析与{subject}相关的输入。", "analysis_result"),
+            action(f"生成{subject}任务结果", f"根据已验证信息完成{subject}任务并遵守输出格式。", "final_result"),
+        ])
+        return actions
+
+    @staticmethod
+    def _ensure_data_access_action(
+        actions: list[Any], *, environment_mode: str, table_names: list[str]
+    ) -> list[Any]:
+        """Add a stable read boundary when a data-backed task omitted one."""
+        if environment_mode not in {"reference_data", "stateful"} or not table_names:
+            return actions
+        chinese_markers = ("读取", "查询", "检索", "查找", "获取")
+        english_pattern = re.compile(r"\b(?:read|query|search|lookup|get)\b", re.I)
+        if any(
+            isinstance(action, dict)
+            and (
+                any(marker in f"{action.get('name', '')} {action.get('description', '')}" for marker in chinese_markers)
+                or english_pattern.search(f"{action.get('name', '')} {action.get('description', '')}")
+            )
+            for action in actions
+        ):
+            return actions
+        name = "读取任务参考数据"
+        used = {str(action.get("name")) for action in actions if isinstance(action, dict)}
+        suffix = 2
+        while name in used:
+            name = f"读取任务参考数据{suffix}"
+            suffix += 1
+        return [
+            {
+                "name": name,
+                "description": f"从沙箱只读数据表中获取完成任务所需的记录：{', '.join(table_names)}。",
+                "atomicity_rationale": "该动作仅负责读取环境事实，不进行比较、决策或最终回答。",
+                "inputs": [{"name": "query", "description": "用户目标和筛选条件"}],
+                "outputs": [{"name": "records", "description": "与任务相关的只读业务记录"}],
+                "preconditions": ["沙箱参考数据已初始化"],
+                "effects": ["向 Agent 提供可验证的环境事实，不修改业务状态"],
+            },
+            *actions,
+        ]
+
+    @staticmethod
+    def _normalize_data_access_capabilities(
+        capabilities: list[Any], *, actions: list[Any], environment_mode: str
+    ) -> list[Any]:
+        if environment_mode not in {"reference_data", "stateful"}:
+            return capabilities
+        action_text = {
+            str(action.get("name")): f"{action.get('name', '')} {action.get('description', '')}"
+            for action in actions if isinstance(action, dict)
+        }
+        chinese_markers = ("读取", "查询", "检索", "查找", "获取")
+        english_pattern = re.compile(r"\b(?:read|query|search|lookup|get)\b", re.I)
+        normalized: list[Any] = []
+        for capability in capabilities:
+            if not isinstance(capability, dict):
+                normalized.append(capability)
+                continue
+            item = dict(capability)
+            text = action_text.get(str(item.get("action_name")), "")
+            if any(marker in text for marker in chinese_markers) or english_pattern.search(text):
+                item["kind"] = "environment_operation"
+                item["requires_tool"] = True
+                if not isinstance(item.get("reason"), str) or not item["reason"].strip():
+                    item["reason"] = "该动作必须读取沙箱中的参考或业务数据。"
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _validate_capability_plan(
+        capabilities: list[Any],
+        actions: list[Any],
+        *,
+        environment_mode: str | None = None,
+        has_business_data: bool = False,
+        training_category: str | None = None,
+    ) -> None:
         action_names = {
             action.get("name") for action in actions
             if isinstance(action, dict) and isinstance(action.get("name"), str)
         }
         seen: set[str] = set()
+        response_markers = (
+            "生成markdown", "生成表格", "格式化", "输出最终", "生成最终",
+            "生成推荐", "生成说明", "撰写", "总结", "generate markdown",
+            "format output", "final response", "write summary",
+        )
         for index, capability in enumerate(capabilities):
             if not isinstance(capability, dict):
                 raise PipelineGenerationError(f"capabilities[{index}] must be an object")
@@ -2444,12 +3724,483 @@ class TaskGenerationPipeline:
                 raise PipelineGenerationError(f"capabilities[{index}] requires boolean requires_tool")
             if requires_tool != (kind == "environment_operation"):
                 raise PipelineGenerationError(f"capabilities[{index}] kind/requires_tool conflict")
+            if requires_tool and any(marker in str(action_name).lower() for marker in response_markers):
+                raise PipelineGenerationError(
+                    f"capabilities[{index}] delegates response composition to a tool"
+                )
             if not isinstance(capability.get("reason"), str) or not capability["reason"].strip():
                 raise PipelineGenerationError(f"capabilities[{index}] requires reason")
             seen.add(action_name)
         if seen != action_names:
             missing = sorted(action_names - seen)
             raise PipelineGenerationError(f"capability plan must cover every action; missing={missing}")
+        environment_actions = {item["action_name"] for item in capabilities if item["requires_tool"]}
+        dependency_graph = {}
+        for item in capabilities:
+            dependencies = item.get("dependencies", [])
+            if not isinstance(dependencies, list) or any(not isinstance(name, str) or name not in action_names for name in dependencies):
+                raise PipelineGenerationError("capability dependencies must reference known action names")
+            dependency_graph[item["action_name"]] = set(dependencies)
+        remaining = set(dependency_graph)
+        while remaining:
+            roots = {name for name in remaining if not dependency_graph[name] & remaining}
+            if not roots:
+                raise PipelineGenerationError("capability dependency graph contains a cycle")
+            remaining -= roots
+        if training_category == "multi_step_agentic" and not any(
+            dependency_graph[name] & environment_actions for name in environment_actions
+        ):
+            raise PipelineGenerationError("multi_step_agentic capability plan requires a real environment-action dependency; declare dependencies using action names, not reward step IDs")
+        if environment_mode in {"reference_data", "stateful"} and has_business_data and not any(
+            isinstance(item, dict) and item.get("requires_tool") is True
+            for item in capabilities
+        ):
+            raise PipelineGenerationError(
+                "capability plan for a data-backed environment must expose at least one data access operation"
+            )
+
+    @staticmethod
+    def _validate_data_grounding_audit(audit: Any) -> None:
+        if not isinstance(audit, dict):
+            raise PipelineGenerationError("environment data grounding audit must be an object")
+        fields = ("task_supported", "decision_determinate", "facts_consistent")
+        if any(not isinstance(audit.get(field), bool) for field in fields):
+            raise PipelineGenerationError(
+                "environment data grounding audit requires boolean verdicts"
+            )
+        issues = audit.get("issues")
+        if not isinstance(issues, list) or any(
+            not isinstance(issue, str) or not issue.strip() for issue in issues
+        ):
+            raise PipelineGenerationError(
+                "environment data grounding audit requires a list of issue strings"
+            )
+        failed = [field for field in fields if audit[field] is False]
+        if failed:
+            detail = "; ".join(issues) if issues else "no details supplied"
+            raise PipelineGenerationError(
+                f"environment data does not ground the task: failed={failed}; issues={detail}"
+            )
+
+    @staticmethod
+    def _validate_task_grounding_audit(audit: Any) -> None:
+        if not isinstance(audit, dict):
+            raise PipelineGenerationError("task grounding audit must be an object")
+        fields = (
+            "self_contained", "no_unprovided_facts",
+            "expected_result_derivable", "internally_consistent",
+        )
+        if any(not isinstance(audit.get(field), bool) for field in fields):
+            raise PipelineGenerationError("task grounding audit requires boolean verdicts")
+        issues = audit.get("issues")
+        if not isinstance(issues, list) or any(
+            not isinstance(issue, str) or not issue.strip() for issue in issues
+        ):
+            raise PipelineGenerationError("task grounding audit requires issue strings")
+        failed = [field for field in fields if audit[field] is False]
+        if failed:
+            detail = "; ".join(issues) if issues else "no details supplied"
+            raise PipelineGenerationError(
+                f"task description is not grounded: failed={failed}; issues={detail}"
+            )
+
+    @staticmethod
+    def _validate_task_description_consistency(description: Any) -> None:
+        """Catch high-signal cross-field task contamination deterministically."""
+        if not isinstance(description, dict):
+            raise PipelineGenerationError("task description must be an object")
+        task = str(description.get("task", "")).lower()
+        requirements = description.get("requirements", {})
+        if not isinstance(requirements, dict):
+            return
+        requirement_text = json.dumps(requirements, ensure_ascii=False).lower()
+        list_contract = (
+            "sort_within_category" in requirements
+            or isinstance(requirements.get("categories"), list)
+            or "购物清单" in requirement_text
+        )
+        list_task_markers = ("清单", "列表", "分类", "归类", "整理", "排序", "采购")
+        if list_contract and not any(marker in task for marker in list_task_markers):
+            raise PipelineGenerationError(
+                "task requirements define a categorized/sorted list but task asks for a different deliverable"
+            )
+        if requirements.get("candidate_list_required") is True and not any(
+            marker in task for marker in ("用户提供", "给定", "候选", "输入")
+        ):
+            raise PipelineGenerationError(
+                "task must disclose that a required candidate list is supplied at runtime"
+            )
+        cooking_markers = ("煎煮", "烹饪", "火候", "菜谱", "食谱", "煮一锅")
+        if any(marker in task for marker in cooking_markers) and "购物清单" in requirement_text:
+            raise PipelineGenerationError(
+                "cooking task is contaminated by a shopping-list output contract"
+            )
+        if any(marker in task for marker in ("代码", "编程", "脚本", "模型实现")) and any(
+            marker in requirement_text for marker in ("活动方案", "视频会议", "参与规则", "人员分工")
+        ):
+            raise PipelineGenerationError(
+                "coding or model-implementation task is contaminated by an event activity contract"
+            )
+        domain_groups = {
+            "commerce": ("销售", "商品", "折扣", "单价", "销量", "收入", "订单"),
+            "health": ("症状", "颤抖", "震颤", "患者", "诊断", "治疗"),
+            "event": ("活动", "会议", "场地", "参与者", "议程"),
+            "network": ("路由器", "网络", "断网", "日志", "连接"),
+            "food": ("菜品", "火腿", "罐头", "食材", "小吃", "餐"),
+            "architecture": ("街墙", "建筑", "墙面", "园林", "街道界面"),
+        }
+        task_domains = {
+            name for name, markers in domain_groups.items()
+            if any(marker in task for marker in markers)
+        }
+        requirement_domains = {
+            name for name, markers in domain_groups.items()
+            if sum(marker in requirement_text for marker in markers) >= 2
+        }
+        if task_domains and requirement_domains and task_domains.isdisjoint(requirement_domains):
+            raise PipelineGenerationError(
+                "task and requirements describe different business domains"
+            )
+        if description.get("task_intent") == "compare" and {"food", "architecture"} <= task_domains:
+            raise PipelineGenerationError(
+                "comparison combines unrelated food and architecture objects"
+            )
+        if "普通话" in task and "重音" in task and "规则" not in f"{task} {requirement_text}":
+            raise PipelineGenerationError(
+                "Mandarin stress classification requires an explicit rule or reference contract"
+            )
+
+    @staticmethod
+    def _validate_action_alignment_audit(audit: Any) -> None:
+        if not isinstance(audit, dict):
+            raise PipelineGenerationError("agent action audit must be an object")
+        fields = ("aligned", "complete", "atomic")
+        if any(not isinstance(audit.get(field), bool) for field in fields):
+            raise PipelineGenerationError("agent action audit requires boolean verdicts")
+        issues = audit.get("issues")
+        if not isinstance(issues, list) or any(
+            not isinstance(issue, str) or not issue.strip() for issue in issues
+        ):
+            raise PipelineGenerationError("agent action audit requires issue strings")
+        failed = [field for field in fields if audit[field] is False]
+        if failed:
+            detail = "; ".join(issues) if issues else "no details supplied"
+            raise PipelineGenerationError(
+                f"agent actions are not task-aligned: failed={failed}; issues={detail}"
+            )
+
+    @staticmethod
+    def _validate_action_grounding(
+        actions: list[Any], *, task_description: dict[str, Any], keywords: list[str]
+    ) -> None:
+        """Reject action plans that import entities or numbers from another task."""
+        task_text = json.dumps(task_description, ensure_ascii=False).lower()
+        action_core = []
+        for item in actions:
+            if not isinstance(item, dict):
+                continue
+            action_core.append({
+                "name": item.get("name"),
+                "description": item.get("description"),
+                "outputs": item.get("outputs", []),
+                "effects": item.get("effects", []),
+            })
+        action_text = json.dumps(action_core, ensure_ascii=False).lower()
+        relevant_keywords = [
+            str(keyword).strip().lower() for keyword in keywords
+            if len(str(keyword).strip()) >= 2 and str(keyword).strip().lower() in task_text
+        ]
+        if relevant_keywords and not any(keyword in action_text for keyword in relevant_keywords):
+            raise PipelineGenerationError(
+                "agent actions omit every task-specific keyword and may belong to another task"
+            )
+        imported_domains = [
+            marker for marker in CROSS_TASK_DOMAIN_MARKERS
+            if marker.lower() in action_text and marker.lower() not in task_text
+        ]
+        if imported_domains:
+            raise PipelineGenerationError(
+                f"agent actions import cross-task domain concepts absent from the task: {imported_domains}"
+            )
+        action_names = [
+            str(item.get("name", "")).strip() for item in actions if isinstance(item, dict)
+        ]
+        generic_count = sum(
+            name in GENERIC_ACTION_NAMES
+            or any(marker.lower() in name.lower() for marker in GENERIC_ACTION_MARKERS)
+            for name in action_names
+        )
+        if action_names and generic_count * 2 >= len(action_names):
+            raise PipelineGenerationError(
+                "agent actions are predominantly generic placeholders instead of task-specific steps"
+            )
+        allowed_numbers = set(re.findall(r"\d+(?:\.\d+)?", task_text))
+        action_numbers = set(re.findall(r"\d+(?:\.\d+)?", action_text))
+        invented = sorted(action_numbers - allowed_numbers)
+        if invented:
+            raise PipelineGenerationError(
+                f"agent actions invent numeric constraints absent from the task: {invented}"
+            )
+
+    @staticmethod
+    def _normalize_action_numeric_examples(
+        actions: list[Any], *, task_description: dict[str, Any]
+    ) -> list[Any]:
+        """Remove model-invented example numbers without changing action structure."""
+        allowed = set(re.findall(
+            r"\d+(?:\.\d+)?", json.dumps(task_description, ensure_ascii=False)
+        ))
+
+        def clean(value: Any) -> Any:
+            if isinstance(value, str):
+                return re.sub(
+                    r"\d+(?:\.\d+)?",
+                    lambda match: match.group(0) if match.group(0) in allowed else "用户提供值",
+                    value,
+                )
+            if isinstance(value, list):
+                return [clean(item) for item in value]
+            if isinstance(value, dict):
+                return {key: (item if key == "name" else clean(item)) for key, item in value.items()}
+            return value
+
+        return [clean(action) for action in actions]
+
+    @staticmethod
+    def _task_relevant_keywords(
+        task_description: dict[str, Any], keywords: list[str]
+    ) -> list[str]:
+        task_text = json.dumps(task_description, ensure_ascii=False).lower()
+        return [
+            str(keyword).strip().lower() for keyword in keywords
+            if len(str(keyword).strip()) >= 2 and str(keyword).strip().lower() in task_text
+        ]
+
+    @staticmethod
+    def _validate_data_keyword_alignment(
+        data_tables: list[Any], *, task_description: dict[str, Any], keywords: list[str]
+    ) -> None:
+        """Keep generated business fixtures in the task's semantic domain."""
+        relevant = TaskGenerationPipeline._task_relevant_keywords(
+            task_description, keywords
+        )
+        if not relevant or not data_tables:
+            return
+        data_text = json.dumps(data_tables, ensure_ascii=False).lower()
+        if not any(keyword in data_text for keyword in relevant):
+            raise PipelineGenerationError(
+                "environment data omits every task-specific keyword and may belong to another task"
+            )
+
+    @staticmethod
+    def _validate_stateful_preconditions(
+        data_tables: list[Any], *, task_description: dict[str, Any], environment_mode: str
+    ) -> None:
+        """Reject baselines that already contain an explicitly requested end state."""
+        if environment_mode != "stateful":
+            return
+        task_text = json.dumps(task_description, ensure_ascii=False)
+        changes = re.findall(
+            r"从\s*[“\"]([^”\"]+)[”\"]\s*(?:更正|修改|更新|调整|改|变更)?\s*为\s*[“\"]([^”\"]+)[”\"]",
+            task_text,
+        )
+        if not changes:
+            return
+        rows_text = json.dumps(data_tables, ensure_ascii=False)
+        missing_old = [old for old, _new in changes if old not in rows_text]
+        if missing_old:
+            raise PipelineGenerationError(
+                "stateful baseline omits explicit precondition value(s): "
+                + ", ".join(sorted(set(missing_old)))
+            )
+
+    @staticmethod
+    def _validate_training_contract_consistency(
+        *,
+        task_description: dict[str, Any],
+        training_contract: dict[str, Any],
+        keywords: list[str],
+        environment_mode: str,
+        data_tables: list[Any],
+        actions: list[Any],
+        tools: list[Any],
+        tool_bindings: list[Any],
+        metrics: list[Any],
+        success_fixture: str,
+    ) -> None:
+        """Final cross-stage gate before an artifact is marked training-ready."""
+        category = training_contract.get("category")
+        allowed_modes = training_contract.get("allowed_environment_modes", [])
+        if environment_mode not in allowed_modes:
+            raise PipelineGenerationError(
+                f"final consistency: {category} does not allow environment mode {environment_mode}"
+            )
+        TaskGenerationPipeline._validate_task_description_consistency(task_description)
+        task_text = json.dumps(task_description, ensure_ascii=False).lower()
+        action_text = json.dumps(actions, ensure_ascii=False).lower()
+        if environment_mode == "stateless" and any(
+            marker in task_text for marker in ("用户提供", "给定的", "provided")
+        ) and any(
+            marker in action_text for marker in ("生成候选列表", "创建候选列表", "invent candidates")
+        ):
+            raise PipelineGenerationError(
+                "final consistency: stateless actions invent candidates instead of using user input"
+            )
+        TaskGenerationPipeline._validate_action_grounding(
+            actions, task_description=task_description, keywords=keywords
+        )
+        if environment_mode in {"reference_data", "stateful"}:
+            TaskGenerationPipeline._validate_data_keyword_alignment(
+                data_tables, task_description=task_description, keywords=keywords
+            )
+        tool_names = {
+            item.get("function", {}).get("name") for item in tools
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+        }
+        action_names = {
+            item.get("name") for item in actions if isinstance(item, dict)
+        }
+        for binding in tool_bindings:
+            if not isinstance(binding, dict):
+                raise PipelineGenerationError("final consistency: invalid tool binding")
+            if binding.get("tool_name") not in tool_names or binding.get("action_name") not in action_names:
+                raise PipelineGenerationError(
+                    "final consistency: tool binding references an unknown tool or action"
+                )
+        bounds = training_contract.get("business_tools", {})
+        count = len(tool_bindings)
+        minimum, maximum = bounds.get("min", 0), bounds.get("max")
+        if count < minimum or (maximum is not None and count > maximum):
+            raise PipelineGenerationError(
+                f"final consistency: {category} business tool count {count} violates [{minimum}, {maximum}]"
+            )
+        if not isinstance(metrics, list) or not metrics:
+            raise PipelineGenerationError("final consistency: task has no reward metrics")
+        TaskGenerationPipeline._validate_success_fixture_constraints(
+            success_fixture, task_description=task_description
+        )
+
+    @staticmethod
+    def _validate_task_generation_scope(
+        task_description: dict[str, Any], *, graph_context: dict[str, Any]
+    ) -> None:
+        text = json.dumps(task_description, ensure_ascii=False).lower()
+        chain_of_thought_markers = (
+            "思考过程", "推理过程", "内心推理", "逐步思考",
+            "chain of thought", "hidden reasoning", "show your reasoning",
+        )
+        if any(marker in text for marker in chain_of_thought_markers):
+            raise PipelineGenerationError(
+                "task must request concise rationale, not hidden chain-of-thought"
+            )
+        if any(marker in text for marker in HIGH_STAKES_MARKERS):
+            evidence = json.dumps(graph_context, ensure_ascii=False)
+            if not re.search(r"https?://[^\s\"']+", evidence, re.I):
+                raise PipelineGenerationError(
+                    "high-stakes task requires authoritative source URLs in graph_context"
+                )
+
+    @staticmethod
+    def _normalize_reasoning_request(value: Any) -> Any:
+        """Rewrite requests for hidden reasoning into an observable short rationale."""
+        replacements = (
+            ("逐步思考", "给出简要依据"), ("思考过程", "简要依据"),
+            ("推理过程", "简要依据"), ("内心推理", "简要依据"),
+            ("chain of thought", "concise rationale"),
+            ("hidden reasoning", "concise rationale"),
+            ("show your reasoning", "give a concise rationale"),
+        )
+        if isinstance(value, str):
+            result = value
+            for old, new in replacements:
+                result = re.sub(re.escape(old), new, result, flags=re.I)
+            return result
+        if isinstance(value, list):
+            return [TaskGenerationPipeline._normalize_reasoning_request(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: TaskGenerationPipeline._normalize_reasoning_request(item)
+                for key, item in value.items()
+            }
+        return value
+
+    @staticmethod
+    def _unwrap_task_description(value: dict[str, Any]) -> dict[str, Any]:
+        """Accept common repair envelopes while keeping one canonical shape."""
+        if isinstance(value.get("output"), dict) and isinstance(value["output"].get("task"), str):
+            return value["output"]
+        if isinstance(value.get("task_description"), dict) and isinstance(
+            value["task_description"].get("task"), str
+        ):
+            return value["task_description"]
+        return value
+
+    @staticmethod
+    def _deterministic_low_risk_task(task_intent: str) -> dict[str, Any]:
+        """Provide a safe task when source keywords repeatedly force unsafe topics."""
+        task_by_intent = {
+            "query": "根据用户提供的物品清单和筛选条件，找出符合条件的条目并以表格返回。",
+            "recommend": "根据用户提供的候选书籍、偏好和限制，推荐最合适的一项并说明依据。",
+            "compare": "根据用户提供的两个方案及评价字段，逐项比较差异并总结适用场景。",
+            "plan": "根据用户提供的目标、可用时间和限制条件，制定一份可执行的活动计划。",
+            "summarize": "将用户提供的会议记录整理为简洁摘要、决定事项和待办清单。",
+            "create": "根据用户提供的主题、目标受众、语气、必含信息和字数上限，创建一份结构清晰的文本草稿；缺失关键字段时先请求补充。",
+            "extract": "从用户提供的文本中提取指定字段；缺失字段明确标记为未提供。",
+            "classify": "按照用户提供的分类标签和规则，对输入条目分类并说明对应规则。",
+            "validate": "按照用户提供的检查规则验证输入记录，列出通过项和未通过项。",
+            "audit": "按照用户提供的完整性规则审查一组记录，并输出问题清单。",
+            "calculate": "根据用户提供的数值、单位和公式完成计算，并展示可复核步骤。",
+            "estimate": "根据用户提供的基础数据和假设进行区间估算，并说明不确定性。",
+            "schedule": "根据用户提供的事项、时长、先后约束和可用时间生成日程。",
+            "monitor": "根据用户提供的状态记录汇总当前状态、变化和待关注事项。",
+            "diagnose": "根据用户提供的家用设备类型、故障现象、最近变更和日志片段，按证据列出可能原因、验证步骤和停止条件；信息不足时先请求补充。",
+            "troubleshoot": "根据用户提供的设备现象和日志，整理排查顺序及验证方法。",
+            "transform": "将用户提供的文本转换为指定格式，且不增加原文没有的事实。",
+            "decide": "根据用户提供的候选项、约束和评价规则，选择一项并说明依据。",
+            "simulate": "根据用户提供的初始值、规则和参数模拟结果，并列明假设条件。",
+            "explain": "根据用户提供的材料，用通俗语言解释其中的概念和关系。",
+            "modify": "按照用户提供的修改规则改写文本，并简要列出所做修改。",
+        }
+        task = task_by_intent.get(
+            task_intent,
+            "根据用户提供的文本和明确要求完成处理；信息不足时先请求补充。",
+        )
+        return {
+            "task": task,
+            "task_intent": task_intent,
+            "goal": task,
+            "context": ["所有事实、数值和判断规则均由用户在运行时提供。"],
+            "expected_result": "给出严格基于用户输入、格式清晰且可复核的结果。",
+            "complexity": "simple",
+            "requirements": {
+                "input_modalities": ["text", "structured_data"],
+                "output_format": "Markdown",
+                "clarification_allowed": True,
+                "constraints": ["不得补充用户未提供的事实。"],
+            },
+        }
+
+    @staticmethod
+    def _unwrap_structured_output(
+        value: Any, *, expected_fields: set[str]
+    ) -> Any:
+        """Unwrap common model response envelopes without weakening validation."""
+        current = value
+        for _ in range(3):
+            if not isinstance(current, dict):
+                break
+            if expected_fields.issubset(current):
+                return current
+            nested = current.get("output")
+            if isinstance(nested, str):
+                try:
+                    nested = json.loads(nested)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    break
+            if not isinstance(nested, dict):
+                break
+            current = nested
+        return current
 
     @staticmethod
     def _resolve_environment_plan(
@@ -2458,23 +4209,109 @@ class TaskGenerationPipeline:
         modes = {"stateless", "reference_data", "stateful", "external_capability"}
         value = dict(candidate) if isinstance(candidate, dict) else {}
         mode = value.get("mode")
+        fallback_reason: str | None = None
+        aliases = {
+            "none": "stateless", "no_data": "stateless",
+            "no_business_data": "stateless", "text_only": "stateless",
+            "pure_text": "stateless", "无状态": "stateless", "纯文本": "stateless",
+            "reference": "reference_data", "read_only": "reference_data",
+            "readonly": "reference_data", "read_only_data": "reference_data",
+            "只读数据": "reference_data", "参考数据": "reference_data",
+            "persistent": "stateful", "persistence": "stateful",
+            "business_state": "stateful", "有状态": "stateful", "持久化": "stateful",
+            "external": "external_capability", "external_tool": "external_capability",
+            "external_api": "external_capability", "外部能力": "external_capability",
+        }
+        if isinstance(mode, str):
+            normalized_mode = re.sub(r"[\s-]+", "_", mode.strip().lower())
+            mode = aliases.get(normalized_mode, normalized_mode)
         if mode not in modes:
-            raise PipelineGenerationError("environment_plan.mode is invalid")
-        task_text = " ".join(str(task_description.get(key, "")) for key in ("task", "goal", "expected_result"))
+            mode = TaskGenerationPipeline._infer_environment_mode(
+                task_description=task_description, task_intent=task_intent
+            )
+            fallback_reason = (
+                "模型返回了未知环境模式，已根据任务中明确的外部能力、持久化和只读资料需求"
+                "确定性选择最小必要环境。"
+            )
+            logger.warning(
+                "environment_plan.mode is invalid; using deterministic fallback: raw=%r resolved=%s",
+                value.get("mode"), mode,
+            )
+        inferred_mode = TaskGenerationPipeline._infer_environment_mode(
+            task_description=task_description, task_intent=task_intent
+        )
+        if mode == "stateless" and inferred_mode in {"external_capability", "reference_data"}:
+            mode = inferred_mode
+            fallback_reason = (
+                "任务需要可验证的外部或参考事实，已确定性升级为相应的数据环境。"
+            )
+            logger.warning(
+                "environment_plan understated external dependency; upgraded to external_capability"
+            )
+        task_text = " ".join(
+            str(task_description.get(key, ""))
+            for key in ("task", "goal", "expected_result", "context", "requirements")
+        )
         persistence_markers = (
             "写入", "保存", "持久化", "更新", "修改", "删除", "创建记录", "提交订单",
             "数据库", "审批", "排程", "预订", "write", "save", "persist", "update",
             "delete", "create record", "database", "approve", "schedule", "book",
         )
-        external_markers = ("天气", "实时", "联网", "搜索", "汇率", "weather", "search", "exchange rate")
+        external_markers = (
+            "天气", "实时", "当前市场", "目前市场", "最新", "联网", "搜索", "汇率",
+            "预估总价", "估算价格", "查询价格",
+            "weather", "current market", "latest", "search", "exchange rate",
+        )
         explicitly_persistent = any(marker in task_text.lower() for marker in persistence_markers)
         explicitly_external = any(marker in task_text.lower() for marker in external_markers)
+        runtime_candidates_supplied = any(
+            marker in task_text.lower()
+            for marker in (
+                "提供的规格", "提供的候选", "给定的候选", "给定选项", "两个方案",
+                "两款", "候选清单", "provided specifications", "given candidates",
+                "provided options", "two options",
+            )
+        ) or re.search(
+            r"(?:用户)?(?:明确)?提供的.{0,8}(?:候选|选项|列表|清单|规格|属性)",
+            task_text,
+        ) is not None
         stateless_intents = {"extract", "summarize", "classify", "transform", "explain"}
-        if task_intent in stateless_intents and not explicitly_persistent and not explicitly_external:
+        common_knowledge_explanation = (
+            task_intent == "explain"
+            and any(
+                marker in task_text.lower()
+                for marker in (
+                    "常见用途", "基本用途", "日常用途", "基本构造", "基本结构",
+                    "一般原理", "基础原理", "常见特点", "common uses",
+                    "basic structure", "basic principle",
+                )
+            )
+            and not any(
+                marker in task_text.lower()
+                for marker in (
+                    "历史", "来源", "出处", "资料", "记录", "数据", "文献",
+                    "权威", "给定", "提供的", "history", "source", "reference",
+                    "record", "data", "provided",
+                )
+            )
+        )
+        if (
+            task_intent in stateless_intents
+            and (inferred_mode == "stateless" or common_knowledge_explanation)
+            and not explicitly_persistent
+            and not explicitly_external
+        ):
+            mode = "stateless"
+        if (
+            task_intent in {"compare", "recommend", "decide"}
+            and runtime_candidates_supplied
+            and not explicitly_persistent
+            and not explicitly_external
+        ):
             mode = "stateless"
         requires_business_data = mode in {"reference_data", "stateful"}
         requires_persistence = mode == "stateful"
-        reason = value.get("reason")
+        reason = fallback_reason or value.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             reason = "由任务明确目标和预期结果推导运行时环境模式。"
         return {
@@ -2483,6 +4320,191 @@ class TaskGenerationPipeline:
             "requires_persistence": requires_persistence,
             "reason": reason.strip(),
         }
+
+    @staticmethod
+    def _infer_environment_mode(
+        *, task_description: dict[str, Any], task_intent: str
+    ) -> str:
+        """Conservatively infer a mode when the model emits an unknown label."""
+        text = " ".join(
+            str(task_description.get(key, ""))
+            for key in ("task", "goal", "expected_result", "context", "requirements")
+        ).lower()
+        external_markers = (
+            "实时天气", "实时汇率", "实时价格", "联网搜索", "网络搜索", "外部 api",
+            "当前市场", "目前市场", "最新", "最新列表", "最新名单", "公开查询", "公开可查", "官方网站", "官网查询",
+            "所属省级行政区", "行政区归属", "地名归属",
+            "预估总价", "估算价格", "查询价格",
+            "现行法律", "当前开放", "开放时间", "公共交通", "权威来源",
+            "weather forecast", "exchange rate", "web search", "external api",
+            "latest list", "current list", "official website", "publicly available",
+        )
+        persistence_markers = (
+            "写入数据库", "保存到", "持久化", "更新记录", "修改记录", "删除记录",
+            "创建记录", "提交订单", "审批申请", "预订", "写入日历",
+            "write to", "save to", "persist", "update record", "delete record",
+            "create record", "submit order", "book ",
+        )
+        reference_markers = (
+            "资料库", "知识库", "档案库", "商品目录", "内部文档", "业务记录中",
+            "训练计划", "锻炼计划", "运动计划", "康复计划", "疼痛", "伤病",
+            "reference data", "knowledge base", "catalog", "internal document",
+            "training plan", "exercise plan", "rehabilitation plan", "pain", "injury",
+        )
+        if any(marker in text for marker in external_markers):
+            return "external_capability"
+        if any(marker in text for marker in persistence_markers):
+            return "stateful"
+        if any(marker in text for marker in reference_markers):
+            return "reference_data"
+        if task_intent in {"recommend", "compare", "explain", "troubleshoot", "decide"}:
+            return "reference_data"
+        # A schedule/create/plan intent describes what the Agent produces, not
+        # whether the result must be persisted. Without an explicit state
+        # boundary, the minimal environment is stateless.
+        return "stateless"
+
+    @staticmethod
+    def _looks_like_dialogue_closure(message: str) -> bool:
+        text = re.sub(r"[\s！!。,.，~～]+", "", str(message)).lower()
+        closure_patterns = (
+            r"^(?:好的?|行|可以)(?:就这样|先这样|结束|没有其他|没别的)?(?:谢谢|感谢)?(?:你|您)?$",
+            r"^(?:完美|满意|可以了|够用了)(?:谢谢|感谢)?(?:你|您)?$",
+            r"^(?:谢谢|感谢)(?:你|您)?(?:的帮助|耐心解答|耐心解释)?$",
+            r"^(?:没有|没了|暂无|暂时没有)(?:其他|别的)?(?:问题|需求)?(?:了)?$",
+            r"^(?:确认)?结束(?:对话)?$",
+        )
+        return any(re.fullmatch(pattern, text) for pattern in closure_patterns)
+
+    @staticmethod
+    def _validate_success_fixture_audit(audit: Any) -> None:
+        if not isinstance(audit, dict):
+            raise PipelineGenerationError("success fixture audit must be an object")
+        fields = ("latest_instructions_satisfied", "grounded", "goal_completed")
+        if any(not isinstance(audit.get(field), bool) for field in fields):
+            raise PipelineGenerationError("success fixture audit requires boolean verdicts")
+        issues = audit.get("issues")
+        if not isinstance(issues, list) or any(
+            not isinstance(issue, str) or not issue.strip() for issue in issues
+        ):
+            raise PipelineGenerationError("success fixture audit requires issue strings")
+        failed = [field for field in fields if audit[field] is False]
+        if failed:
+            detail = "; ".join(issues) if issues else "no details supplied"
+            raise PipelineGenerationError(
+                f"success fixture is inconsistent: failed={failed}; issues={detail}"
+            )
+
+    @staticmethod
+    def _validate_success_fixture_constraints(
+        content: Any, *, task_description: dict[str, Any]
+    ) -> None:
+        """Enforce simple objective constraints without trusting an LLM judge."""
+        if not isinstance(content, str) or not content.strip():
+            raise PipelineGenerationError("success fixture content must be non-empty")
+        source = json.dumps(task_description, ensure_ascii=False)
+        compact = re.sub(r"\s+", "", content)
+        ranges = re.findall(r"(\d+)\s*[-–—~～至到]\s*(\d+)\s*(?:个)?字", source)
+        for lower_text, upper_text in ranges:
+            lower, upper = int(lower_text), int(upper_text)
+            if lower <= upper and not lower <= len(compact) <= upper:
+                raise PipelineGenerationError(
+                    f"success fixture length {len(compact)} violates required {lower}-{upper} characters"
+                )
+
+    @staticmethod
+    def _normalize_success_fixture_length(
+        content: str, *, task_description: dict[str, Any]
+    ) -> str:
+        """Deterministically trim an overlong fixture to an explicit char limit."""
+        if not isinstance(content, str):
+            return content
+        source = json.dumps(task_description, ensure_ascii=False)
+        ranges = re.findall(r"(\d+)\s*[-–—~～至到]\s*(\d+)\s*(?:个)?字", source)
+        upper_bounds = [int(upper) for lower, upper in ranges if int(lower) <= int(upper)]
+        if not upper_bounds:
+            return content.strip()
+        upper = min(upper_bounds)
+        if len(re.sub(r"\s+", "", content)) <= upper:
+            return content.strip()
+        kept: list[str] = []
+        count = 0
+        for char in content.strip():
+            if not char.isspace():
+                if count >= upper:
+                    break
+                count += 1
+            kept.append(char)
+        normalized = "".join(kept).rstrip()
+        logger.info(
+            "trimmed success fixture to explicit character limit: upper=%d", upper
+        )
+        return normalized
+
+    @staticmethod
+    def _validate_metric_constraint_grounding(
+        metrics: list[Any], *, task_description: dict[str, Any]
+    ) -> None:
+        """Reject thresholds invented by reward generation.
+
+        We inspect only human-facing metric semantics, deliberately excluding
+        weights, score ranges and score mappings which contain evaluator
+        mechanics rather than task requirements.
+        """
+        task_text = json.dumps(task_description, ensure_ascii=False)
+        allowed = set(re.findall(r"(?<![\w.])\d+(?:\.\d+)?", task_text))
+        for index, metric in enumerate(metrics):
+            if not isinstance(metric, dict):
+                continue
+            evaluator = metric.get("evaluator", {})
+            semantic_parts: list[str] = []
+            for key in ("rubric", "condition"):
+                if isinstance(metric.get(key), str):
+                    semantic_parts.append(metric[key])
+            criteria = metric.get("criteria")
+            if isinstance(criteria, list):
+                semantic_parts.extend(item for item in criteria if isinstance(item, str))
+            if isinstance(evaluator, dict):
+                for key in ("assertion", "criteria"):
+                    value = evaluator.get(key)
+                    if isinstance(value, str):
+                        semantic_parts.append(value)
+                    elif isinstance(value, list):
+                        semantic_parts.extend(item for item in value if isinstance(item, str))
+            mentioned = set(re.findall(
+                r"(?<![\w.])\d+(?:\.\d+)?", " ".join(semantic_parts)
+            ))
+            # Zero and one frequently express boolean/control-state assertions
+            # (for example count == 0 or completed == 1), not user-facing
+            # quantitative requirements. Treat them as evaluator mechanics.
+            invented = sorted(
+                number for number in mentioned
+                if number not in allowed and number not in {"0", "1"}
+            )
+            if invented:
+                raise PipelineGenerationError(
+                    f"metrics[{index}] invents numeric constraints absent from the task: {invented}"
+                )
+
+    @classmethod
+    def _drop_ungrounded_numeric_metrics(
+        cls, metrics: list[Any], *, task_description: dict[str, Any]
+    ) -> list[Any]:
+        """Discard isolated reward thresholds invented by the model."""
+        retained: list[Any] = []
+        for metric in metrics:
+            try:
+                cls._validate_metric_constraint_grounding(
+                    [metric], task_description=task_description
+                )
+            except PipelineGenerationError as exc:
+                logger.warning(
+                    "discarding metric with ungrounded numeric constraint: metric=%s error=%s",
+                    metric.get("id") if isinstance(metric, dict) else None, exc,
+                )
+                continue
+            retained.append(metric)
+        return retained
 
     @staticmethod
     def _derive_complexity(
@@ -2505,6 +4527,124 @@ class TaskGenerationPipeline:
         return "single_step_tool_use"
 
     @staticmethod
+    def _requires_file_deliverable(task_description: dict[str, Any]) -> bool:
+        """Detect tasks whose goal is an actual file, not merely textual content."""
+        requirements = task_description.get("requirements")
+        requirements = requirements if isinstance(requirements, dict) else {}
+        output_format = str(requirements.get("output_format", "")).lower()
+        text = " ".join(
+            str(task_description.get(key, ""))
+            for key in ("task", "goal", "expected_result")
+        ).lower()
+        text = f"{text} {output_format}"
+        file_markers = (
+            "pdf", "png", "jpg", "jpeg", "svg", "docx", "xlsx", "pptx",
+            "音频文件", "视频文件", "图片文件", "可打印文件", "生成文件",
+        )
+        return any(marker in text for marker in file_markers)
+
+    @staticmethod
+    def _validate_media_generation(
+        media_generation: dict[str, Any],
+        *,
+        input_media_required: bool,
+        deliverable_required: bool,
+        task_description: dict[str, Any],
+    ) -> None:
+        code = str(media_generation.get("code", ""))
+        lower = code.lower()
+        if deliverable_required and not media_generation.get("output_dir"):
+            raise PipelineGenerationError(
+                "file deliverable requires a non-empty media_generation.output_dir"
+            )
+        if deliverable_required:
+            requirements = task_description.get("requirements")
+            requirements = requirements if isinstance(requirements, dict) else {}
+            expected = str(requirements.get("output_format", "")).lower()
+            extensions = {
+                "pdf": ".pdf", "png": ".png", "jpg": ".jpg", "jpeg": ".jpeg",
+                "svg": ".svg", "docx": ".docx", "xlsx": ".xlsx", "pptx": ".pptx",
+            }
+            required_extensions = {
+                extension for label, extension in extensions.items() if label in expected
+            }
+            if required_extensions and not any(extension in lower for extension in required_extensions):
+                raise PipelineGenerationError(
+                    "media_generation code does not create the declared file format"
+                )
+        if input_media_required:
+            fabricated_markers = (
+                "模拟数据", "生成一个模拟", "mock data", "dummy data",
+                "placeholder data", "synthetic user", "假设最大", "示例数据：",
+            )
+            if any(marker in lower for marker in fabricated_markers):
+                raise PipelineGenerationError(
+                    "media_generation fabricates runtime user input; read inputs from arguments instead"
+                )
+            input_markers = (
+                "argparse", "sys.argv", "input_path", "input_file", "source_path",
+                "image_path", "file_path", "json.load", "csv.", "read_csv",
+                "image.open", "soundfile.read", "wave.open",
+            )
+            if not any(marker in lower for marker in input_markers):
+                raise PipelineGenerationError(
+                    "media_generation for user-provided media must read an explicit runtime input"
+                )
+
+    @staticmethod
+    def _validate_authoritative_source_schema(
+        *, task_description: dict[str, Any], table_definitions: list[Any]
+    ) -> None:
+        """Require traceable provenance for generated high-stakes reference facts."""
+        text = json.dumps(task_description, ensure_ascii=False).lower()
+        if not any(marker in text for marker in HIGH_STAKES_MARKERS):
+            return
+        column_names = {
+            str(column.get("name", "")).lower()
+            for table in table_definitions if isinstance(table, dict)
+            for column in table.get("columns", []) if isinstance(column, dict)
+        }
+        aliases = {
+            "source_url": {"source_url", "official_url", "url"},
+            "retrieved_at": {"retrieved_at", "accessed_at", "fetched_at"},
+            "content_hash": {"content_hash", "source_hash", "sha256"},
+        }
+        missing = [
+            canonical for canonical, names in aliases.items()
+            if not column_names.intersection(names)
+        ]
+        if missing:
+            raise PipelineGenerationError(
+                "authoritative reference data requires provenance columns: "
+                + ", ".join(missing)
+            )
+
+    @staticmethod
+    def _validate_authoritative_task_input(
+        *,
+        task_description: dict[str, Any],
+        environment_mode: str,
+        graph_context: dict[str, Any],
+    ) -> None:
+        """Do not let an LLM invent the source corpus for high-stakes lookup tasks."""
+        if environment_mode not in {"reference_data", "stateful"}:
+            return
+        text = json.dumps(task_description, ensure_ascii=False).lower()
+        high_stakes_markers = (
+            "法律", "法规", "法条", "政策文件", "合规", "医疗", "诊断", "用药",
+            "投资", "证券", "税务", "legal", "regulation", "medical", "diagnosis",
+            "investment", "tax",
+        )
+        if not any(marker in text for marker in high_stakes_markers):
+            return
+        evidence = json.dumps(graph_context, ensure_ascii=False)
+        if not re.search(r"https?://[^\s\"']+", evidence, re.I):
+            raise PipelineGenerationError(
+                "authoritative reference task requires source URLs in graph_context; "
+                "LLM-generated authority data is not allowed"
+            )
+
+    @staticmethod
     def _validate_task_readiness(
         *,
         capability_plan: list[Any],
@@ -2513,6 +4653,12 @@ class TaskGenerationPipeline:
         metrics: list[Any],
         metric_implementations: list[Any],
         business_scenarios: list[Any],
+        environment_mode: str = "stateless",
+        has_business_data: bool = False,
+        task_description: dict[str, Any] | None = None,
+        data_tables: list[Any] | None = None,
+        media_generation: dict[str, Any] | None = None,
+        success_fixture: str = "",
         require_noise: bool = True,
     ) -> None:
         eligible = {
@@ -2524,6 +4670,27 @@ class TaskGenerationPipeline:
         }
         if not bound <= eligible:
             raise PipelineGenerationError("task readiness: a tool delegates agent reasoning or response composition")
+        if environment_mode == "external_capability" and not bound:
+            raise PipelineGenerationError(
+                "task readiness: external-capability task exposes no business tool"
+            )
+        if environment_mode in {"reference_data", "stateful"} and has_business_data and not bound:
+            raise PipelineGenerationError(
+                "task readiness: data-backed task exposes no business data access tool"
+            )
+        if environment_mode == "reference_data":
+            leaked = [
+                metric.get("id") for metric in metrics
+                if isinstance(metric, dict)
+                and metric.get("category") == "outcome"
+                and isinstance(metric.get("evaluator"), dict)
+                and metric["evaluator"].get("kind") == "business_state_rule"
+            ]
+            if leaked:
+                raise PipelineGenerationError(
+                    "task readiness: read-only reference data cannot by itself prove agent outcome; "
+                    f"metrics={leaked}"
+                )
         if require_noise and not noise_tools:
             raise PipelineGenerationError("task readiness: tool-selection tasks require at least one noise tool")
         rule_ids = {
@@ -2547,59 +4714,285 @@ class TaskGenerationPipeline:
             metric_implementations=metric_implementations,
             noise_tools=noise_tools,
         )
+        description = task_description or {}
+        if TaskGenerationPipeline._requires_file_deliverable(description):
+            media = media_generation or {}
+            if media.get("required") is not True or not str(media.get("code", "")).strip():
+                raise PipelineGenerationError(
+                    "task readiness: file deliverable has no executable artifact generation"
+                )
+            file_metric_text = json.dumps(metrics, ensure_ascii=False).lower()
+            if any(marker in file_metric_text for marker in ("file_generation", "pdf_file", "生成文件", "pdf文件")):
+                model_only = [
+                    metric.get("id") for metric in metrics
+                    if isinstance(metric, dict)
+                    and any(marker in json.dumps(metric, ensure_ascii=False).lower()
+                            for marker in ("file_generation", "pdf_file", "生成文件", "pdf文件"))
+                    and isinstance(metric.get("evaluator"), dict)
+                    and metric["evaluator"].get("kind") == "external_llm_judge"
+                ]
+                if model_only:
+                    raise PipelineGenerationError(
+                        "task readiness: file existence cannot be evaluated only by an LLM judge; "
+                        f"metrics={model_only}"
+                    )
+            if re.search(r"(?:已|已经).{0,12}(?:生成|创建|提供).{0,30}\.(?:pdf|png|jpg|docx|xlsx|pptx)", success_fixture, re.I):
+                # A claimed artifact is acceptable only because executable media
+                # generation was required and validated above. Keep this branch
+                # explicit so future artifact-manifest support can tighten it.
+                pass
 
     @staticmethod
-    def _validate_user_script_tree(script: dict[str, Any], index: int) -> None:
-        """Validate the branching behavior tree consumed by User LLM."""
-        tree = script.get("tree")
-        if not isinstance(tree, dict):
-            raise PipelineGenerationError(f"user_scripts[{index}] requires a tree object")
-        seen_nodes: set[str] = set()
-        seen_branches: set[str] = set()
-        branch_count = 0
-        has_end_signal = False
+    def _validate_user_script_state_machine(script: dict[str, Any], index: int) -> None:
+        """Validate a reusable, finite user-behavior state machine."""
+        states = script.get("states")
+        transitions = script.get("transitions")
+        initial = script.get("initial_state")
+        variables = script.get("variables", {})
+        recovery_policy = script.get("recovery_policy")
+        if not isinstance(states, list) or len(states) < 2:
+            raise PipelineGenerationError(f"user_scripts[{index}] requires at least two states")
+        if not isinstance(transitions, list) or len(transitions) < 2:
+            raise PipelineGenerationError(f"user_scripts[{index}] requires at least two transitions")
+        if not isinstance(variables, dict):
+            raise PipelineGenerationError(f"user_scripts[{index}].variables must be an object")
+        if (
+            not isinstance(recovery_policy, dict)
+            or not isinstance(recovery_policy.get("max_recoveries"), int)
+            or not 1 <= recovery_policy["max_recoveries"] <= 3
+            or not isinstance(recovery_policy.get("user_behavior"), str)
+            or not recovery_policy["user_behavior"].strip()
+            or set(recovery_policy.get("handled_outcomes", [])) != RECOVERY_DIALOGUE_OUTCOMES
+        ):
+            raise PipelineGenerationError(f"user_scripts[{index}].recovery_policy is invalid")
+        by_id: dict[str, dict[str, Any]] = {}
+        for state_index, state in enumerate(states):
+            if not isinstance(state, dict):
+                raise PipelineGenerationError(f"user_scripts[{index}].states[{state_index}] must be an object")
+            state_id = state.get("state_id")
+            if not isinstance(state_id, str) or not state_id.strip() or state_id in by_id:
+                raise PipelineGenerationError(f"user_scripts[{index}] has invalid or duplicate state_id")
+            if not isinstance(state.get("user_behavior"), str) or not state["user_behavior"].strip():
+                raise PipelineGenerationError(f"user_scripts[{index}] state {state_id} requires user_behavior")
+            if not isinstance(state.get("terminal"), bool):
+                raise PipelineGenerationError(f"user_scripts[{index}] state {state_id} requires terminal")
+            by_id[state_id] = state
+        if not isinstance(initial, str) or initial not in by_id or by_id[initial]["terminal"]:
+            raise PipelineGenerationError(f"user_scripts[{index}] initial_state is invalid")
 
-        def visit(node: Any, path: str, depth: int = 0) -> None:
-            nonlocal branch_count, has_end_signal
-            if depth > 8:
-                raise PipelineGenerationError(f"user_scripts[{index}] tree exceeds maximum depth 8")
-            if not isinstance(node, dict):
-                raise PipelineGenerationError(f"user_scripts[{index}] tree node {path} must be an object")
-            node_id = node.get("node_id")
-            behavior = node.get("user_behavior")
-            branches = node.get("branches")
-            if not isinstance(node_id, str) or not node_id.strip() or node_id in seen_nodes:
-                raise PipelineGenerationError(f"user_scripts[{index}] tree node {path} requires a unique node_id")
-            if not isinstance(behavior, str) or not behavior.strip():
-                raise PipelineGenerationError(f"user_scripts[{index}] tree node {node_id} requires user_behavior")
-            if not isinstance(branches, list):
-                raise PipelineGenerationError(f"user_scripts[{index}] tree node {node_id} requires branches array")
-            seen_nodes.add(node_id)
-            for branch_index, branch in enumerate(branches):
-                if not isinstance(branch, dict):
-                    raise PipelineGenerationError(f"user_scripts[{index}] branch {path}.{branch_index} must be an object")
-                branch_id = branch.get("branch_id")
-                condition = branch.get("condition")
-                should_end = branch.get("should_end")
-                next_node = branch.get("next")
-                if not isinstance(branch_id, str) or not branch_id.strip() or branch_id in seen_branches:
-                    raise PipelineGenerationError(f"user_scripts[{index}] branch {path}.{branch_index} requires a unique branch_id")
-                if not isinstance(condition, str) or not condition.strip():
-                    raise PipelineGenerationError(f"user_scripts[{index}] branch {branch_id} requires condition")
-                if not isinstance(should_end, bool):
-                    raise PipelineGenerationError(f"user_scripts[{index}] branch {branch_id} requires boolean should_end")
-                has_end_signal = has_end_signal or should_end
-                if not isinstance(next_node, dict):
-                    raise PipelineGenerationError(f"user_scripts[{index}] branch {branch_id} requires next node")
-                seen_branches.add(branch_id)
-                branch_count += 1
-                visit(next_node, f"{path}.{branch_index}", depth + 1)
+        outgoing: dict[str, list[str]] = {state_id: [] for state_id in by_id}
+        seen_transitions: set[str] = set()
+        covered_outcomes: set[str] = set()
+        for transition_index, transition in enumerate(transitions):
+            if not isinstance(transition, dict):
+                raise PipelineGenerationError(f"user_scripts[{index}].transitions[{transition_index}] must be an object")
+            transition_id = transition.get("transition_id")
+            source, target = transition.get("from_state"), transition.get("to_state")
+            if not isinstance(transition_id, str) or not transition_id.strip() or transition_id in seen_transitions:
+                raise PipelineGenerationError(f"user_scripts[{index}] has invalid or duplicate transition_id")
+            if source not in by_id or target not in by_id:
+                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} references unknown state")
+            if by_id[source]["terminal"]:
+                raise PipelineGenerationError(f"user_scripts[{index}] terminal state {source} cannot have outgoing transitions")
+            if not isinstance(transition.get("condition"), str) or not transition["condition"].strip():
+                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} requires condition")
+            outcome = transition.get("outcome_category")
+            if outcome not in NORMAL_DIALOGUE_OUTCOMES:
+                raise PipelineGenerationError(
+                    f"user_scripts[{index}] transition {transition_id} has invalid outcome_category"
+                )
+            if not isinstance(transition.get("should_end"), bool):
+                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} requires should_end")
+            if transition["should_end"] != bool(by_id[target]["terminal"]):
+                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} end flag must match target state")
+            if outcome == "user_acceptance" and not by_id[target]["terminal"]:
+                raise PipelineGenerationError(f"user_scripts[{index}] user_acceptance must enter a terminal state")
+            if outcome in {"information_required", "user_correction", "user_rejection"} and by_id[target]["terminal"]:
+                raise PipelineGenerationError(f"user_scripts[{index}] {outcome} cannot enter a terminal state")
+            updates = transition.get("updates", {})
+            if not isinstance(updates, dict) or any(key not in variables for key in updates):
+                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} has invalid updates")
+            seen_transitions.add(transition_id)
+            covered_outcomes.add(str(outcome))
+            outgoing[source].append(target)
 
-        visit(tree, "root")
-        if branch_count < 2:
-            raise PipelineGenerationError(f"user_scripts[{index}] tree must contain at least two branches")
-        if not has_end_signal:
-            raise PipelineGenerationError(f"user_scripts[{index}] tree must contain a should_end=true branch")
+        reachable = {initial}
+        frontier = [initial]
+        while frontier:
+            source = frontier.pop()
+            for target in outgoing[source]:
+                if target not in reachable:
+                    reachable.add(target)
+                    frontier.append(target)
+        if reachable != set(by_id):
+            raise PipelineGenerationError(f"user_scripts[{index}] contains unreachable states")
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def reject_cycle(state_id: str) -> None:
+            if state_id in visiting:
+                raise PipelineGenerationError(f"user_scripts[{index}] state machine must be acyclic")
+            if state_id in visited:
+                return
+            visiting.add(state_id)
+            for target in outgoing[state_id]:
+                reject_cycle(target)
+            visiting.remove(state_id)
+            visited.add(state_id)
+
+        reject_cycle(initial)
+        terminals = {state_id for state_id, state in by_id.items() if state["terminal"]}
+        if not terminals:
+            raise PipelineGenerationError(f"user_scripts[{index}] requires a terminal state")
+        reverse: dict[str, set[str]] = {state_id: set() for state_id in by_id}
+        for source, targets in outgoing.items():
+            for target in targets:
+                reverse[target].add(source)
+        can_terminate = set(terminals)
+        frontier = list(terminals)
+        while frontier:
+            target = frontier.pop()
+            for source in reverse[target]:
+                if source not in can_terminate:
+                    can_terminate.add(source)
+                    frontier.append(source)
+        if reachable - can_terminate:
+            raise PipelineGenerationError(f"user_scripts[{index}] has states without a terminal path")
+        missing_outcomes = NORMAL_DIALOGUE_OUTCOMES - covered_outcomes
+        if missing_outcomes:
+            raise PipelineGenerationError(
+                f"user_scripts[{index}] misses dialogue outcomes: {sorted(missing_outcomes)}"
+            )
+
+    @staticmethod
+    def _deterministic_user_scripts(*, description: dict[str, Any], count: int) -> list[dict[str, Any]]:
+        """Build minimal valid FSMs when a model cannot repair script structure.
+
+        User scripts are test drivers rather than task semantics. A structurally
+        sound generic driver is therefore preferable to discarding an otherwise
+        valid task after repeated formatting failures.
+        """
+        goal = str(description.get("description") or description.get("task") or "完成用户任务").strip()
+        scripts: list[dict[str, Any]] = []
+        for index in range(1, max(1, count) + 1):
+            script = {
+                "script_id": f"script-{index}",
+                "goal": goal,
+                "initial_state": "request",
+                "variables": {"clarification": None},
+                "recovery_policy": {
+                    "max_recoveries": 2,
+                    "user_behavior": "指出回复没有解决当前问题，并要求 Agent 根据已有信息重新回答。",
+                    "handled_outcomes": sorted(RECOVERY_DIALOGUE_OUTCOMES),
+                },
+                "states": [
+                    {
+                        "state_id": "request",
+                        "user_behavior": "提出任务请求，并仅提供完成任务所需的公开信息。",
+                        "terminal": False,
+                    },
+                    {
+                        "state_id": "clarify",
+                        "user_behavior": "回答一个必要澄清问题，或要求 Agent 直接完成任务。",
+                        "terminal": False,
+                    },
+                    {"state_id": "corrected", "user_behavior": "纠正 Agent 对需求的误解。", "terminal": False},
+                    {"state_id": "rejected", "user_behavior": "拒绝不符合约束的方案并重申要求。", "terminal": False},
+                    {"state_id": "review", "user_behavior": "检查 Agent 已完成的结果并决定是否接受。", "terminal": False},
+                    {
+                        "state_id": "done",
+                        "user_behavior": "确认收到结果并结束对话。",
+                        "terminal": True,
+                    },
+                ],
+                "transitions": [
+                    {
+                        "transition_id": "request-to-clarify",
+                        "outcome_category": "information_required",
+                        "from_state": "request",
+                        "to_state": "clarify",
+                        "condition": "Agent 请求必要信息或开始处理任务",
+                        "should_end": False,
+                        "updates": {"clarification": "按任务上下文提供必要补充"},
+                    },
+                    {
+                        "transition_id": "request-to-corrected",
+                        "outcome_category": "user_correction",
+                        "from_state": "request", "to_state": "corrected",
+                        "condition": "Agent 误解了用户已明确的目标或约束",
+                        "should_end": False, "updates": {},
+                    },
+                    {
+                        "transition_id": "request-to-rejected",
+                        "outcome_category": "user_rejection",
+                        "from_state": "request", "to_state": "rejected",
+                        "condition": "Agent 给出不符合约束的候选方案",
+                        "should_end": False, "updates": {},
+                    },
+                    {
+                        "transition_id": "request-to-review",
+                        "outcome_category": "goal_satisfied",
+                        "from_state": "request", "to_state": "review",
+                        "condition": "Agent 已完成当前任务目标，等待用户确认",
+                        "should_end": False, "updates": {},
+                    },
+                    {
+                        "transition_id": "clarify-to-review",
+                        "outcome_category": "goal_satisfied",
+                        "from_state": "clarify",
+                        "to_state": "review",
+                        "condition": "Agent 给出可验收的最终结果",
+                        "should_end": False,
+                        "updates": {},
+                    },
+                    {"transition_id": "corrected-to-review", "outcome_category": "goal_satisfied", "from_state": "corrected", "to_state": "review", "condition": "Agent 按纠正后的要求完成任务", "should_end": False, "updates": {}},
+                    {"transition_id": "rejected-to-review", "outcome_category": "goal_satisfied", "from_state": "rejected", "to_state": "review", "condition": "Agent 提供符合约束的新方案", "should_end": False, "updates": {}},
+                    {"transition_id": "review-to-done", "outcome_category": "user_acceptance", "from_state": "review", "to_state": "done", "condition": "用户接受已完成的结果", "should_end": True, "updates": {}},
+                ],
+            }
+            TaskGenerationPipeline._validate_user_script_state_machine(script, index - 1)
+            scripts.append(script)
+        return scripts
+
+    def _deterministic_dialogue_fixture(
+        self, *, description: dict[str, Any], profile: Any,
+        script: dict[str, Any], script_id: str, session_id: str,
+    ) -> dict[str, Any]:
+        """Create a bounded acceptance fixture without using an LLM transcript.
+
+        These records only exercise artifact shape and seed acceptance-fixture
+        generation. They are deliberately not consumed by the runtime user
+        simulator and contain no generated business truth.
+        """
+        request = str(description.get("task") or description.get("description") or "完成任务").strip()
+        expected = str(description.get("expected_result") or description.get("goal") or "给出可核验的结果").strip()
+        clarification = "请基于任务中已经给出的约束继续，并明确说明结果依据。"
+        turns = [
+            {"role": "user", "content": request},
+            {"role": "agent", "content": "我会先核对必要条件，再完成任务。请确认按已给出的约束执行。"},
+            {"role": "user", "content": clarification},
+            {"role": "agent", "content": expected},
+            {"role": "user", "content": "结果符合要求，我接受并结束本次对话。"},
+        ]
+        # Preserve configured bounds for callers using non-default values.
+        turns = turns[:self.maximum_dialogue_turns]
+        while len(turns) < self.minimum_dialogue_turns:
+            role = "agent" if turns[-1]["role"] == "user" else "user"
+            content = expected if role == "agent" else clarification
+            turns.append({"role": role, "content": content})
+        user_turns = sum(turn["role"] == "user" for turn in turns)
+        return {
+            "script_id": script_id,
+            "session_id": session_id,
+            "profile_id": profile.get("profile_id") if isinstance(profile, dict) else None,
+            "turns": turns,
+            "turn_count": len(turns),
+            "user_end_flags": [False] * max(0, user_turns - 1) + [True],
+            "state_trace": ["request", "clarify", "review", "done"],
+            "final_variables": {"clarification": clarification},
+            "termination_reason": "user_script_end",
+            "fixture_only": True,
+        }
 
     @staticmethod
     def _normalize_metric_weights(metrics: list[Any]) -> list[Any]:
@@ -2687,6 +5080,40 @@ class TaskGenerationPipeline:
         return metrics
 
     @staticmethod
+    def _normalize_metrics_for_environment(
+        metrics: list[Any], *, environment_mode: str
+    ) -> list[Any]:
+        """Prevent read-only source data from being treated as an Agent outcome."""
+        if environment_mode != "reference_data":
+            return metrics
+        for metric in metrics:
+            if not isinstance(metric, dict) or metric.get("category") != "outcome":
+                continue
+            evaluator = metric.get("evaluator")
+            if not isinstance(evaluator, dict) or evaluator.get("kind") != "business_state_rule":
+                continue
+            criterion = (
+                metric.get("rubric") or evaluator.get("assertion")
+                or "最终回答是否基于参考数据完成用户目标"
+            )
+            metric["type"] = "model-based"
+            metric["scope"] = "terminal"
+            metric.pop("condition", None)
+            metric["evaluation_inputs"] = ["final_agent_response", "business_data"]
+            metric["criteria"] = [str(criterion)]
+            metric["evaluator"] = {
+                "kind": "external_llm_judge",
+                "source": "external_llm",
+                "criteria": [str(criterion)],
+                "score_mapping": {"pass": 1, "fail": 0},
+            }
+            logger.info(
+                "promoted reference-data outcome to response judge: metric=%s",
+                metric.get("id"),
+            )
+        return metrics
+
+    @staticmethod
     def _ensure_deterministic_noise_penalty(
         metrics: list[Any], *, noise_names: list[str]
     ) -> None:
@@ -2751,6 +5178,69 @@ class TaskGenerationPipeline:
             )
 
     @staticmethod
+    def _promote_mixed_response_business_rules(metrics: list[Any]) -> None:
+        """A textual answer cannot be joined to business tables by the path DSL."""
+        for metric in metrics:
+            if not isinstance(metric, dict) or metric.get("type") != "rule-based":
+                continue
+            evaluator = metric.get("evaluator")
+            if not isinstance(evaluator, dict) or evaluator.get("kind") != "business_state_rule":
+                continue
+            source_fields = evaluator.get("source_fields", [])
+            assertion = str(evaluator.get("assertion", ""))
+            mixes_response = (
+                isinstance(source_fields, list) and "final_agent_response" in source_fields
+            ) or "final_agent_response" in assertion
+            if not mixes_response:
+                continue
+            criterion = assertion or metric.get("rubric") or metric.get("condition")
+            mapping = evaluator.get("score_mapping", {"pass": 1, "fail": 0})
+            metric["type"] = "model-based"
+            metric["evaluation_inputs"] = ["business_data", "final_agent_response"]
+            metric["criteria"] = [str(criterion or "判断最终回答是否与业务数据一致。")]
+            metric["evaluator"] = {
+                "kind": "external_llm_judge",
+                "source": "external_llm",
+                "score_mapping": dict(mapping) if isinstance(mapping, dict) else {"pass": 1, "fail": 0},
+            }
+            metric.pop("condition", None)
+            logger.info(
+                "promoted mixed response/business rule to external judge: metric=%s",
+                metric.get("id"),
+            )
+
+    @staticmethod
+    def _canonical_observation_schema(candidate: Any) -> dict[str, Any]:
+        """Return one stable observation shape for every generated task."""
+        descriptions = {
+            "conversation": "当前 episode 的完整对话消息。",
+            "public_observation": "沙箱允许 Agent 或 Trainer 观察的公开环境信息。",
+            "available_tools": "当前提供给 Agent 的 OpenAI Function Tool 定义。",
+            "tool_call": "最近一次工具调用；未调用时为空。",
+            "tool_results": "当前 episode 的工具调用结果列表。",
+            "final_agent_response": "Agent 提交的最终自然语言回答。",
+        }
+        properties: dict[str, Any] = {}
+        if isinstance(candidate, dict) and isinstance(candidate.get("properties"), dict):
+            properties.update(candidate["properties"])
+        field_types = {
+            "conversation": "array", "public_observation": "object",
+            "available_tools": "array", "tool_call": "object",
+            "tool_results": "array", "final_agent_response": "string",
+        }
+        for name, description in descriptions.items():
+            properties.setdefault(name, {
+                "type": field_types[name],
+                "description": description,
+            })
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": ["conversation", "available_tools", "tool_results"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
     def _validate_metric_runtime_semantics(
         *, metrics: list[Any], metric_implementations: list[Any], noise_tools: list[Any]
     ) -> None:
@@ -2782,6 +5272,10 @@ class TaskGenerationPipeline:
                 raise PipelineGenerationError(
                     f"task readiness: metric_implementations[{index}] addresses fields on raw final_agent_response"
                 )
+            if spec.get("source") == "business_state" and "final_agent_response" in str(spec.get("path")):
+                raise PipelineGenerationError(
+                    f"task readiness: metric_implementations[{index}] mixes response data into business_state"
+                )
             expected = spec.get("expected")
             targets_noise = (
                 spec.get("operator") == "none_tool_calls"
@@ -2803,6 +5297,7 @@ class TaskGenerationPipeline:
             if isinstance(action, dict)
         }
         step_ids: set[str] = set()
+        declared_dependencies: dict[str, list[str]] = {}
         for index, step in enumerate(key_steps):
             if not isinstance(step, dict):
                 raise PipelineGenerationError(f"key_steps[{index}] must be an object")
@@ -2816,8 +5311,17 @@ class TaskGenerationPipeline:
                 raise PipelineGenerationError(f"key_steps[{index}] requires rationale")
             if not isinstance(step.get("required_for_goal"), bool):
                 raise PipelineGenerationError(f"key_steps[{index}] requires boolean required_for_goal")
-            if not isinstance(step.get("dependencies", []), list):
+            dependencies = step.get("dependencies", [])
+            if not isinstance(dependencies, list) or any(
+                not isinstance(item, str) or not item.strip() for item in dependencies
+            ):
                 raise PipelineGenerationError(f"key_steps[{index}].dependencies must be a list")
+            unknown = [item for item in dependencies if item not in step_ids]
+            if unknown:
+                raise PipelineGenerationError(
+                    f"key_steps[{index}] dependencies must reference earlier steps: {unknown}"
+                )
+            declared_dependencies[step_id] = list(dependencies)
             step_ids.add(step_id)
 
     @staticmethod
@@ -3011,6 +5515,10 @@ class TaskGenerationPipeline:
             if spec.get("source") == "final_agent_response" and spec.get("path") not in {"$", ""}:
                 raise PipelineGenerationError(
                     f"metric_implementations[{index}] cannot address fields on raw final_agent_response"
+                )
+            if spec.get("source") == "business_state" and "final_agent_response" in str(spec.get("path")):
+                raise PipelineGenerationError(
+                    f"metric_implementations[{index}] cannot address final_agent_response through business_state"
                 )
             mapping = spec.get("score_mapping")
             low, high = metric.get("score_range", [0, 1])
@@ -3272,7 +5780,8 @@ class TaskGenerationPipeline:
             path.write_text(json.dumps(session, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             session_files.append({"session_id": session_id, "file": str(path.relative_to(artifact_dir))})
         return {
-            "version": "1.0",
+            "version": "2.0",
+            "script_model": "finite_state_machine",
             "root": str(artifact_dir),
             "profiles_file": str(profiles_path.relative_to(artifact_dir)),
             "scripts_file": str(scripts_path.relative_to(artifact_dir)),
