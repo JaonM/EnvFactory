@@ -120,6 +120,31 @@ class BuildWorkflowTest(unittest.TestCase):
         validator = (ROOT / "scripts" / "validate_training_readiness.py").read_text(encoding="utf-8")
         self.assertIn('os.environ.setdefault("SANDBOX_EVALUATOR_MOCK", "1")', validator)
 
+    def test_runtime_validator_rejects_trace_derived_tool_preconditions(self):
+        validator = load_script("validate_sandbox_runtime.py")
+        unsafe = '''
+def dependency_error():
+    return SandboxError("PRECONDITION_FAILED", "read first", 400)
+def successful_calls(store):
+    return store.replay()["events"]
+def handler(store, arguments):
+    if not successful_calls(store):
+        raise dependency_error()
+    return arguments
+'''
+        self.assertEqual(
+            validator.trace_precondition_functions(unsafe), ["handler"]
+        )
+        safe = '''
+def observe(store):
+    return store.replay()
+def handler(data, arguments):
+    if not data.exists(arguments["id"]):
+        raise SandboxError("PRECONDITION_FAILED", "missing business row", 400)
+    return data.read(arguments["id"])
+'''
+        self.assertEqual(validator.trace_precondition_functions(safe), [])
+
     def test_agentic_value_validator_rejects_placeholders_and_empty_collections(self):
         validator = load_script("validate_agentic_training_value.py")
         self.assertTrue(validator.has_placeholder({"source": "fixture-value"}))

@@ -10,6 +10,7 @@ by fixed metric ids, one session, or a fixed turn count.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 from pathlib import Path
@@ -17,6 +18,53 @@ from pathlib import Path
 
 def fail(message: str) -> None:
     raise SystemExit(message)
+
+
+def trace_precondition_functions(source: str) -> list[str]:
+    """Find task functions that turn historical tool order into a hard precondition."""
+    tree = ast.parse(source)
+    functions = {
+        node.name: node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    calls = {
+        name: {
+            call.func.id for call in ast.walk(node)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            and call.func.id in functions
+        }
+        for name, node in functions.items()
+    }
+    trace = {
+        name: any(
+            isinstance(node, ast.Attribute) and node.attr in {"replay", "events"}
+            for node in ast.walk(function)
+        )
+        for name, function in functions.items()
+    }
+    precondition = {
+        name: any(
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value == "PRECONDITION_FAILED"
+            for node in ast.walk(function)
+        )
+        for name, function in functions.items()
+    }
+    changed = True
+    while changed:
+        changed = False
+        for name, dependencies in calls.items():
+            next_trace = trace[name] or any(trace[dependency] for dependency in dependencies)
+            next_precondition = precondition[name] or any(
+                precondition[dependency] for dependency in dependencies
+            )
+            if next_trace != trace[name] or next_precondition != precondition[name]:
+                trace[name], precondition[name] = next_trace, next_precondition
+                changed = True
+    return sorted(
+        name for name in functions if trace[name] and precondition[name]
+    )
 
 
 def main() -> int:
@@ -41,6 +89,16 @@ def main() -> int:
         for name in production_names if (root / name).is_file()
     }
     source = "\n".join(sources.values())
+    task_source = sources.get("task_impl.py", "")
+    try:
+        trace_preconditions = trace_precondition_functions(task_source)
+    except SyntaxError as exc:
+        fail(f"task_impl.py cannot be parsed: {exc}")
+    if trace_preconditions:
+        fail(
+            "task business handlers must not derive PRECONDITION_FAILED from replay order; "
+            f"shared reward causality owns DAG sequencing: {trace_preconditions}"
+        )
     shared_source_path = root / "sandbox_runtime.py"
     shared_source = shared_source_path.read_text(encoding="utf-8") if shared_source_path.is_file() else ""
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
