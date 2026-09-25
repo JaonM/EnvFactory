@@ -4,6 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from env_factory.sandbox_scoring import evidence_fingerprint
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -133,6 +135,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "pii_findings": [],
         }))
         holdouts = []
+        sandbox_reports = []
         for batch in range(batches):
             jobs = []
             for index in range(count):
@@ -241,6 +244,46 @@ class ProductionReadinessTest(unittest.TestCase):
                 }
                 for episode in range(10)
                 ]
+                check_weights = {
+                    "delivery_integrity": 1.0,
+                    "contract_and_tool_identity": 1.0,
+                    "semantic_business_fidelity": 0.5,
+                    "business_acceptance": 1.0,
+                    "sandbox_pytest": 1.0,
+                    "runtime_genericity": 0.5,
+                    "outer_conformance": 1.0,
+                    "mutation_resistance": 1.0,
+                    "training_readiness": 1.0,
+                    "declared_training_policy": 2.0,
+                }
+                sandbox_report = {
+                    "score": 10.0,
+                    "eligible": True,
+                    "passed": True,
+                    "threshold": 8.0,
+                    "failed_critical_gates": [],
+                    "checks": [
+                        {
+                            "name": name,
+                            "weight": weight,
+                            "passed": True,
+                            "evidence": "fixture evidence",
+                            "critical": True,
+                        }
+                        for name, weight in check_weights.items()
+                    ],
+                    "root": str(evidence),
+                    "mode": "offline_executable",
+                    "live_rollout_verified": False,
+                    "evidence_fingerprint": evidence_fingerprint(
+                        evidence, ROOT, task_path=task
+                    ),
+                    "network_used": False,
+                    "model_used": False,
+                    "model": "gpt-5.6-luna",
+                    "review_model": "gpt-5.6-luna",
+                }
+                sandbox_reports.append(sandbox_report)
                 result = {
                     "task_path": str(task), "output": str(evidence),
                     "container_image_tag": "fixture",
@@ -248,10 +291,7 @@ class ProductionReadinessTest(unittest.TestCase):
                     "sample_manifest": str(sample_manifest),
                     "category": category,
                     "task_score": {"eligible": True, "score": 9},
-                    "sandbox_score": {
-                        "passed": True, "score": 9,
-                        "evidence_fingerprint": f"sandbox-{global_index}",
-                    },
+                    "sandbox_score": sandbox_report,
                     "score": 9, "passed": True,
                     "live_rollout": {
                         "schema_version": "2.0",
@@ -272,6 +312,17 @@ class ProductionReadinessTest(unittest.TestCase):
                             "no_new_privileges": True,
                             "non_root_user": True,
                         },
+                        "live_rollout_verified": True,
+                        "agent_success_rate": 0.8,
+                        "environment_checks_passed": True,
+                        "all_episodes_fallback_free": True,
+                        "all_episodes_environment_clean": True,
+                        "minimum_success_rate": 2 / 3,
+                        "success_rate_gate_passed": True,
+                        "quality_score": 1.0,
+                        "passed": True,
+                        "failure_owner": None,
+                        "conclusion": "live_success_witness",
                         "episodes": episodes,
                     },
                 }
@@ -281,6 +332,15 @@ class ProductionReadinessTest(unittest.TestCase):
                 "jobs": jobs,
                 "summary": {"fresh_tasks_verified": True},
             })
+        (evidence / "score_summary.json").write_text(json.dumps({
+            "mode": "offline_executable",
+            "threshold": 8.0,
+            "total": len(sandbox_reports),
+            "passed": len(sandbox_reports),
+            "failed": 0,
+            "all_passed": True,
+            "sandboxes": sandbox_reports,
+        }))
         representative = holdouts[0]["jobs"][0]["result"]["live_rollout"]
         (evidence / "trajectory_privacy.json").write_text(json.dumps(
             certifier.audit_rollout_privacy(representative)
@@ -457,6 +517,53 @@ class ProductionReadinessTest(unittest.TestCase):
             report = certifier.certify(history, certifier.default_policy())
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["container_reward_calibration"])
+
+    def test_final_pass_cannot_bypass_task_and_sandbox_qualification_lineage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            result["task_score"]["eligible"] = False
+            # A stale or tampered outer result still claims final success.
+            self.assertTrue(result["passed"])
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["qualification_lineage"])
+            self.assertEqual(
+                report["measurements"]["qualification_lineage"],
+                {"verified": False, "violations": 1},
+            )
+            self.assertEqual(report["measurements"]["training_ready"], 899)
+            self.assertEqual(report["measurements"]["episodes"], 8990)
+
+    def test_rollout_summary_is_recomputed_from_episodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            rollout = history["holdouts"][0]["jobs"][0]["result"][
+                "live_rollout"
+            ]
+            rollout["passed"] = False
+            rollout["agent_success_rate"] = 1.0
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["rollout_outcome_integrity"])
+            self.assertEqual(
+                report["measurements"]["rollout_outcome_integrity"],
+                {"verified": 899, "expected": 900, "all_verified": False},
+            )
+
+    def test_sandbox_score_must_match_frozen_structural_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            result["sandbox_score"] = dict(result["sandbox_score"])
+            result["sandbox_score"]["score"] = 9.5
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["sandbox_score_provenance"])
+            self.assertEqual(
+                report["measurements"]["sandbox_score_provenance"],
+                {"verified": 899, "failures": 1},
+            )
 
     def test_credential_finding_breaks_data_governance_gate(self):
         with tempfile.TemporaryDirectory() as directory:

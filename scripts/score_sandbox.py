@@ -9,9 +9,10 @@ import os
 import subprocess
 import sys
 import tempfile
-import hashlib
 from pathlib import Path
 from typing import Any, NamedTuple
+
+from env_factory.sandbox_scoring import evidence_fingerprint
 
 
 REQUIRED_FILES = (
@@ -27,23 +28,6 @@ class Check(NamedTuple):
     passed: bool
     evidence: str
     critical: bool = False
-
-
-def evidence_fingerprint(root: Path, project: Path) -> str:
-    """Bind evidence to both evaluator code and the evaluated implementation."""
-    paths = [*sorted((project / "src/env_factory").glob("*.py")),
-             *sorted((project / "scripts").glob("*.py")),
-             root / "task.json", root / "BUILD_CONTRACT.json",
-             *sorted(root.glob("*.py")), *sorted(root.glob("*.sh")),
-             *sorted((root / "tests").rglob("*.py")),
-             *sorted((root / "data").rglob("*.json*"))]
-    digest = hashlib.sha256()
-    for path in paths:
-        if path.is_file():
-            # Relative labels avoid invalidating a byte-identical copied sandbox.
-            label = str(path.relative_to(root)) if path.is_relative_to(root) else str(path.relative_to(project))
-            digest.update(label.encode()); digest.update(path.read_bytes())
-    return digest.hexdigest()
 
 
 def score_checks(checks: list[Check], *, threshold: float = 8.0) -> dict[str, Any]:

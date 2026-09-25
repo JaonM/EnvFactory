@@ -37,6 +37,7 @@ from env_factory.execution_provenance import verify_execution_provenance
 from env_factory.task_similarity import near_duplicate_rate, task_partition_isolation
 from env_factory.generation_provenance import generation_provenance_snapshot
 from env_factory.runtime_provenance import valid_container_rollout_execution
+from env_factory.sandbox_scoring import valid_score_report
 
 
 Z_95 = 1.959963984540054
@@ -221,6 +222,47 @@ def valid_rollout_provenance(item: Mapping[str, Any]) -> bool:
     )
 
 
+def valid_rollout_outcome(
+    report: Mapping[str, Any], policy: Mapping[str, Any]
+) -> bool:
+    """Independently recompute the per-sandbox production rollout verdict."""
+    episodes = report.get("episodes")
+    if not isinstance(episodes, list) or not episodes:
+        return False
+    successes = sum(
+        episode.get("agent_success") is True
+        for episode in episodes if isinstance(episode, Mapping)
+    )
+    if len(episodes) != sum(isinstance(item, Mapping) for item in episodes):
+        return False
+    success_rate = successes / len(episodes)
+    minimum = float(policy["min_agent_success_rate_per_sandbox"])
+    clean = all(not episode.get("issues") for episode in episodes)
+    fallback_free = all(
+        "runtime_llm_fallback" not in episode.get("issues", [])
+        for episode in episodes
+    )
+    return (
+        len(episodes) >= policy["min_episodes_per_qualified_sandbox"]
+        and success_rate >= minimum
+        and clean
+        and fallback_free
+        and report.get("passed") is True
+        and report.get("live_rollout_verified") is True
+        and report.get("environment_checks_passed") is True
+        and report.get("all_episodes_environment_clean") is True
+        and report.get("all_episodes_fallback_free") is True
+        and report.get("success_rate_gate_passed") is True
+        and isinstance(report.get("agent_success_rate"), (int, float))
+        and math.isclose(float(report["agent_success_rate"]), success_rate)
+        and isinstance(report.get("minimum_success_rate"), (int, float))
+        and float(report["minimum_success_rate"]) >= minimum
+        and report.get("quality_score") == 1.0
+        and report.get("failure_owner") is None
+        and report.get("conclusion") == "live_success_witness"
+    )
+
+
 def fresh_holdout_evidence(
     holdouts: Iterable[Mapping[str, Any]], policy: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -329,20 +371,80 @@ def certify(
     holdout_freshness = fresh_holdout_evidence(holdouts, policy)
     partition_isolation = partition_isolation_evidence(history, holdouts)
     generated = [item for item in results if Path(str(item.get("task_path", ""))).is_file()]
-    task_good = [
+    verified_sandbox_scores: set[int] = set()
+    sandbox_score_failures = []
+    for item in results:
+        claimed = item.get("sandbox_score")
+        if not isinstance(claimed, Mapping):
+            continue
+        root = Path(str(item.get("output", "")))
+        try:
+            summary = load(root / "score_summary.json")
+            reports = summary.get("sandboxes")
+            stored = next(
+                (
+                    report for report in reports
+                    if isinstance(report, Mapping) and report == claimed
+                ),
+                None,
+            ) if isinstance(reports, list) else None
+        except (OSError, json.JSONDecodeError, TypeError, IndexError):
+            stored = None
+        if (
+            stored == claimed
+            and valid_score_report(
+                stored,
+                root=root,
+                project=project,
+                threshold=float(policy["score_threshold"]),
+                task_path=Path(str(item.get("task_path", ""))),
+            )
+        ):
+            verified_sandbox_scores.add(id(item))
+        elif (
+            claimed.get("passed") is True
+            and claimed.get("score", 0) >= policy["score_threshold"]
+        ):
+            sandbox_score_failures.append(str(item.get("task_path", "")))
+    def task_passes(item: Mapping[str, Any]) -> bool:
+        return (
+            item.get("task_score", {}).get("eligible") is True
+            and item.get("task_score", {}).get("score", 0)
+            >= policy["score_threshold"]
+        )
+
+    def sandbox_passes(item: Mapping[str, Any]) -> bool:
+        return (
+            task_passes(item)
+            and id(item) in verified_sandbox_scores
+            and item.get("sandbox_score", {}).get("passed") is True
+            and item.get("sandbox_score", {}).get("score", 0)
+            >= policy["score_threshold"]
+        )
+
+    def result_passes(item: Mapping[str, Any]) -> bool:
+        return (
+            sandbox_passes(item)
+            and item.get("passed") is True
+            and item.get("score", 0) >= policy["score_threshold"]
+        )
+
+    task_good = [item for item in results if task_passes(item)]
+    built = [item for item in results if sandbox_passes(item)]
+    qualified = [item for item in results if result_passes(item)]
+    claimed_qualified = [
         item for item in results
-        if item.get("task_score", {}).get("eligible") is True
-        and item.get("task_score", {}).get("score", 0) >= policy["score_threshold"]
+        if item.get("passed") is True
+        and item.get("score", 0) >= policy["score_threshold"]
     ]
-    built = [
-        item for item in task_good
-        if item.get("sandbox_score", {}).get("passed") is True
-        and item.get("sandbox_score", {}).get("score", 0) >= policy["score_threshold"]
-    ]
-    qualified = [
-        item for item in results
-        if item.get("passed") is True and item.get("score", 0) >= policy["score_threshold"]
-    ]
+    lineage_violations = sum(
+        item.get("passed") is True
+        and item.get("score", 0) >= policy["score_threshold"]
+        and not sandbox_passes(item)
+        for item in results
+    )
+    qualification_lineage = lineage_violations == 0
+    sandbox_score_provenance = not sandbox_score_failures
     rates = {
         "generation_completion": len(generated) / total if total else 0.0,
         "task_good_yield": len(task_good) / total if total else 0.0,
@@ -357,7 +459,7 @@ def certify(
     categories = sorted({str(item.get("category", "unknown")) for item in results})
     for category in categories:
         members = [item for item in results if str(item.get("category", "unknown")) == category]
-        passed = sum(item in qualified for item in members)
+        passed = sum(result_passes(item) for item in members)
         category_counts[category] = {
             "requested": len(members), "qualified": passed,
             "rate": passed / len(members) if members else 0.0,
@@ -407,9 +509,17 @@ def certify(
             })
 
     live_reports = [
-        item.get("live_rollout") for item in built
+        item.get("live_rollout") for item in qualified
         if isinstance(item.get("live_rollout"), Mapping)
     ]
+    rollout_outcomes_verified = sum(
+        valid_rollout_outcome(report, policy) for report in live_reports
+    )
+    rollout_outcome_integrity = (
+        bool(qualified)
+        and len(live_reports) == len(qualified)
+        and rollout_outcomes_verified == len(qualified)
+    )
     episodes = [
         episode for report in live_reports
         for episode in report.get("episodes", []) if isinstance(episode, Mapping)
@@ -452,14 +562,19 @@ def certify(
     agentic_reports = [
         _artifact(item, "agentic_training_value_live.json") for item in qualified
     ]
-    governance_reports = [_artifact(item, "data_governance.json") for item in qualified]
+    # Re-scan every sample that claims final success, even if another
+    # independent gate already removed it from the exportable set. This keeps
+    # governance diagnostics fail-closed under post-run task tampering.
+    governance_reports = [
+        _artifact(item, "data_governance.json") for item in claimed_qualified
+    ]
     governed_materials = sum(
         valid_data_governance(
             report,
             Path(str(item.get("output", ""))),
             Path(str(item.get("task_path", ""))),
         )
-        for item, report in zip(qualified, governance_reports)
+        for item, report in zip(claimed_qualified, governance_reports)
     )
     container_reports = [
         verify_container_provenance(
@@ -515,28 +630,22 @@ def certify(
         batch_generated = sum(
             Path(str(item.get("task_path", ""))).is_file() for item in batch_results
         )
-        batch_task_good = [
-            item for item in batch_results
-            if item.get("task_score", {}).get("eligible") is True
-            and item.get("task_score", {}).get("score", 0) >= policy["score_threshold"]
-        ]
-        batch_built = [
-            item for item in batch_task_good
-            if item.get("sandbox_score", {}).get("passed") is True
-            and item.get("sandbox_score", {}).get("score", 0) >= policy["score_threshold"]
-        ]
-        batch_qualified = [
-            item for item in batch_results
-            if item.get("passed") is True
+        batch_task_good = [item for item in batch_results if task_passes(item)]
+        batch_built = [item for item in batch_results if sandbox_passes(item)]
+        batch_qualified = [item for item in batch_results if result_passes(item)]
+        batch_lineage_integrity = not any(
+            item.get("passed") is True
             and item.get("score", 0) >= policy["score_threshold"]
-        ]
+            and not sandbox_passes(item)
+            for item in batch_results
+        )
         batch_categories = {}
         for category in sorted({str(item.get("category", "unknown")) for item in batch_results}):
             members = [
                 item for item in batch_results
                 if str(item.get("category", "unknown")) == category
             ]
-            count = sum(item in batch_qualified for item in members)
+            count = sum(result_passes(item) for item in members)
             batch_categories[category] = count / len(members) if members else 0.0
         task_rate = len(batch_task_good) / batch_total if batch_total else 0.0
         build_rate = len(batch_built) / len(batch_task_good) if batch_task_good else 0.0
@@ -557,6 +666,7 @@ def certify(
             and bool(batch_categories)
             and all(rate >= policy["min_category_rate"] for rate in batch_categories.values())
             and batch_mix["passed"]
+            and batch_lineage_integrity
         )
         batch_measurements.append({
             "batch": batch.get("holdout_batch"),
@@ -570,6 +680,7 @@ def certify(
             "end_to_end_ci95_lower": wilson_lower(len(batch_qualified), batch_total),
             "by_category": batch_categories,
             "category_mix": batch_mix,
+            "qualification_lineage": batch_lineage_integrity,
             "passed": batch_passed,
         })
     material_items = []
@@ -625,6 +736,14 @@ def certify(
         "task_qualified": len(task_good),
         "sandbox_built": len(built),
         "training_ready": len(qualified),
+        "qualification_lineage": {
+            "verified": qualification_lineage,
+            "violations": lineage_violations,
+        },
+        "sandbox_score_provenance": {
+            "verified": len(verified_sandbox_scores),
+            "failures": len(sandbox_score_failures),
+        },
         **rates,
         "by_category": category_counts,
         "category_mix": category_mix(results, policy),
@@ -640,6 +759,11 @@ def certify(
         "environment_error_rate": environment_errors / len(episodes) if episodes else 1.0,
         "llm_fallbacks": fallbacks,
         "rollout_coverage": rollout_coverage,
+        "rollout_outcome_integrity": {
+            "verified": rollout_outcomes_verified,
+            "expected": len(qualified),
+            "all_verified": rollout_outcome_integrity,
+        },
         "rollout_provenance": rollout_provenance,
         "container_rollout_execution": container_rollout_execution,
         "trajectory_schema_complete": bool(episodes) and complete_episodes == len(episodes),
@@ -656,9 +780,9 @@ def certify(
             "reports": len(governance_reports),
             "verified": governed_materials,
             "all_verified": (
-                bool(qualified)
-                and len(governance_reports) == len(qualified)
-                and governed_materials == len(qualified)
+                bool(claimed_qualified)
+                and len(governance_reports) == len(claimed_qualified)
+                and governed_materials == len(claimed_qualified)
             ),
         },
         "container_reproducibility": {
@@ -711,6 +835,8 @@ def certify(
         ),
         "fresh_holdout": measurements["fresh_holdout_verified"],
         "holdout_partition_isolation": partition_isolation["isolated"],
+        "qualification_lineage": qualification_lineage,
+        "sandbox_score_provenance": sandbox_score_provenance,
         "task_good_yield": (
             rates["task_good_yield"] >= policy["min_task_yield"]
             and rates["task_good_yield_ci95_lower"] >= policy["min_task_yield_ci95_lower"]
@@ -730,6 +856,7 @@ def certify(
         "exact_deduplication": exact_duplicate_rate == 0,
         "near_deduplication": measurements["near_duplicate_rate"] <= policy["max_near_duplicate_rate"],
         "rollout_coverage": rollout_coverage and len(episodes) >= policy["min_total_episodes"],
+        "rollout_outcome_integrity": rollout_outcome_integrity,
         "rollout_provenance": rollout_provenance,
         "container_rollout_execution": container_rollout_execution,
         "trajectory_schema": measurements["trajectory_schema_complete"],
@@ -811,6 +938,7 @@ def default_policy() -> dict[str, Any]:
         "min_category_rate": 0.75,
         "max_near_duplicate_rate": 0.05,
         "min_episodes_per_qualified_sandbox": 10,
+        "min_agent_success_rate_per_sandbox": 2 / 3,
         "min_total_episodes": 7500,
         "max_environment_error_rate": 0.001,
         "max_reward_false_positive_rate": 0.005,
