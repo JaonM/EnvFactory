@@ -28,6 +28,7 @@ from env_factory.material_consumer import (
     CONSUMER_CONTRACT_FILE,
     DATASET_SPLITS,
     DATASET_CARD_FILE,
+    EXPERIMENT_CONTRACT_FILE,
     TRANSITIONS_FILE,
     assign_dataset_splits,
     consumer_contract,
@@ -48,6 +49,7 @@ from env_factory.generation_provenance import valid_generation_provenance
 from env_factory.runtime_provenance import valid_container_rollout_execution
 from env_factory.data_governance import valid_provider_binding
 from env_factory.certification_policy import valid_certification_policy
+from env_factory.experiment_contract import valid_experiment_contract
 from env_factory.task_portability import valid_task_lineage
 from env_factory.production_preflight import (
     REQUIRED_CHECKS,
@@ -97,6 +99,9 @@ def _portable_certification(certification: Mapping[str, Any]) -> dict[str, Any]:
         "source_dataset_sha256": source.get("dataset_sha256"),
         "evaluator_source_digest": source.get("evaluator_source_digest"),
         "experiment_config_sha256": source.get("experiment_config_sha256"),
+        "experiment_contract_sha256": source.get(
+            "experiment_contract_sha256"
+        ),
         "execution_provenance": source.get("execution_provenance"),
     }
 
@@ -171,7 +176,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "2.2",
+        "version": "2.3",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -181,6 +186,9 @@ def _dataset_card(
             "policy_sha256": certification.get("materials_manifest", {}).get(
                 "certification_policy_sha256"
             ),
+            "experiment_contract_sha256": certification.get(
+                "materials_manifest", {}
+            ).get("experiment_contract_sha256"),
         },
         "intended_uses": [
             "reconstruct_agentic_sandbox_environments",
@@ -362,6 +370,28 @@ def _export_bundle_uncommitted(
         and re.fullmatch(r"[0-9a-f]{64}", experiment_config_sha256) is not None
     ):
         raise ValueError("source manifest lacks a valid experiment configuration digest")
+    experiment_contract = source_manifest.get("experiment_contract")
+    experiment_contract_sha256 = source_manifest.get(
+        "experiment_contract_sha256"
+    )
+    if not (
+        valid_experiment_contract(
+            experiment_contract,
+            expected_source_config_sha256=experiment_config_sha256,
+        )
+        and experiment_contract_sha256 == digest_json(experiment_contract)
+        and certification.get("gates", {}).get(
+            "portable_experiment_contract"
+        ) is True
+        and certification.get("measurements", {}).get(
+            "experiment_contract"
+        ) == {
+            "version": experiment_contract["version"],
+            "sha256": experiment_contract_sha256,
+            "verified": True,
+        }
+    ):
+        raise ValueError("portable experiment contract is invalid or unbound")
     certification_policy = certification.get("policy")
     certification_policy_sha256 = source_manifest.get(
         "certification_policy_sha256"
@@ -585,6 +615,10 @@ def _export_bundle_uncommitted(
             "portable certification contains non-portable or sensitive metadata: "
             f"{portable_metadata_privacy}"
         )
+    (output / EXPERIMENT_CONTRACT_FILE).write_text(
+        json.dumps(experiment_contract, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n",
+    )
     (output / CERTIFICATION_FILE).write_text(
         json.dumps(portable_certification, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8", newline="\n",
@@ -617,6 +651,8 @@ def _export_bundle_uncommitted(
         "kind": "portable_agentic_rl_training_materials",
         "source_dataset_sha256": source_manifest.get("dataset_sha256"),
         "experiment_config_sha256": experiment_config_sha256,
+        "experiment_contract_file": EXPERIMENT_CONTRACT_FILE,
+        "experiment_contract_sha256": experiment_contract_sha256,
         "certification_policy_sha256": certification_policy_sha256,
         "execution_provenance_sha256": digest_json(
             source_manifest.get("execution_provenance")
@@ -676,7 +712,7 @@ def verify_bundle(
         failures.append("bundle_digest")
     if (
         manifest.get("version") not in {
-            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0",
+            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0", "16.0",
             BUNDLE_VERSION,
         }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
@@ -691,10 +727,23 @@ def verify_bundle(
                 str(manifest.get("certification_policy_sha256", "")),
             ) is None
         )
+        or (
+            supports_bundle_feature(
+                str(manifest.get("version")), "portable_experiment_contract"
+            )
+            and (
+                manifest.get("experiment_contract_file")
+                    != EXPERIMENT_CONTRACT_FILE
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(manifest.get("experiment_contract_sha256", "")),
+                ) is None
+            )
+        )
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0",
+        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0", "16.0",
         BUNDLE_VERSION,
     }
     if production_contract_ready:
@@ -729,6 +778,35 @@ def verify_bundle(
     }
     if not isinstance(expected, Mapping) or expected_files != actual:
         failures.append("bundle_files")
+    portable_experiment_contract: Mapping[str, Any] | dict[str, Any]
+    try:
+        experiment_contract_relative = _safe_relative(
+            str(manifest.get("experiment_contract_file", ""))
+        )
+        if experiment_contract_relative != Path(EXPERIMENT_CONTRACT_FILE):
+            raise ValueError("unexpected experiment contract path")
+        portable_experiment_contract = json.loads(
+            (root / experiment_contract_relative).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
+        portable_experiment_contract = {}
+    experiment_contract_ready = (
+        supports_bundle_feature(
+            str(manifest.get("version")), "portable_experiment_contract"
+        )
+        and valid_experiment_contract(
+            portable_experiment_contract,
+            expected_source_config_sha256=manifest.get(
+                "experiment_config_sha256"
+            ),
+        )
+        and digest_json(portable_experiment_contract)
+            == manifest.get("experiment_contract_sha256")
+    )
+    if supports_bundle_feature(
+        str(manifest.get("version")), "portable_experiment_contract"
+    ) and not experiment_contract_ready:
+        failures.append("experiment_contract")
     try:
         certification_relative = _safe_relative(
             str(manifest.get("certification_file", ""))
@@ -797,6 +875,26 @@ def verify_bundle(
         and portable_certification.get("failed_gates") == []
         and portable_certification.get("source_dataset_sha256")
             == manifest.get("source_dataset_sha256")
+        and (
+            not supports_bundle_feature(
+                str(manifest.get("version")), "portable_experiment_contract"
+            )
+            or (
+                experiment_contract_ready
+                and portable_certification.get("experiment_contract_sha256")
+                    == manifest.get("experiment_contract_sha256")
+                and portable_certification.get("gates", {}).get(
+                    "portable_experiment_contract"
+                ) is True
+                and portable_certification.get("measurements", {}).get(
+                    "experiment_contract"
+                ) == {
+                    "version": portable_experiment_contract["version"],
+                    "sha256": manifest.get("experiment_contract_sha256"),
+                    "verified": True,
+                }
+            )
+        )
         and certification_policy_ready
         and (
             not supports_bundle_feature(
@@ -1611,7 +1709,8 @@ def verify_bundle(
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "2.2" if manifest.get("version") == BUNDLE_VERSION
+            "2.3" if manifest.get("version") == BUNDLE_VERSION
+            else "2.2" if manifest.get("version") == "16.0"
             else "2.1" if manifest.get("version") == "15.0"
             else "2.0" if manifest.get("version") == "14.0"
             else "1.9" if manifest.get("version") == "13.0"
@@ -1635,6 +1734,14 @@ def verify_bundle(
         and dataset_card.get("certification", {}).get("certified") is True
         and (
             not supports_bundle_feature(
+                str(version), "portable_experiment_contract"
+            )
+            or dataset_card.get("certification", {}).get(
+                "experiment_contract_sha256"
+            ) == manifest.get("experiment_contract_sha256")
+        )
+        and (
+            not supports_bundle_feature(
                 str(version), "certification_policy_binding"
             )
             or dataset_card.get("certification", {}).get("policy_sha256")
@@ -1645,7 +1752,7 @@ def verify_bundle(
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
             manifest.get("version") not in {
-                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0",
+                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0", "16.0",
                 BUNDLE_VERSION,
             }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
@@ -1692,7 +1799,7 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     trusted_attestation = (
         manifest.get("version") in {
-            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0",
+            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0", "16.0",
             BUNDLE_VERSION,
         }
         and trusted_public_key is not None
@@ -1725,6 +1832,7 @@ def verify_bundle(
         "task_lineage_ready": task_lineage_ready,
         "production_preflight_ready": production_preflight_ready,
         "experiment_config_ready": experiment_config_ready,
+        "experiment_contract_ready": experiment_contract_ready,
         "trajectory_purpose_ready": trajectory_purpose_ready,
         "model_response_provenance_ready": model_response_provenance_ready,
         "model_response_authorization_ready": model_response_authorization_ready,

@@ -185,14 +185,14 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 
 生产认证还会原子生成 `training_materials_bundle/`。该目录不保留本机绝对路径，按内容身份保存每个
 环境的任务、运行时代码、业务数据、验收证据和 `live_rollout.json`，并生成 `transitions.jsonl` 与
-`bundle_manifest.json`。Bundle v16 同时包含去除本机路径的 `certification.json`、机器可读
+`bundle_manifest.json`。Bundle v17 同时包含去除本机路径的 `certification.json`、机器可读
 `dataset_card.json`，并要求便携认证保留及验证 production profile 与新鲜 preflight 证据。JSONL 每行
 是一条可重建的 schema v2 transition，并携带任务、类别、episode、
 任务生成模型与 provider 身份、生成 seed、Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与
 `bundle_sha256` 再次校验；导出失败或包校验失败时，即使此前统计门禁通过，也不会产生
 `production_prepared_for_agentic_rl`。
 
-Bundle v16 会递归清点 `.dockerignore` 允许进入镜像的完整构建上下文，而不再只复制预定义文件名；嵌套
+Bundle v17 会递归清点 `.dockerignore` 允许进入镜像的完整构建上下文，而不再只复制预定义文件名；嵌套
 Python 包、任务扩展和 JSON 配置都会按内容摘要进入环境目录。导出后验证器重新计算该清单并验证规范化
 `.dockerignore`、Dockerfile 与所有重建输入均存在；因此“源目录曾经构建成功但便携包遗漏运行文件”不能
 获得 `portable_build_context_ready`。
@@ -201,19 +201,19 @@ Python 包、任务扩展和 JSON 配置都会按内容摘要进入环境目录�
 `transitions.jsonl` 逐条精确比较。校验范围包含 item/episode/step 引用、模型身份、parsed action 与原始
 输出的一致性、observation 链、reward、usage 以及 terminated/truncated 终止语义，防止只重算文件哈希
 就让语义损坏的轨迹通过。JSONL 由固定字段白名单投影产生；完整 trainer-only 证据仍保存在对应环境目录，
-并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。Bundle v16 延续 v14 的
+并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。Bundle v17 延续 v14 的
 用途隔离，把
 这些已导出的 rollout 标记为 `certification_evidence` 与 `direct_training_status=not_certified`：它们证明环境
 和奖励可以工作，但不自动成为策略优化目标。通过认证的是可重建环境及其新鲜 rollout 采集能力；下游若要
 复用验收轨迹做离线训练，必须另行完成算法、分布偏差和行为策略兼容性审批。
 
-Bundle v16 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
+Bundle v17 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
 记录身份与排序、环境目录和 Docker 重建入口、运行接口来源，以及 policy input/output、环境反馈和
 trainer-only 证据边界。验证器使用内置规范与文件逐项比较；即使同时修改契约并重算所有外层哈希，也不能
-把 trainer-only 字段伪装成策略输入。Bundle v16 还要求每个环境携带并校验
+把 trainer-only 字段伪装成策略输入。Bundle v17 还要求每个环境携带并校验
 `agentic_training_value_live.json` 的容器执行身份；rollout 与奖励校准都必须匹配同一份 v5 镜像
 provenance，并重新读取 `data_governance.json` 复核 Agent、User Simulator 与 Reward Judge 的模型和
-provider 摘要授权，并校验 `task_lineage.json`。Bundle v16 还从每次 Agent 响应和 trainer-only runtime
+provider 摘要授权，并校验 `task_lineage.json`。Bundle v17 还从每次 Agent 响应和 trainer-only runtime
 replay 重算 provider 实际返回的模型分布与响应 ID 摘要；配置的模型别名不能再替代实际响应 provenance，
 原始 provider response ID 不会落盘。实际模型还必须分别属于冻结的 generation、Agent、runtime allowlist；
 allowlist 默认仅含各角色配置模型，也可通过 `LLM_ALLOWED_RESPONSE_MODELS`、
@@ -226,12 +226,18 @@ v11 包缺少 production preflight
 更早版本也只能
 验证各自声明的历史契约，不能满足当前受信发布门禁。
 
-Bundle v16 的验证器还会把每一条 `transitions.jsonl` 记录作为独立消费者输入重新校验：顶层字段和
+Bundle v17 新增 `experiment_contract.json`。它从冻结实验配置中删除本机项目路径和任务路径，保留
+production/live/Docker 模式、评分阈值、留出批次与 rollout 规模、三类模型 provider、允许的实际响应模型、
+源码与输入摘要以及签名公钥身份。原始配置摘要、可移植配置摘要和契约摘要分别绑定到认证报告、素材清单、
+数据集卡和签名 Bundle。验证器会重新检查生产参数下限和隐私扫描；同步重写契约及所有外层哈希也不能把
+300 个留出请求改成小样本，或把 live Docker 实验改成 offline/in-process 实验。
+
+Bundle v17 的验证器还会把每一条 `transitions.jsonl` 记录作为独立消费者输入重新校验：顶层字段和
 policy transition 字段必须与契约精确相等，消息只允许 `role` 与 `content`，数值必须有限，内容摘要、
 类别、split、任务家族和生成 provenance 必须符合格式。嵌套额外字段即使未命中已知敏感关键词，也会以
 `consumer_records` 失败，避免通过“看似无害”的键把 trainer-only 信息带入下游策略输入。
 
-v16 验证器还会把 preflight 的 generation、Rollout Agent、User/Judge 三个 provider 分别与每个环境中的
+v16 及后续验证器还会把 preflight 的 generation、Rollout Agent、User/Judge 三个 provider 分别与每个环境中的
 生成 provenance 和 `data_governance.json` 交叉核对；三个各自格式合法但来自不同实验的身份不能拼成合格包。
 认证阶段生成的 preflight v1.2 还会绑定完整冻结实验配置的 SHA-256 与三类响应模型 allowlist；任务配比、门禁阈值、holdout 参数或
 其他配置发生变化后，旧 preflight 不能复用。启动阶段的 v1.0 preflight 仅作环境诊断，不构成认证证据。
@@ -269,7 +275,7 @@ uv run python scripts/verify_training_materials.py \
 验证器会分别重新计算任务文件、沙箱可移植文件树、rollout JSON 和整批清单摘要；任何文件变化、
 轨迹数量变化或重复沙箱身份都会返回非零退出码。评估器版本作为 provenance 固化，但后续评估器升级
 不会被误判成已认证沙箱遭到篡改。v1/v2/v3 清单仍可按各自规则验证，但应重新认证并升级为同时包含
-执行环境、任务生成 provenance 和 canonical 认证策略绑定的 v5 后再导入训练系统。v4 及更早版本
+执行环境、任务生成 provenance、canonical 认证策略和可移植实验契约绑定的 v6 后再导入训练系统。v5 及更早版本
 仍可按各自历史 schema 做完整性验证，但不能导出为当前生产准备 Bundle。
 
 迁移或导入训练平台后可独立验证便携包：

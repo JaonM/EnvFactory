@@ -1,6 +1,7 @@
 import unittest
 
 from env_factory.material_consumer import (
+    BUNDLE_VERSION,
     DATASET_SPLITS,
     assign_dataset_splits,
     consumer_contract,
@@ -59,7 +60,12 @@ class MaterialConsumerTest(unittest.TestCase):
     def test_consumer_schema_makes_split_part_of_every_record(self):
         contract = consumer_contract()
         records = contract["records"]
-        self.assertEqual(contract["bundle_version"], "16.0")
+        self.assertEqual(contract["bundle_version"], BUNDLE_VERSION)
+        self.assertEqual(contract["experiment_contract"], "experiment_contract.json")
+        self.assertIn(
+            "frozen_experiment_configuration_is_portable_and_bound",
+            contract["invariants"],
+        )
         self.assertIn("task_lineage", contract["environments"])
         self.assertIn("dockerignore", contract["environments"])
         self.assertIn("generated_task_equals_runtime_task", contract["invariants"])

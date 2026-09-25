@@ -10,8 +10,10 @@ import re
 from typing import Any
 
 
-MATERIAL_MANIFEST_VERSION = "5.0"
-SUPPORTED_MATERIAL_MANIFEST_VERSIONS = {"1.0", "2.0", "3.0", "4.0", "5.0"}
+MATERIAL_MANIFEST_VERSION = "6.0"
+SUPPORTED_MATERIAL_MANIFEST_VERSIONS = {
+    "1.0", "2.0", "3.0", "4.0", "5.0", "6.0",
+}
 
 
 EVIDENCE_NAMES = {

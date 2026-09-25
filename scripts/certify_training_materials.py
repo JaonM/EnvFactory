@@ -45,6 +45,10 @@ from env_factory.certification_policy import (
     policy_for_experiment,
 )
 from env_factory.execution_provenance import verify_execution_provenance
+from env_factory.experiment_contract import (
+    build_experiment_contract,
+    valid_experiment_contract,
+)
 from env_factory.task_similarity import near_duplicate_rate, task_partition_isolation
 from env_factory.generation_provenance import generation_provenance_snapshot
 from env_factory.runtime_provenance import valid_container_rollout_execution
@@ -811,6 +815,12 @@ def certify(
     experiment_config_sha256 = (
         digest_json(config) if isinstance(config, Mapping) else None
     )
+    experiment_contract = build_experiment_contract(config)
+    experiment_contract_verified = valid_experiment_contract(
+        experiment_contract,
+        expected_source_config_sha256=experiment_config_sha256,
+    )
+    experiment_contract_sha256 = digest_json(experiment_contract)
     preflight_verified = (
         isinstance(expected_generation_provider, Mapping)
         and isinstance(expected_agent_provider, Mapping)
@@ -1429,6 +1439,8 @@ def certify(
         "evaluator_source_digest": history.get("config", {}).get("source_digest"),
         "execution_provenance": recorded_execution,
         "experiment_config_sha256": experiment_config_sha256,
+        "experiment_contract": experiment_contract,
+        "experiment_contract_sha256": experiment_contract_sha256,
         "certification_policy": dict(policy),
         "certification_policy_sha256": certification_policy_sha256,
         "items": material_items,
@@ -1440,6 +1452,11 @@ def certify(
             "version": policy["version"],
             "sha256": certification_policy_sha256,
             "verified": certification_policy_verified,
+        },
+        "experiment_contract": {
+            "version": experiment_contract["version"],
+            "sha256": experiment_contract_sha256,
+            "verified": experiment_contract_verified,
         },
         "requested_tasks": total,
         "generated_tasks": len(generated),
@@ -1607,6 +1624,7 @@ def certify(
 
     gates = {
         "certification_policy": certification_policy_verified,
+        "portable_experiment_contract": experiment_contract_verified,
         "production_experiment_profile": production_experiment,
         "production_preflight": preflight_verified,
         "materialized_sample_size": (
@@ -1757,6 +1775,7 @@ def attach_bundle_verification(
         and verification.get("task_lineage_ready") is True
         and verification.get("production_preflight_ready") is True
         and verification.get("experiment_config_ready") is True
+        and verification.get("experiment_contract_ready") is True
         and verification.get("trajectory_purpose_ready") is True
         and verification.get("model_response_provenance_ready") is True
         and verification.get("model_response_authorization_ready") is True

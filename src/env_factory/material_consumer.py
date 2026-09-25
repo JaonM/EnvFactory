@@ -15,8 +15,9 @@ TRANSITIONS_FILE = "transitions.jsonl"
 CERTIFICATION_FILE = "certification.json"
 DATASET_CARD_FILE = "dataset_card.json"
 CONSUMER_CONTRACT_FILE = "consumer_contract.json"
+EXPERIMENT_CONTRACT_FILE = "experiment_contract.json"
 BUNDLE_SIGNATURE_FILE = "bundle_manifest.sig"
-BUNDLE_VERSION = "16.0"
+BUNDLE_VERSION = "17.0"
 DATASET_SPLITS = ("train", "validation", "test")
 FEATURE_VERSIONS = {
     "splits": {"6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0", "16.0"},
@@ -34,7 +35,11 @@ FEATURE_VERSIONS = {
     "consumer_record_validation": {"16.0"},
     "portable_build_context": {"16.0"},
     "certification_policy_binding": {"16.0"},
+    "portable_experiment_contract": {"17.0"},
 }
+for _feature_versions in FEATURE_VERSIONS.values():
+    if _feature_versions != {BUNDLE_VERSION}:
+        _feature_versions.add(BUNDLE_VERSION)
 
 
 def supports_bundle_feature(bundle_version: str, feature: str) -> bool:
@@ -195,6 +200,11 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
         "version": "1.0",
         "kind": "agentic_rl_training_material_consumer_contract",
         "bundle_version": bundle_version,
+        **({
+            "experiment_contract": EXPERIMENT_CONTRACT_FILE,
+        } if supports_bundle_feature(
+            bundle_version, "portable_experiment_contract"
+        ) else {}),
         "records": {
             "path": TRANSITIONS_FILE,
             "media_type": "application/x-ndjson",
@@ -343,6 +353,12 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
                 ["portable_inventory_covers_complete_docker_build_context"]
                 if supports_bundle_feature(
                     bundle_version, "portable_build_context"
+                ) else []
+            ),
+            *(
+                ["frozen_experiment_configuration_is_portable_and_bound"]
+                if supports_bundle_feature(
+                    bundle_version, "portable_experiment_contract"
                 ) else []
             ),
         ],
