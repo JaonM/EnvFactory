@@ -308,15 +308,39 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                 )
                 if grounding_attempt >= self.retries:
                     break
+                repair_payload: dict[str, Any] = {
+                    "task_description": description,
+                    "grounding_issues": [str(exc)] + list(audit.get("issues", [])),
+                    "task_intent": task_intent,
+                    "output": description,
+                }
+                repair_instruction = ""
+                if (
+                    "high-stakes task requires authoritative source URLs" in str(exc)
+                    and not has_source_urls
+                ):
+                    # Avoid anchoring a smaller model on the unsafe domain it
+                    # repeatedly failed to remove.  Preserve the validated route
+                    # shape, not the rejected task prose.
+                    repair_payload = {
+                        "keywords": keywords,
+                        "task_type": task_type,
+                        "style": style,
+                        "task_intent": task_intent,
+                        "training_category": training_category,
+                        "required_route_plan": description.get("route_plan"),
+                        "grounding_issues": [str(exc)],
+                        "output": description_output,
+                    }
+                    repair_instruction = (
+                        "这是重新生成而不是改写：不要复用上一版任务的领域、对象或高风险措辞；"
+                        "仅保留 required_route_plan 的动作数量、依赖关系和固定 task_intent，"
+                        "围绕安全关键词生成全新的低风险业务任务。"
+                    )
                 repaired_description = self._call(
                     "task_description.grounding_repair",
-                    "修复任务描述，使任务能够由用户运行时输入、明确业务资料或工具能力完成。补充缺失的权威值或规则，或明确要求 Agent 在信息不足时向用户澄清；不得直接编造隐藏答案。必须逐条解决 grounding_issues 中的真实校验错误。若错误指出缺少权威来源，必须彻底移除医疗诊断、食物中毒判断、用药、法律、合规、税务、证券或投资建议等高风险目标，并在保持 task_intent 的前提下改写为无需权威事实的低风险主题；仅改措辞但保留高风险目标不算修复。不得要求输出思考过程、推理过程或隐藏思维链，只能要求简短结论依据。保持原 task_intent 不变，返回完整任务描述对象。",
-                    {
-                        "task_description": description,
-                        "grounding_issues": [str(exc)] + list(audit.get("issues", [])),
-                        "task_intent": task_intent,
-                        "output": description,
-                    },
+                    "修复任务描述，使任务能够由用户运行时输入、明确业务资料或工具能力完成。补充缺失的权威值或规则，或明确要求 Agent 在信息不足时向用户澄清；不得直接编造隐藏答案。必须逐条解决 grounding_issues 中的真实校验错误。若错误指出缺少权威来源，必须彻底移除医疗诊断、食物中毒判断、用药、法律、合规、税务、证券或投资建议等高风险目标，并在保持 task_intent 的前提下改写为无需权威事实的低风险主题；仅改措辞但保留高风险目标不算修复。不得要求输出思考过程、推理过程或隐藏思维链，只能要求简短结论依据。保持原 task_intent 不变，返回完整任务描述对象。" + repair_instruction,
+                    repair_payload,
                 )
                 description = self._unwrap_task_description(repaired_description)
                 if (
@@ -466,7 +490,9 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                      "previous_tables": table_definitions, "output": table_output},
                 )
                 try:
-                    candidate_tables = table_design.get("tables")
+                    candidate_tables = self._normalize_structural_constraints(
+                        table_design.get("tables")
+                    )
                     self._validate_table_definitions(candidate_tables)
                     self._validate_authoritative_source_schema(
                         task_description=description,
@@ -1254,14 +1280,15 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
 
         implementation_result = self._call(
             "tool_implementation_specs",
-            "为可以直接由数据表操作实现的业务工具生成声明式实现。operation 支持 select、aggregate_count、insert、update、delete；复杂计算、跨表业务决策、文档生成和噪声工具不要生成 spec。filters.argument 以及 selector/values/changes 的键必须来自工具 parameters，对应值必须是目标表字段。operator 只能是 eq、in、contains、gte、lte。只返回 specs 数组。",
+            "为可以直接由数据表操作实现的业务工具生成声明式实现。operation 支持 select、aggregate_count、insert、update、delete；复杂计算、跨表业务决策、文档生成和噪声工具不要生成 spec。filters.argument 以及 selector/values/changes 的键必须来自工具 parameters，对应值必须是目标表字段。operator 只能是 eq、in、contains、gte、lte。若公开参数是关联实体的可读字段而目标列是外键，filter.resolve 必须声明关联表 table、匹配字段 match_column 和写入外键比较的 value_column。若公开返回字段名与表字段名不同，projection_aliases 使用公开字段名到表字段名的映射。只返回 specs 数组。",
             {
                 "business_model": business_model,
                 "tools": candidate_tools,
                 "output": {"specs": [{
                     "tool_name": "string", "operation": "select", "table": "string",
-                    "filters": [{"argument": "string", "column": "string", "operator": "eq"}],
-                    "projection": ["string"], "order_by": ["string"], "result_field": "records",
+                    "filters": [{"argument": "string", "column": "string", "operator": "eq", "resolve": {"table": "string", "match_column": "string", "value_column": "string"}}],
+                    "projection": ["string"], "projection_aliases": {"public_field": "table_column"},
+                    "order_by": ["string"], "result_field": "records",
                     "selector": {"tool_argument": "table_column"},
                     "values": {"tool_argument": "table_column"},
                     "changes": {"tool_argument": "table_column"},
@@ -1362,8 +1389,22 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                 if coverage_error is not None:
                     raise coverage_error
 
+        tool_implementations = self._complete_filter_resolvers(
+            implementations=tool_implementations,
+            tables=business_model["tables"],
+        )
+        self._validate_tool_implementations(
+            tool_implementations,
+            tools=candidate_tools,
+            tables=business_model["tables"],
+        )
         tool_implementations = self._complete_dependency_projections(
             implementations=tool_implementations,
+            tools=candidate_tools,
+            tables=business_model["tables"],
+        )
+        self._validate_tool_implementations(
+            tool_implementations,
             tools=candidate_tools,
             tables=business_model["tables"],
         )
@@ -2598,11 +2639,16 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                     result_field = implementation.get("result_field")
                     projection = implementation.get("projection")
                     if isinstance(result_field, str) and isinstance(projection, list):
+                        aliases = implementation.get("projection_aliases", {})
                         for variable, json_path in capture.items():
                             if json_path == f"$.{result_field}":
                                 capture_shapes[variable] = {
                                     field for field in projection if isinstance(field, str)
                                 }
+                                if isinstance(aliases, dict):
+                                    capture_shapes[variable].update(
+                                        alias for alias in aliases if isinstance(alias, str)
+                                    )
                 captures.update(capture)
             if scenario["kind"] == "goal_success":
                 if training_category == "direct_response" and success_business_calls:
@@ -2820,6 +2866,9 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
             projection = implementation.get("projection", [])
             if isinstance(result_field, str) and result_field.strip():
                 fields = [item for item in projection if isinstance(item, str)]
+                aliases = implementation.get("projection_aliases", {})
+                if isinstance(aliases, dict):
+                    fields.extend(alias for alias in aliases if isinstance(alias, str))
                 prior_outputs.append((result_field, fields))
         success_steps.extend([
             {
@@ -3277,6 +3326,39 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                     or rule.get("operator") not in {"eq", "in", "contains", "gte", "lte"}
                 ):
                     raise PipelineGenerationError(f"tool_implementations[{index}] has an invalid filter")
+                resolver = rule.get("resolve")
+                if resolver is not None:
+                    if not isinstance(resolver, dict):
+                        raise PipelineGenerationError(
+                            f"tool_implementations[{index}] has an invalid filter resolver"
+                        )
+                    resolver_table = resolver.get("table")
+                    match_column = resolver.get("match_column")
+                    value_column = resolver.get("value_column")
+                    if (
+                        resolver_table not in table_columns
+                        or match_column not in table_columns[resolver_table]
+                        or value_column not in table_columns[resolver_table]
+                    ):
+                        raise PipelineGenerationError(
+                            f"tool_implementations[{index}] resolver references an invalid table column"
+                        )
+                    target_table = next(
+                        item for item in tables if item.get("table_name") == table
+                    )
+                    foreign_keys = target_table.get("foreign_keys", [])
+                    if not any(
+                        isinstance(foreign, dict)
+                        and foreign.get("column") == rule.get("column")
+                        and (foreign.get("ref_table") or foreign.get("references_table"))
+                            == resolver_table
+                        and (foreign.get("ref_column") or foreign.get("references_column"))
+                            == value_column
+                        for foreign in foreign_keys
+                    ):
+                        raise PipelineGenerationError(
+                            f"tool_implementations[{index}] resolver is not backed by a foreign key"
+                        )
             for field in ("projection", "order_by"):
                 values = spec.get(field, [])
                 if not isinstance(values, list) or any(
@@ -3284,6 +3366,16 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                     for value in values
                 ):
                     raise PipelineGenerationError(f"tool_implementations[{index}].{field} is invalid")
+            projection_aliases = spec.get("projection_aliases", {})
+            if not isinstance(projection_aliases, dict) or any(
+                not isinstance(alias, str) or not alias
+                or not isinstance(column, str) or column not in table_columns[table]
+                or alias in spec.get("projection", [])
+                for alias, column in projection_aliases.items()
+            ):
+                raise PipelineGenerationError(
+                    f"tool_implementations[{index}].projection_aliases is invalid"
+                )
             for field in ("selector", "values", "changes"):
                 mapping = spec.get(field, {})
                 if not isinstance(mapping, dict) or any(
@@ -3301,6 +3393,53 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
             if operation == "update" and not spec.get("changes"):
                 raise PipelineGenerationError(f"tool_implementations[{index}] requires changes")
             seen.add(name)
+
+    @staticmethod
+    def _complete_filter_resolvers(
+        *, implementations: list[dict[str, Any]], tables: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Resolve human-readable related-entity arguments through declared FKs."""
+        table_map = {
+            table.get("table_name"): table for table in tables
+            if isinstance(table, dict) and isinstance(table.get("table_name"), str)
+        }
+        completed = copy.deepcopy(implementations)
+        for spec in completed:
+            target = table_map.get(spec.get("table"), {})
+            foreign_keys = target.get("foreign_keys", []) if isinstance(target, dict) else []
+            for rule in spec.get("filters", []):
+                if not isinstance(rule, dict) or rule.get("resolve") is not None:
+                    continue
+                foreign = next((
+                    item for item in foreign_keys
+                    if isinstance(item, dict) and item.get("column") == rule.get("column")
+                ), None)
+                if not foreign:
+                    continue
+                related_name = foreign.get("ref_table") or foreign.get("references_table")
+                value_column = foreign.get("ref_column") or foreign.get("references_column")
+                related = table_map.get(related_name)
+                argument = rule.get("argument")
+                if not isinstance(related, dict) or not isinstance(argument, str):
+                    continue
+                related_columns = {
+                    column.get("name") for column in related.get("columns", [])
+                    if isinstance(column, dict)
+                }
+                candidates = [argument]
+                prefix = f"{related_name}_"
+                if isinstance(related_name, str) and argument.startswith(prefix):
+                    candidates.append(argument[len(prefix):])
+                match_column = next(
+                    (candidate for candidate in candidates if candidate in related_columns), None
+                )
+                if match_column and value_column in related_columns:
+                    rule["resolve"] = {
+                        "table": related_name,
+                        "match_column": match_column,
+                        "value_column": value_column,
+                    }
+        return completed
 
     @staticmethod
     def _validate_business_tool_semantics(
@@ -3496,8 +3635,22 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
             projection = spec.get("projection", [])
             if not isinstance(projection, list):
                 projection = []
+            projection = list(dict.fromkeys([*projection, *required]))
             if projection:
-                spec["projection"] = list(dict.fromkeys([*projection, *required]))
+                spec["projection"] = projection
+            aliases = spec.get("projection_aliases", {})
+            if not isinstance(aliases, dict):
+                aliases = {}
+            table_name = str(spec.get("table", ""))
+            for public_name in sorted(schema_fields - set(available)):
+                candidates = [
+                    column for column in available
+                    if public_name == f"{table_name}_{column}"
+                ]
+                if len(candidates) == 1 and public_name not in projection:
+                    aliases.setdefault(public_name, candidates[0])
+            if aliases:
+                spec["projection_aliases"] = aliases
         return completed
 
     @staticmethod
@@ -3513,7 +3666,6 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
         work and therefore fail the stateful buildability gate.
         """
         completed = [dict(item) for item in implementations]
-        implemented_names = {item.get("tool_name") for item in completed}
         raw_predicates = (
             semantic_goal.get("row_predicates", [])
             if isinstance(semantic_goal, dict) else []
@@ -3557,10 +3709,17 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
         for tool in tools:
             function = tool.get("function", {}) if isinstance(tool, dict) else {}
             name = function.get("name")
-            if not isinstance(name, str) or name in implemented_names:
+            if not isinstance(name, str):
                 continue
             label = f"{name} {function.get('description', '')}".lower()
             if not any(marker in label for marker in ("update", "modify", "更新", "修改", "修正")):
+                continue
+            existing = next(
+                (item for item in completed if item.get("tool_name") == name), None
+            )
+            if isinstance(existing, dict) and existing.get("operation") in {
+                "insert", "update", "delete",
+            }:
                 continue
             properties = function.get("parameters", {}).get("properties", {})
             if not isinstance(properties, dict):
@@ -3601,11 +3760,13 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                     })
             if len(candidates) == 1:
                 self_spec = candidates[0]
+                completed = [
+                    item for item in completed if item.get("tool_name") != name
+                ]
                 TaskGenerationPipeline._validate_tool_implementations(
                     [*completed, self_spec], tools=tools, tables=tables
                 )
                 completed.append(self_spec)
-                implemented_names.add(name)
                 logger.warning(
                     "compiled deterministic stateful implementation: tool=%s table=%s",
                     name, self_spec["table"],
@@ -6446,6 +6607,61 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                             f"table definitions[{index}] has unsupported CHECK constraint: {expression}"
                         ) from exc
             names.add(name)
+
+    @staticmethod
+    def _normalize_structural_constraints(tables: Any) -> Any:
+        """Compile common descriptive UNIQUE/NOT NULL text into schema fields.
+
+        Mid-tier models occasionally put structural constraints such as
+        ``name 唯一且非空`` in CHECK constraints.  Those are not executable
+        CHECK expressions, but their meaning is unambiguous and already has a
+        canonical representation in the schema.
+        """
+        if not isinstance(tables, list):
+            return tables
+        normalized = copy.deepcopy(tables)
+        for table in normalized:
+            if not isinstance(table, dict):
+                continue
+            columns = {
+                column.get("name"): column for column in table.get("columns", [])
+                if isinstance(column, dict) and isinstance(column.get("name"), str)
+            }
+            indexes = table.setdefault("indexes", [])
+            kept = []
+            for constraint in table.get("constraints", []):
+                if not isinstance(constraint, str):
+                    kept.append(constraint)
+                    continue
+                lowered = constraint.casefold()
+                unique = "唯一" in constraint or bool(re.search(r"\bunique\b", lowered))
+                non_null = (
+                    "非空" in constraint
+                    or bool(re.search(r"\bnot[ _-]?null\b", lowered))
+                    or "不能为空" in constraint
+                )
+                mentioned = [
+                    name for name in columns
+                    if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", constraint)
+                ]
+                if (unique or non_null) and len(mentioned) == 1:
+                    column_name = mentioned[0]
+                    if unique and not any(
+                        isinstance(index, dict)
+                        and index.get("unique") is True
+                        and index.get("columns") == [column_name]
+                        for index in indexes
+                    ):
+                        indexes.append({
+                            "name": f"uq_{table.get('table_name', 'table')}_{column_name}",
+                            "columns": [column_name], "unique": True,
+                        })
+                    if non_null:
+                        columns[column_name]["nullable"] = False
+                    continue
+                kept.append(constraint)
+            table["constraints"] = kept
+        return normalized
 
     @staticmethod
     def _materialize_business_data(

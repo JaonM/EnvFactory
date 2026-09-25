@@ -44,6 +44,32 @@ class IntegrityTest(unittest.TestCase):
             self.assertEqual(call.call_count, 1)
             self.assertEqual(call.call_args.kwargs["response_schema"]["properties"]["label"]["enum"], ["pass", "fail"])
 
+    def test_model_metric_maps_declared_business_data_to_runtime_state(self):
+        contract = {"metrics": [{
+            "id": "quality", "score_range": [0, 1],
+            "evaluation_inputs": ["business_data"],
+            "evaluator": {
+                "kind": "external_llm_judge",
+                "score_mapping": {"pass": 1, "fail": 0},
+            },
+        }]}
+        evaluator = ContractModelMetricEvaluator(contract, self.store)
+        captured = {}
+
+        def fake_chat(client, messages, **kwargs):
+            captured["evidence"] = json.loads(messages[1]["content"])["runtime_evidence"]
+            return {"label": "pass"}
+
+        with patch.dict("os.environ", {"SANDBOX_EVALUATOR_MOCK": "0"}), patch(
+            "env_factory.sandbox_runtime.RuntimeLLMClient.json_chat", new=fake_chat,
+        ):
+            self.assertEqual(evaluator.evaluate_all({
+                "business_state": {"orders": [{"id": 1}]},
+            }, {}), {"quality": 1})
+        self.assertEqual(captured["evidence"], {
+            "business_data": {"orders": [{"id": 1}]},
+        })
+
     def test_hybrid_outcome_is_a_platform_model_metric(self):
         contract = {"metrics": [{"id": "quality", "score_range": [0, 1], "evaluator": {
             "kind": "hybrid_outcome",

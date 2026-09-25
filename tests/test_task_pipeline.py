@@ -266,6 +266,34 @@ class AgentActionContractTest(unittest.TestCase):
         self.assertEqual(result[0]["selector"], {"product_name": "name"})
         self.assertEqual(result[0]["changes"], {"new_status": "status"})
 
+    def test_deterministic_stateful_update_replaces_non_mutating_model_spec(self):
+        tools = [{"function": {
+            "name": "update_product", "description": "更新商品状态",
+            "parameters": {"properties": {
+                "product_name": {"type": "string"},
+                "new_status": {"type": "string"},
+            }},
+        }}]
+        tables = [{"table_name": "product", "columns": [
+            {"name": "name", "type": "VARCHAR(64)"},
+            {"name": "status", "type": "VARCHAR(32)"},
+        ]}]
+        result = TaskGenerationPipeline._complete_stateful_tool_implementations(
+            implementations=[{
+                "tool_name": "update_product", "operation": "select",
+                "table": "product", "filters": [], "projection": ["name"],
+                "order_by": [], "result_field": "records",
+            }],
+            tools=tools, tables=tables,
+            semantic_goal={"row_predicates": [{
+                "table": "product", "where": {"name": "A"},
+                "values": {"status": "active"}, "count": 1,
+            }]},
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["operation"], "update")
+        self.assertEqual(result[0]["changes"], {"new_status": "status"})
+
     def test_file_deliverable_detection(self):
         self.assertTrue(TaskGenerationPipeline._requires_file_deliverable({
             "task": "生成可打印的工作坊流程表",
@@ -1402,6 +1430,61 @@ class OpenAIToolArtifactTest(unittest.TestCase):
                 tools=tools, tables=tables,
             )
 
+    def test_foreign_key_filter_resolver_is_completed_and_validated(self):
+        tools = [{"function": {"name": "count_products", "parameters": {
+            "properties": {"brand_name": {"type": "string"}}
+        }}}]
+        tables = [
+            {"table_name": "brand", "columns": [
+                {"name": "id"}, {"name": "name"},
+            ], "foreign_keys": []},
+            {"table_name": "product", "columns": [
+                {"name": "id"}, {"name": "brand_id"},
+            ], "foreign_keys": [{
+                "column": "brand_id", "ref_table": "brand", "ref_column": "id",
+            }]},
+        ]
+        specs = [{
+            "tool_name": "count_products", "operation": "aggregate_count",
+            "table": "product", "result_field": "count",
+            "filters": [{
+                "argument": "brand_name", "column": "brand_id", "operator": "eq",
+            }],
+        }]
+        completed = TaskGenerationPipeline._complete_filter_resolvers(
+            implementations=specs, tables=tables,
+        )
+        self.assertEqual(completed[0]["filters"][0]["resolve"], {
+            "table": "brand", "match_column": "name", "value_column": "id",
+        })
+        TaskGenerationPipeline._validate_tool_implementations(
+            completed, tools=tools, tables=tables,
+        )
+        broken = copy.deepcopy(completed)
+        broken[0]["filters"][0]["resolve"]["value_column"] = "name"
+        with self.assertRaisesRegex(PipelineGenerationError, "foreign key"):
+            TaskGenerationPipeline._validate_tool_implementations(
+                broken, tools=tools, tables=tables,
+            )
+
+    def test_descriptive_unique_non_null_constraint_is_canonicalized(self):
+        tables = [{
+            "table_name": "ingredient",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "nullable": False},
+                {"name": "name", "type": "TEXT", "nullable": True},
+            ],
+            "primary_key": ["id"], "foreign_keys": [], "indexes": [],
+            "constraints": ["name 唯一且非空"],
+        }]
+        normalized = TaskGenerationPipeline._normalize_structural_constraints(tables)
+        self.assertEqual(normalized[0]["constraints"], [])
+        self.assertFalse(normalized[0]["columns"][1]["nullable"])
+        self.assertEqual(normalized[0]["indexes"], [{
+            "name": "uq_ingredient_name", "columns": ["name"], "unique": True,
+        }])
+        TaskGenerationPipeline._validate_table_definitions(normalized)
+
     def test_materialize_tools_writes_only_standard_tool_array(self):
         tools = [{
             "type": "function",
@@ -2320,6 +2403,34 @@ class RewardContractTest(unittest.TestCase):
             implementations=implementations, tools=tools, tables=tables
         )
         self.assertEqual(completed[0]["projection"], ["id", "product_name", "origin"])
+
+    def test_dependency_projection_aliases_table_qualified_public_field(self):
+        implementations = [{
+            "tool_name": "read_products", "operation": "select", "table": "product",
+            "projection": ["id"], "filters": [], "order_by": [], "result_field": "records",
+        }]
+        tools = [
+            {"function": {"name": "read_products", "parameters": {
+                "type": "object", "properties": {}, "required": [],
+            }}},
+            {"function": {"name": "consume_products", "parameters": {
+                "type": "object", "properties": {"rows": {
+                    "type": "array", "items": {"type": "object", "properties": {
+                        "product_name": {"type": "string", "description": "name"},
+                    }, "required": ["product_name"]},
+                }}, "required": ["rows"],
+            }}},
+        ]
+        tables = [{"table_name": "product", "columns": [
+            {"name": "id", "type": "INTEGER"}, {"name": "name", "type": "TEXT"},
+        ]}]
+        completed = TaskGenerationPipeline._complete_dependency_projections(
+            implementations=implementations, tools=tools, tables=tables,
+        )
+        self.assertEqual(completed[0]["projection_aliases"], {"product_name": "name"})
+        TaskGenerationPipeline._validate_tool_implementations(
+            completed, tools=tools, tables=tables,
+        )
 
     def test_stateful_tool_surface_requires_goal_fields(self):
         goal = {"row_predicates": [{

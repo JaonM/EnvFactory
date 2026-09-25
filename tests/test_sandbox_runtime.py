@@ -481,6 +481,60 @@ class SandboxRuntimeTest(unittest.TestCase):
             "records": [{"id": "1"}], "count": 1,
         })
 
+    def test_declarative_tool_resolves_human_name_through_foreign_key(self):
+        class FakeData:
+            def table(self, name):
+                return {
+                    "brands": [{"id": 7, "name": "Cotton"}],
+                    "products": [
+                        {"id": 1, "brand_id": 7},
+                        {"id": 2, "brand_id": 8},
+                    ],
+                }[name]
+
+        handler = DeclarativeToolCompiler(FakeData()).compile({
+            "tool_name": "count_products", "operation": "aggregate_count",
+            "table": "products", "result_field": "count",
+            "filters": [{
+                "argument": "brand_name", "column": "brand_id", "operator": "eq",
+                "resolve": {
+                    "table": "brands", "match_column": "name", "value_column": "id",
+                },
+            }],
+        })
+        self.assertEqual(handler({"brand_name": "Cotton"}), {"count": 1})
+        self.assertEqual(handler({"brand_name": "Unknown"}), {"count": 0})
+
+    def test_declarative_tool_resolves_name_list_and_projects_public_alias(self):
+        class FakeData:
+            def table(self, name):
+                return {
+                    "brands": [{"id": 7, "name": "Cotton"}, {"id": 8, "name": "Wool"}],
+                    "products": [
+                        {"id": 1, "name": "Shirt", "brand_id": 7},
+                        {"id": 2, "name": "Coat", "brand_id": 8},
+                    ],
+                }[name]
+
+        handler = DeclarativeToolCompiler(FakeData()).compile({
+            "tool_name": "find_products", "operation": "select",
+            "table": "products", "result_field": "records",
+            "filters": [{
+                "argument": "brand_names", "column": "brand_id", "operator": "in",
+                "resolve": {
+                    "table": "brands", "match_column": "name", "value_column": "id",
+                },
+            }],
+            "projection": ["id"], "projection_aliases": {"product_name": "name"},
+        })
+        self.assertEqual(handler({"brand_names": ["Cotton", "Wool"]}), {
+            "records": [
+                {"id": 1, "product_name": "Shirt"},
+                {"id": 2, "product_name": "Coat"},
+            ],
+            "count": 2,
+        })
+
     def test_manifest_store_write_operations(self):
         class MemoryStore:
             def __init__(self): self.rows = [{"id": "1", "value": "a"}]

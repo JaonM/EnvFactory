@@ -628,6 +628,7 @@ class DeclarativeToolCompiler:
         result_field = spec.get("result_field", "records")
         filters = spec.get("filters", [])
         projection = spec.get("projection", [])
+        projection_aliases = spec.get("projection_aliases", {})
         order_by = spec.get("order_by", [])
         if not isinstance(table, str) or not table or not isinstance(result_field, str) or not result_field:
             raise SandboxError("TOOL_SPEC_INVALID", "select spec requires table and result_field", 500)
@@ -639,8 +640,24 @@ class DeclarativeToolCompiler:
             for item in filters
         ):
             raise SandboxError("TOOL_SPEC_INVALID", "select filters are invalid", 500)
+        for item in filters:
+            resolver = item.get("resolve")
+            if resolver is not None and (
+                not isinstance(resolver, Mapping)
+                or not all(
+                    isinstance(resolver.get(field), str) and resolver[field]
+                    for field in ("table", "match_column", "value_column")
+                )
+            ):
+                raise SandboxError("TOOL_SPEC_INVALID", "filter resolver is invalid", 500)
         if not isinstance(projection, list) or not all(isinstance(item, str) for item in projection):
             raise SandboxError("TOOL_SPEC_INVALID", "select projection is invalid", 500)
+        if not isinstance(projection_aliases, Mapping) or any(
+            not isinstance(alias, str) or not alias
+            or not isinstance(column, str) or not column
+            for alias, column in projection_aliases.items()
+        ):
+            raise SandboxError("TOOL_SPEC_INVALID", "select projection aliases are invalid", 500)
         if not isinstance(order_by, list) or not all(isinstance(item, str) for item in order_by):
             raise SandboxError("TOOL_SPEC_INVALID", "select order_by is invalid", 500)
 
@@ -650,14 +667,32 @@ class DeclarativeToolCompiler:
                 argument = rule["argument"]
                 if argument not in arguments:
                     continue
+                expected_values = [arguments[argument]]
+                resolver = rule.get("resolve")
+                if isinstance(resolver, Mapping):
+                    requested = arguments[argument]
+                    requested_values = requested if isinstance(requested, list) else [requested]
+                    expected_values = [
+                        row.get(resolver["value_column"])
+                        for row in self.data.table(resolver["table"])
+                        if row.get(resolver["match_column"]) in requested_values
+                    ]
+                    if rule["operator"] == "in":
+                        expected_values = [expected_values]
                 rows = [
                     row for row in rows
-                    if self._matches(row.get(rule["column"]), arguments[argument], rule["operator"])
+                    if any(
+                        self._matches(row.get(rule["column"]), expected, rule["operator"])
+                        for expected in expected_values
+                    )
                 ]
             if order_by:
                 rows.sort(key=lambda row: tuple((row.get(field) is None, row.get(field)) for field in order_by))
-            if projection:
-                rows = [{field: row.get(field) for field in projection} for row in rows]
+            if projection or projection_aliases:
+                rows = [{
+                    **{field: row.get(field) for field in projection},
+                    **{alias: row.get(column) for alias, column in projection_aliases.items()},
+                } for row in rows]
             return rows
 
         def handler(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1163,6 +1198,7 @@ class ContractModelMetricEvaluator:
                     "recent_conversation": "conversation",
                     "terminal_observation": "public_observation",
                     "tool_results": "trajectory",
+                    "business_data": "business_state",
                 }
                 selected_context: dict[str, Any] = {}
                 for name in declared_inputs:
