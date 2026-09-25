@@ -56,6 +56,9 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
   `/health`。`/app/.runtime` 使用显式 UID/GID 与权限的 tmpfs，使非 root 进程能够创建 episode SQLite；
   只有测试通过但服务无法启动的镜像不能生成当前 v4 容器 provenance。
 - 工具契约、真实业务结果、mutation resistance 和奖励反事实全部通过。
+- 奖励反事实集合由每个冻结任务的成功轨迹、工具数量、依赖要求和噪声场景推导，不能由报告自行挑选；
+  必须覆盖适用的无工具回答、每个工具的参数破坏、每个依赖步骤的跳过、依赖乱序和噪声选择。缺失 case
+  直接使奖励完整性门禁失败，不能通过减少假阳性/假阴性分母获得更好结果。
 - 奖励假阳性率不高于 0.5%，假阴性率不高于 2%。
 - 奖励反事实必须使用生产配置的真实 evaluator，并通过刚刚构建的同一 Docker 镜像的 loopback HTTP
   协议重跑；宿主进程导入沙箱或 mock 报告只用于离线构建测试，不能进入生产认证。校准报告保存实际

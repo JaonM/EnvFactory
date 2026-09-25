@@ -162,6 +162,105 @@ def _counterfactual_counts(reports: Iterable[Mapping[str, Any]]) -> dict[str, in
     }
 
 
+def valid_reward_calibration(
+    report: Mapping[str, Any], task: Mapping[str, Any]
+) -> bool:
+    """Require the task-derived counterfactual matrix, not a cherry-picked subset."""
+    evidence = report.get("evidence")
+    cases = evidence.get("counterfactuals") if isinstance(evidence, Mapping) else None
+    if not isinstance(cases, Mapping):
+        return False
+    training = task.get("training_contract")
+    if not isinstance(training, Mapping):
+        training = {}
+    category = training.get(
+        "category", task.get("training_category", "multi_step_agentic")
+    )
+    tool_required = category != "direct_response"
+    dependency = training.get("dependency")
+    dependency_required = (
+        dependency.get("required", category == "multi_step_agentic")
+        if isinstance(dependency, Mapping)
+        else category == "multi_step_agentic"
+    )
+    acceptance = task.get("acceptance_contract")
+    scenarios = acceptance.get("executable_scenarios") if isinstance(
+        acceptance, Mapping
+    ) else None
+    if not isinstance(scenarios, list):
+        return False
+    by_kind = {
+        item.get("kind"): item for item in scenarios
+        if isinstance(item, Mapping) and isinstance(item.get("kind"), str)
+    }
+    success = by_kind.get("goal_success")
+    failure = by_kind.get("goal_failure")
+    if not isinstance(success, Mapping) or not isinstance(failure, Mapping):
+        return False
+    steps = success.get("steps")
+    if not isinstance(steps, list):
+        return False
+    tool_steps = [
+        step for step in steps
+        if isinstance(step, Mapping) and step.get("operation") == "tool_call"
+    ]
+    required = {"goal_success", "goal_failure"}
+    if tool_required and any(
+        isinstance(step, Mapping) and step.get("operation") == "agent_response"
+        for step in steps
+    ):
+        required.add("no_tools")
+    required.update(
+        f"corrupted_arguments_{index}"
+        for index, step in enumerate(tool_steps, start=1)
+        if isinstance(step.get("arguments"), Mapping) and step["arguments"]
+    )
+    if dependency_required and len(tool_steps) >= 2:
+        required.update(
+            f"skipped_tool_{index}" for index in range(1, len(tool_steps) + 1)
+        )
+        required.add("reordered_tools")
+    if task.get("noise_tools") and "noise_selection" in by_kind:
+        required.add("noise_selection")
+    if not required <= set(cases):
+        return False
+
+    positive = cases.get("goal_success")
+    if not (
+        isinstance(positive, Mapping)
+        and positive.get("status") == "completed"
+        and isinstance(positive.get("reward"), (int, float))
+        and not isinstance(positive.get("reward"), bool)
+        and positive["reward"] >= 0.6
+    ):
+        return False
+    for name in required - {"goal_success"}:
+        case = cases.get(name)
+        if not isinstance(case, Mapping) or case.get("status") not in {
+            "completed", "rejected",
+        }:
+            return False
+        reward = case.get("reward")
+        limit = 0.0 if name == "noise_selection" else 0.2
+        if case.get("status") == "completed":
+            if (
+                not isinstance(reward, (int, float))
+                or isinstance(reward, bool)
+                or reward > limit
+            ):
+                return False
+        elif reward is not None:
+            return False
+    return (
+        report.get("curriculum_training_ready") is True
+        and report.get("agentic_training_ready") is True
+        and report.get("hard_gates_passed") is True
+        and report.get("validation_mode") == "live_evaluator"
+        and report.get("failed_gates") == []
+        and report.get("failures") == []
+    )
+
+
 def valid_user_turn(step: Mapping[str, Any]) -> bool:
     result = step.get("result")
     return (
@@ -683,10 +782,22 @@ def certify(
         )
         for report in readiness_reports
     )
-    tool_and_reward_integrity = bool(agentic_reports) and all(
-        report.get("curriculum_training_ready") is True
-        and report.get("validation_mode") == "live_evaluator"
-        for report in agentic_reports
+    qualified_tasks = []
+    for item in qualified:
+        try:
+            value = load(Path(str(item.get("task_path", ""))))
+        except (OSError, json.JSONDecodeError, TypeError):
+            value = None
+        qualified_tasks.append(value if isinstance(value, Mapping) else {})
+    verified_reward_calibrations = sum(
+        valid_reward_calibration(report, task)
+        for report, task in zip(agentic_reports, qualified_tasks)
+    )
+    tool_and_reward_integrity = (
+        bool(qualified)
+        and len(agentic_reports) == len(qualified)
+        and len(qualified_tasks) == len(qualified)
+        and verified_reward_calibrations == len(qualified)
     )
     container_reward_calibration = bool(qualified) and all(
         valid_container_rollout_execution(report, Path(str(item.get("output", ""))))
@@ -871,6 +982,10 @@ def certify(
         "user_simulator_outcomes": dict(user_outcomes),
         "runtime_integrity": runtime_integrity,
         "tool_and_reward_integrity": tool_and_reward_integrity,
+        "reward_calibration_coverage": {
+            "verified": verified_reward_calibrations,
+            "expected": len(qualified),
+        },
         "container_reward_calibration": container_reward_calibration,
         "data_governance": {
             "reports": len(governance_reports),

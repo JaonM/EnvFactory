@@ -198,7 +198,11 @@ class ProductionReadinessTest(unittest.TestCase):
         }))
         (evidence / "agentic_training_value_live.json").write_text(json.dumps({
             "curriculum_training_ready": True,
+            "agentic_training_ready": True,
+            "hard_gates_passed": True,
             "validation_mode": "live_evaluator",
+            "failed_gates": [],
+            "failures": [],
             "runtime_execution": {
                 "version": "1.0",
                 "mode": "docker_http",
@@ -210,9 +214,15 @@ class ProductionReadinessTest(unittest.TestCase):
                 "non_root_user": True,
             },
             "evidence": {"counterfactuals": {
-                "goal_success": {"reward": 1.0},
-                "goal_failure": {"reward": 0.0},
-                "no_tools": {"reward": 0.0},
+                "goal_success": {"reward": 1.0, "status": "completed"},
+                "goal_failure": {"reward": 0.0, "status": "completed"},
+                "no_tools": {"reward": 0.0, "status": "completed"},
+                "corrupted_arguments_1": {"reward": 0.0, "status": "completed"},
+                "corrupted_arguments_2": {"reward": 0.0, "status": "completed"},
+                "skipped_tool_1": {"reward": 0.0, "status": "completed"},
+                "skipped_tool_2": {"reward": 0.0, "status": "completed"},
+                "reordered_tools": {"reward": 0.0, "status": "completed"},
+                "noise_selection": {"reward": -1.0, "status": "completed"},
             }},
         }))
         (evidence / "data_governance.json").write_text(json.dumps({
@@ -729,6 +739,37 @@ class ProductionReadinessTest(unittest.TestCase):
                 report["measurements"]["final_result_provenance"],
                 {"verified": 899, "failures": 1},
             )
+
+    def test_reward_calibration_requires_task_derived_counterfactual_coverage(self):
+        task = self.fixture_task("multi_step_agentic", "验证多步工具奖励覆盖矩阵。")
+        task["acceptance_contract"]["executable_scenarios"][0]["steps"].append({
+            "operation": "agent_response", "content": "done",
+        })
+        report = {
+            "curriculum_training_ready": True,
+            "agentic_training_ready": True,
+            "hard_gates_passed": True,
+            "validation_mode": "live_evaluator",
+            "failed_gates": [],
+            "failures": [],
+            "evidence": {"counterfactuals": {
+                name: {
+                    "reward": 1.0 if name == "goal_success" else (
+                        -1.0 if name == "noise_selection" else 0.0
+                    ),
+                    "status": "completed",
+                }
+                for name in (
+                    "goal_success", "goal_failure", "no_tools",
+                    "corrupted_arguments_1", "corrupted_arguments_2",
+                    "skipped_tool_1", "skipped_tool_2", "reordered_tools",
+                    "noise_selection",
+                )
+            }},
+        }
+        self.assertTrue(certifier.valid_reward_calibration(report, task))
+        del report["evidence"]["counterfactuals"]["skipped_tool_2"]
+        self.assertFalse(certifier.valid_reward_calibration(report, task))
 
     def test_credential_finding_breaks_data_governance_gate(self):
         with tempfile.TemporaryDirectory() as directory:
