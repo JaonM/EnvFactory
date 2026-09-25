@@ -715,7 +715,7 @@ validate_mutation_tests() {
 }
 
 validate_training_readiness() {
-  echo "执行 RL environment readiness hard gate"
+  echo "执行 RL 训练素材环境准备就绪硬门禁"
   SANDBOX_TRAINER_API_KEY="${SANDBOX_TRAINER_API_KEY:-envfactory-readiness-key}" \
     python3 "$project_dir/scripts/validate_training_readiness.py" \
       --root "$output_path" --output "$output_path/training_readiness.json"
@@ -1337,9 +1337,9 @@ validate_delivery() {
   validate_runtime_genericity
   validate_outer_conformance
   validate_mutation_tests
-  set_build_phase "training_readiness" "" "${current_attempt:-0}" "${current_defect_ids:-}" "正在验证 RL 训练可用性"
+  set_build_phase "training_readiness" "" "${current_attempt:-0}" "${current_defect_ids:-}" "正在验证 RL 训练素材环境准备就绪性"
   validate_training_readiness
-  set_build_phase "agentic_training_value" "" "${current_attempt:-0}" "${current_defect_ids:-}" "正在验证 Agentic 训练价值"
+  set_build_phase "agentic_training_value" "" "${current_attempt:-0}" "${current_defect_ids:-}" "正在验证 Agentic RL 训练素材价值"
   validate_agentic_training_value
   # Mutation runs execute acceptance.sh repeatedly and deliberately leave the
   # last mutant's failed evidence behind.  Re-run a clean baseline before the

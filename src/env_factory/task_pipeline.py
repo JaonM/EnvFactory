@@ -4764,7 +4764,7 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
         metrics: list[Any],
         success_fixture: str,
     ) -> None:
-        """Final cross-stage gate before an artifact is marked training-ready."""
+        """Final cross-stage gate before a task is accepted for sandbox construction."""
         category = training_contract.get("category")
         allowed_modes = training_contract.get("allowed_environment_modes", [])
         if environment_mode not in allowed_modes:
