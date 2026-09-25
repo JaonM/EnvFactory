@@ -85,6 +85,17 @@ def run_production_preflight(
         role["model"] and role["api_key"]
         for role in (generation, agent, runtime)
     )
+    response_allowlists_valid = all(
+        isinstance(role["allowed_response_models"], list)
+        and bool(role["allowed_response_models"])
+        and len(role["allowed_response_models"])
+            == len(set(role["allowed_response_models"]))
+        and all(
+            isinstance(model, str) and bool(model.strip())
+            for model in role["allowed_response_models"]
+        )
+        for role in (generation, agent, runtime)
+    )
     urls_valid = all(
         _valid_url(role["base_url"])
         for role in (generation, agent, runtime)
@@ -94,7 +105,10 @@ def run_production_preflight(
     )
     agent_provider = provider_identity(agent["base_url"], agent["model"])
     runtime_provider = provider_identity(runtime["base_url"], runtime["model"])
-    record("model_configuration", model_configured and urls_valid, {
+    record(
+        "model_configuration",
+        model_configured and urls_valid and response_allowlists_valid,
+        {
         "generation_model_configured": bool(generation["model"]),
         "generation_key_configured": bool(generation["api_key"]),
         "agent_model_configured": bool(agent["model"]),
@@ -107,8 +121,15 @@ def run_production_preflight(
         "generation_provider": generation_provider,
         "agent_provider": agent_provider,
         "runtime_provider": runtime_provider,
+        "generation_allowed_response_models": generation[
+            "allowed_response_models"
+        ],
+        "agent_allowed_response_models": agent["allowed_response_models"],
+        "runtime_allowed_response_models": runtime["allowed_response_models"],
+        "response_allowlists_valid": response_allowlists_valid,
         "urls_valid": urls_valid,
-    })
+        },
+    )
     evaluator_separated = (
         agent_provider["identity_sha256"]
         != runtime_provider["identity_sha256"]
@@ -160,7 +181,7 @@ def run_production_preflight(
 
     failed = [item["name"] for item in checks if not item["passed"]]
     return {
-        "version": "1.1" if experiment_config is not None else "1.0",
+        "version": "1.2" if experiment_config is not None else "1.0",
         "scope": "production_pre_training_material_experiment",
         **(
             {"experiment_config_sha256": digest_json(experiment_config)}
@@ -194,18 +215,23 @@ def valid_production_preflight(
     expected_signing_key_identity: str | None = None,
     expected_experiment_config_sha256: str | None = None,
     expected_bundle_version: str = BUNDLE_VERSION,
+    expected_generation_response_models: list[str] | None = None,
+    expected_agent_response_models: list[str] | None = None,
+    expected_runtime_response_models: list[str] | None = None,
 ) -> bool:
     """Validate evidence produced by a fresh, trusted preflight execution."""
-    if not isinstance(value, Mapping) or value.get("version") not in {"1.0", "1.1"}:
+    if not isinstance(value, Mapping) or value.get("version") not in {
+        "1.0", "1.1", "1.2",
+    }:
         return False
     config_digest = value.get("experiment_config_sha256")
-    if value.get("version") == "1.1" and not (
+    if value.get("version") in {"1.1", "1.2"} and not (
         isinstance(config_digest, str)
         and re.fullmatch(r"[0-9a-f]{64}", config_digest) is not None
     ):
         return False
     if expected_experiment_config_sha256 is not None and not (
-        value.get("version") == "1.1"
+        value.get("version") in {"1.1", "1.2"}
         and config_digest == expected_experiment_config_sha256
     ):
         return False
@@ -254,6 +280,36 @@ def valid_production_preflight(
     model_evidence = by_name["model_configuration"].get("evidence")
     if not isinstance(model_evidence, Mapping):
         return False
+    allowlists = {
+        "generation": model_evidence.get("generation_allowed_response_models"),
+        "agent": model_evidence.get("agent_allowed_response_models"),
+        "runtime": model_evidence.get("runtime_allowed_response_models"),
+    }
+    require_allowlists = value.get("version") == "1.2" or any(
+        expected is not None for expected in (
+            expected_generation_response_models,
+            expected_agent_response_models,
+            expected_runtime_response_models,
+        )
+    )
+    if require_allowlists and not (
+        value.get("version") == "1.2"
+        and model_evidence.get("response_allowlists_valid") is True
+        and all(
+            isinstance(values, list) and bool(values)
+            and len(values) == len(set(values))
+            and all(isinstance(model, str) and model.strip() for model in values)
+            for values in allowlists.values()
+        )
+    ):
+        return False
+    for role, expected in (
+        ("generation", expected_generation_response_models),
+        ("agent", expected_agent_response_models),
+        ("runtime", expected_runtime_response_models),
+    ):
+        if expected is not None and allowlists[role] != expected:
+            return False
     if (
         expected_generation_provider is not None
         and model_evidence.get("generation_provider")

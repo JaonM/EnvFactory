@@ -1205,6 +1205,15 @@ def main():
                   generation_model=model_roles["generation"]["model"],
                   rollout_model=model_roles["agent"]["model"],
                   runtime_model=model_roles["runtime"]["model"],
+                  generation_allowed_response_models=model_roles[
+                      "generation"
+                  ]["allowed_response_models"],
+                  rollout_allowed_response_models=model_roles[
+                      "agent"
+                  ]["allowed_response_models"],
+                  runtime_allowed_response_models=model_roles[
+                      "runtime"
+                  ]["allowed_response_models"],
                   generation_provider=generation_provider,
                   rollout_provider=rollout_provider,
                   runtime_provider=runtime_provider,

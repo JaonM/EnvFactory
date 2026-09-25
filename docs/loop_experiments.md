@@ -115,13 +115,13 @@ manifest 路径迁移；否则以 `TASK_LINEAGE` 失败，在评分和 live roll
 `training_materials_bundle/`。该包使用相对路径和内容摘要，可直接迁移到后续 RL 数据转换/训练系统；
 仅存在指向本机输出目录的清单不再足以触发生产准备停止原因。包验证器会从原始 rollout 重建
 transition 投影并验证 episode/step/终止关系；它证明训练素材可摄取，不宣称已经执行 RL 训练。
-Bundle v15 内置 `certification.json`、`dataset_card.json` 和机器可读 `consumer_contract.json`；后者固定
+Bundle v16 内置 `certification.json`、`dataset_card.json` 和机器可读 `consumer_contract.json`；后者固定
 transition JSON Schema、记录顺序、任务生成来源、环境重建入口以及 policy/trainer 可见性边界。数据集卡的构成统计、模型偏差、用途限制与
 内部使用边界会同实际 transition 交叉验证，不能通过重新计算 manifest 哈希伪造更宽泛的认证结论。
 导出的验收 rollout 会被机器标记为认证证据而非已认证的直接策略优化目标；生产准备认证覆盖环境的
 新鲜 rollout 采集能力，不替代下游算法对轨迹用途的审批。
 每次 Agent 与 User Simulator/Reward Judge 的外部响应还会保存实际返回模型的聚合 provenance 和响应 ID
-哈希，避免仅凭请求时配置的模型别名声明运行身份。
+哈希，避免仅凭请求时配置的模型别名声明运行身份；三类实际响应模型还必须落在实验启动前冻结的 allowlist 中。
 生产 profile 还必须传入 `--bundle-signing-private-key` 与 `--bundle-trusted-public-key`（或在 `.env` 中设置
 `ENVFACTORY_BUNDLE_SIGNING_PRIVATE_KEY`、`ENVFACTORY_BUNDLE_TRUSTED_PUBLIC_KEY`）。私钥应由组织密钥管理
 系统保管且不得提交到仓库；实验清单只冻结公钥身份。未签名包和只携带自声明公钥的包均不能通过生产门禁。

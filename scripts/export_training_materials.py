@@ -164,7 +164,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "2.1",
+        "version": "2.2",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -219,6 +219,9 @@ def _dataset_card(
                 "agent_models": dict(sorted(agent_response_models.items())),
                 "runtime_models": dict(sorted(runtime_response_models.items())),
             },
+            "model_response_authorization": certification.get(
+                "measurements", {}
+            ).get("model_response_authorization", {}),
             "runtime_execution": {
                 "modes": dict(sorted(runtime_modes.items())),
                 "validated_container_items": runtime_modes.get("docker_http", 0),
@@ -639,7 +642,7 @@ def verify_bundle(
         failures.append("bundle_digest")
     if (
         manifest.get("version") not in {
-            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0",
+            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0",
             BUNDLE_VERSION,
         }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
@@ -648,7 +651,7 @@ def verify_bundle(
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0",
+        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0",
         BUNDLE_VERSION,
     }
     if production_contract_ready:
@@ -807,6 +810,14 @@ def verify_bundle(
                     "model_response_provenance"
                 ].get("all_verified") is True
             )
+        )
+        and (
+            not supports_bundle_feature(
+                str(manifest.get("version")), "model_response_authorization"
+            )
+            or portable_certification.get("gates", {}).get(
+                "model_response_authorization"
+            ) is True
         )
     ):
         failures.append("portable_certification")
@@ -1355,6 +1366,44 @@ def verify_bundle(
             expected_runtime_response_models.update(
                 provenance.get("runtime_response_models", {})
             )
+    allowed_response_models = {
+        "generation": preflight_model_evidence.get(
+            "generation_allowed_response_models"
+        ),
+        "agent": preflight_model_evidence.get("agent_allowed_response_models"),
+        "runtime": preflight_model_evidence.get(
+            "runtime_allowed_response_models"
+        ),
+    }
+    actual_response_models = {
+        "generation": dict(sorted(expected_generation_actual_models.items())),
+        "agent": dict(sorted(expected_agent_response_models.items())),
+        "runtime": dict(sorted(expected_runtime_response_models.items())),
+    }
+    expected_authorization_measurement = {
+        "all_authorized": all(
+            isinstance(allowed_response_models[role], list)
+            and bool(actual_response_models[role])
+            and set(actual_response_models[role])
+                <= set(allowed_response_models[role])
+            for role in ("generation", "agent", "runtime")
+        ),
+        "allowed": allowed_response_models,
+        "actual": actual_response_models,
+    }
+    model_response_authorization_ready = (
+        supports_bundle_feature(
+            str(manifest.get("version")), "model_response_authorization"
+        )
+        and expected_authorization_measurement["all_authorized"] is True
+        and portable_certification.get("measurements", {}).get(
+            "model_response_authorization"
+        ) == expected_authorization_measurement
+    )
+    if supports_bundle_feature(
+        str(manifest.get("version")), "model_response_authorization"
+    ) and not model_response_authorization_ready:
+        failures.append("model_response_authorization")
     expected_runtime_modes = Counter(
         str(item.get("runtime_execution", {}).get("mode"))
         for item in items if isinstance(item, Mapping)
@@ -1412,6 +1461,11 @@ def verify_bundle(
                 ),
             }
         )
+    if supports_bundle_feature(str(version), "model_response_authorization"):
+        versioned_card_composition = versioned_card_composition and (
+            card_composition.get("model_response_authorization")
+                == expected_authorization_measurement
+        )
     if supports_bundle_feature(str(version), "container_rollout"):
         versioned_card_composition = versioned_card_composition and (
             card_composition.get("runtime_execution") == {
@@ -1437,7 +1491,8 @@ def verify_bundle(
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "2.1" if manifest.get("version") == BUNDLE_VERSION
+            "2.2" if manifest.get("version") == BUNDLE_VERSION
+            else "2.1" if manifest.get("version") == "15.0"
             else "2.0" if manifest.get("version") == "14.0"
             else "1.9" if manifest.get("version") == "13.0"
             else "1.8" if manifest.get("version") == "12.0"
@@ -1463,7 +1518,7 @@ def verify_bundle(
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
             manifest.get("version") not in {
-                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0",
+                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0",
                 BUNDLE_VERSION,
             }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
@@ -1510,7 +1565,7 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     trusted_attestation = (
         manifest.get("version") in {
-            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0",
+            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0",
             BUNDLE_VERSION,
         }
         and trusted_public_key is not None
@@ -1543,6 +1598,7 @@ def verify_bundle(
         "experiment_config_ready": experiment_config_ready,
         "trajectory_purpose_ready": trajectory_purpose_ready,
         "model_response_provenance_ready": model_response_provenance_ready,
+        "model_response_authorization_ready": model_response_authorization_ready,
         "preflight_provider_bindings": verified_preflight_provider_bindings,
         "metadata_privacy_ready": portable_metadata_privacy["safe"],
         "evaluator_independence_ready": evaluator_independence_ready,

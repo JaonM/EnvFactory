@@ -126,6 +126,48 @@ class ProductionPreflightTest(unittest.TestCase):
                 },
             )
 
+    def test_bound_preflight_rejects_response_model_allowlist_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.project(Path(directory))
+            private = root / "private.pem"
+            public = root / "public.pem"
+            private.write_text("private")
+            public.write_text("public")
+            config = {"agent_allowed_response_models": ["policy-model"]}
+            with patch(
+                "env_factory.production_preflight.private_key_public_identity",
+                return_value="a" * 64,
+            ), patch(
+                "env_factory.production_preflight.public_key_identity",
+                return_value="a" * 64,
+            ):
+                report = run_production_preflight(
+                    root, root,
+                    signing_private_key=private,
+                    trusted_public_key=public,
+                    experiment_config=config,
+                    environment={
+                        "LLM_API_KEY": "secret-value",
+                        "LLM_MODEL": "generator-model",
+                        "LLM_BASE_URL": "https://agent.example/v1",
+                        "SANDBOX_LLM_MODEL": "runtime-model",
+                        "SANDBOX_LLM_BASE_URL": "https://runtime.example/v1",
+                    },
+                    runner=self.runner,
+                    which=lambda name: f"/usr/bin/{name}",
+                    disk_usage=lambda path: Usage(),
+                )
+            self.assertTrue(valid_production_preflight(
+                report,
+                expected_experiment_config_sha256=digest_json(config),
+                expected_agent_response_models=["generator-model"],
+            ))
+            self.assertFalse(valid_production_preflight(
+                report,
+                expected_experiment_config_sha256=digest_json(config),
+                expected_agent_response_models=["unapproved-policy-model"],
+            ))
+
     def test_preflight_validator_rejects_forged_or_incomplete_evidence(self):
         self.assertFalse(valid_production_preflight({"ready": True}))
         report = {

@@ -783,6 +783,18 @@ def certify(
         config.get("bundle_attestation_key_identity_sha256")
         if isinstance(config, Mapping) else None
     )
+    expected_generation_response_models = (
+        config.get("generation_allowed_response_models")
+        if isinstance(config, Mapping) else None
+    )
+    expected_agent_response_models = (
+        config.get("rollout_allowed_response_models")
+        if isinstance(config, Mapping) else None
+    )
+    expected_runtime_response_models = (
+        config.get("runtime_allowed_response_models")
+        if isinstance(config, Mapping) else None
+    )
     experiment_config_sha256 = (
         digest_json(config) if isinstance(config, Mapping) else None
     )
@@ -791,6 +803,15 @@ def certify(
         and isinstance(expected_agent_provider, Mapping)
         and isinstance(expected_runtime_provider, Mapping)
         and isinstance(expected_signing_key_identity, str)
+        and all(
+            isinstance(models, list) and bool(models)
+            and all(isinstance(model, str) and model for model in models)
+            for models in (
+                expected_generation_response_models,
+                expected_agent_response_models,
+                expected_runtime_response_models,
+            )
+        )
         and valid_production_preflight(
             production_preflight,
             expected_generation_provider=expected_generation_provider,
@@ -798,6 +819,9 @@ def certify(
             expected_runtime_provider=expected_runtime_provider,
             expected_signing_key_identity=expected_signing_key_identity,
             expected_experiment_config_sha256=experiment_config_sha256,
+            expected_generation_response_models=expected_generation_response_models,
+            expected_agent_response_models=expected_agent_response_models,
+            expected_runtime_response_models=expected_runtime_response_models,
         )
     )
     recorded_execution = (
@@ -1063,6 +1087,17 @@ def certify(
             generation_failures.append({
                 "task_path": str(task_path), "error_type": type(exc).__name__,
             })
+    actual_generation_models: Counter[str] = Counter()
+    for snapshot in generation_provenance.values():
+        for attempt in snapshot.get("attempts", []):
+            actual_generation_models.update(
+                attempt.get("llm_trace", {}).get("models", {})
+            )
+    generation_response_models_authorized = (
+        isinstance(expected_generation_response_models, list)
+        and bool(actual_generation_models)
+        and set(actual_generation_models) <= set(expected_generation_response_models)
+    )
 
     claimed_live_reports = [
         item.get("live_rollout") for item in claimed_qualified
@@ -1164,6 +1199,18 @@ def certify(
                 for model in report["runtime_response_models"]
             }
         }
+    )
+    rollout_response_models_authorized = (
+        isinstance(expected_agent_response_models, list)
+        and isinstance(expected_runtime_response_models, list)
+        and bool(actual_agent_models)
+        and bool(actual_runtime_models)
+        and set(actual_agent_models) <= set(expected_agent_response_models)
+        and set(actual_runtime_models) <= set(expected_runtime_response_models)
+    )
+    response_models_authorized = (
+        generation_response_models_authorized
+        and rollout_response_models_authorized
     )
     provider_bindings_verified = sum(
         valid_provider_binding(
@@ -1443,6 +1490,19 @@ def certify(
             "agent_response_models": dict(sorted(actual_agent_models.items())),
             "runtime_response_models": dict(sorted(actual_runtime_models.items())),
         },
+        "model_response_authorization": {
+            "all_authorized": response_models_authorized,
+            "allowed": {
+                "generation": list(expected_generation_response_models or []),
+                "agent": list(expected_agent_response_models or []),
+                "runtime": list(expected_runtime_response_models or []),
+            },
+            "actual": {
+                "generation": dict(sorted(actual_generation_models.items())),
+                "agent": dict(sorted(actual_agent_models.items())),
+                "runtime": dict(sorted(actual_runtime_models.items())),
+            },
+        },
         "provider_identity_consistency": {
             "verified": provider_bindings_verified,
             "expected": len(qualified),
@@ -1565,6 +1625,7 @@ def certify(
         "rollout_outcome_integrity": rollout_outcome_integrity,
         "rollout_provenance": rollout_provenance,
         "model_response_provenance": response_provenance_verified,
+        "model_response_authorization": response_models_authorized,
         "provider_identity_consistency": provider_identity_consistency,
         "evaluator_independence": (
             bool(qualified)
@@ -1702,6 +1763,7 @@ def attach_bundle_verification(
         and verification.get("experiment_config_ready") is True
         and verification.get("trajectory_purpose_ready") is True
         and verification.get("model_response_provenance_ready") is True
+        and verification.get("model_response_authorization_ready") is True
         and verification.get("metadata_privacy_ready") is True
         and verification.get("evaluator_independence_ready") is True
         and verification.get("source_dataset_sha256")

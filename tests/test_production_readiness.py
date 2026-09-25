@@ -44,7 +44,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "identity_sha256": "b" * 64,
         }
         return {
-            "version": "1.1",
+            "version": "1.2",
             "experiment_config_sha256": certifier.digest_json(config),
             "scope": "production_pre_training_material_experiment",
             "network_probe_performed": False,
@@ -59,10 +59,20 @@ class ProductionReadinessTest(unittest.TestCase):
                             "generation_provider": generation_provider,
                             "agent_provider": agent_provider,
                             "runtime_provider": runtime_provider,
+                            "generation_allowed_response_models": config[
+                                "generation_allowed_response_models"
+                            ],
+                            "agent_allowed_response_models": config[
+                                "rollout_allowed_response_models"
+                            ],
+                            "runtime_allowed_response_models": config[
+                                "runtime_allowed_response_models"
+                            ],
+                            "response_allowlists_valid": True,
                         }
                         if name == "model_configuration" else {
                             "key_identity_sha256": "e" * 64,
-                            "bundle_version": "15.0",
+                            "bundle_version": "16.0",
                         }
                         if name == "bundle_signing_identity" else {}
                         if name != "evaluator_role_separation" else {
@@ -636,6 +646,9 @@ class ProductionReadinessTest(unittest.TestCase):
                     "identity_sha256": "a" * 64,
                 },
                 "bundle_attestation_key_identity_sha256": "e" * 64,
+                "generation_allowed_response_models": ["generator-model"],
+                "rollout_allowed_response_models": ["policy-model"],
+                "runtime_allowed_response_models": ["simulator-model"],
             },
             "holdout": holdouts[0], "holdouts": holdouts,
         }
@@ -736,6 +749,21 @@ class ProductionReadinessTest(unittest.TestCase):
             report = self.certify(history)
             self.assertFalse(report["gates"]["model_response_provenance"])
             self.assertIn("model_response_provenance", report["failed_gates"])
+
+    def test_unapproved_actual_response_model_cannot_certify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            rollout = history["holdouts"][0]["jobs"][0]["result"][
+                "live_rollout"
+            ]
+            rollout["episodes"][0]["usage"][0][
+                "response_model"
+            ] = "unapproved-policy-model"
+            report = self.certify(history)
+            self.assertTrue(report["gates"]["model_response_provenance"])
+            self.assertFalse(report["gates"]["model_response_authorization"])
+            self.assertIn("model_response_authorization", report["failed_gates"])
+
 
     def test_preflight_signing_key_drift_cannot_certify(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1351,7 +1379,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "materials_manifest": {"dataset_sha256": "dataset"},
         }
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "15.0",
+            "verified": True, "bundle_version": "16.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1365,6 +1393,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "experiment_config_ready": True,
             "trajectory_purpose_ready": True,
             "model_response_provenance_ready": True,
+            "model_response_authorization_ready": True,
             "metadata_privacy_ready": True,
             "evaluator_independence_ready": True,
             "source_dataset_sha256": "different",
@@ -1372,7 +1401,7 @@ class ProductionReadinessTest(unittest.TestCase):
         self.assertFalse(report["certified"])
         self.assertIn("portable_materials_bundle", report["failed_gates"])
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "15.0",
+            "verified": True, "bundle_version": "16.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1386,6 +1415,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "experiment_config_ready": True,
             "trajectory_purpose_ready": True,
             "model_response_provenance_ready": True,
+            "model_response_authorization_ready": True,
             "metadata_privacy_ready": True,
             "evaluator_independence_ready": True,
             "source_dataset_sha256": "dataset",

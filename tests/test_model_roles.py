@@ -18,12 +18,14 @@ class ModelRolesTest(unittest.TestCase):
             "base_url": "https://generation.example/v1",
             "model": "policy-model",
             "timeout_seconds": "42",
+            "allowed_response_models": ["policy-model"],
         })
         self.assertEqual(roles["runtime"], {
             "api_key": "generation-key",
             "base_url": "https://runtime.example/v1",
             "model": "generation-model",
             "timeout_seconds": "42",
+            "allowed_response_models": ["generation-model"],
         })
 
     def test_all_roles_can_be_independent(self):
@@ -43,6 +45,24 @@ class ModelRolesTest(unittest.TestCase):
         self.assertEqual(roles["agent"]["model"], "policy-model")
         self.assertEqual(roles["runtime"]["api_key"], "runtime-key")
         self.assertEqual(roles["runtime"]["model"], "runtime-model")
+
+    def test_response_model_allowlists_are_explicit_and_role_scoped(self):
+        roles = resolve_model_roles({
+            "LLM_MODEL": "generation-alias",
+            "LLM_ALLOWED_RESPONSE_MODELS": "gen-v1, gen-v2,gen-v1",
+            "ROLLOUT_LLM_MODEL": "policy-alias",
+            "ROLLOUT_LLM_ALLOWED_RESPONSE_MODELS": "policy-v1,policy-v2",
+            "SANDBOX_LLM_MODEL": "runtime-alias",
+        })
+        self.assertEqual(
+            roles["generation"]["allowed_response_models"], ["gen-v1", "gen-v2"]
+        )
+        self.assertEqual(
+            roles["agent"]["allowed_response_models"], ["policy-v1", "policy-v2"]
+        )
+        self.assertEqual(
+            roles["runtime"]["allowed_response_models"], ["runtime-alias"]
+        )
 
 
 if __name__ == "__main__":
