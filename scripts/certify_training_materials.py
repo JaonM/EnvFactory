@@ -742,8 +742,24 @@ def certify(
         isinstance(config, Mapping)
         and config.get("certification_profile") == "production"
     )
-    preflight_verified = valid_production_preflight(production_preflight)
-    recorded_execution = config.get("execution_provenance") if isinstance(config, Mapping) else None
+    expected_agent_provider = (
+        config.get("generation_provider") if isinstance(config, Mapping) else None
+    )
+    expected_runtime_provider = (
+        config.get("runtime_provider") if isinstance(config, Mapping) else None
+    )
+    preflight_verified = (
+        isinstance(expected_agent_provider, Mapping)
+        and isinstance(expected_runtime_provider, Mapping)
+        and valid_production_preflight(
+            production_preflight,
+            expected_agent_provider=expected_agent_provider,
+            expected_runtime_provider=expected_runtime_provider,
+        )
+    )
+    recorded_execution = (
+        config.get("execution_provenance") if isinstance(config, Mapping) else None
+    )
     execution_verification = verify_execution_provenance(project, recorded_execution)
     raw_holdouts = history.get("holdouts")
     if isinstance(raw_holdouts, list) and raw_holdouts:

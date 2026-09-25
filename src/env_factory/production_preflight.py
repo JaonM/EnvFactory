@@ -14,6 +14,7 @@ from .material_attestation import (
     public_key_identity,
 )
 from .material_consumer import BUNDLE_VERSION
+from .data_governance import provider_identity
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -80,6 +81,8 @@ def run_production_preflight(
     runtime_url = (env.get("SANDBOX_LLM_BASE_URL") or agent_url).rstrip("/")
     model_configured = all((agent_model, agent_key, runtime_model, runtime_key))
     urls_valid = _valid_url(agent_url) and _valid_url(runtime_url)
+    agent_provider = provider_identity(agent_url, agent_model)
+    runtime_provider = provider_identity(runtime_url, runtime_model)
     record("model_configuration", model_configured and urls_valid, {
         "agent_model_configured": bool(agent_model),
         "agent_key_configured": bool(agent_key),
@@ -87,6 +90,8 @@ def run_production_preflight(
         "runtime_key_configured": bool(runtime_key),
         "agent_host": urlparse(agent_url).hostname,
         "runtime_host": urlparse(runtime_url).hostname,
+        "agent_provider": agent_provider,
+        "runtime_provider": runtime_provider,
         "urls_valid": urls_valid,
     })
 
@@ -156,7 +161,12 @@ REQUIRED_CHECKS = {
 }
 
 
-def valid_production_preflight(value: Mapping[str, Any] | Any) -> bool:
+def valid_production_preflight(
+    value: Mapping[str, Any] | Any,
+    *,
+    expected_agent_provider: Mapping[str, Any] | None = None,
+    expected_runtime_provider: Mapping[str, Any] | None = None,
+) -> bool:
     """Validate evidence produced by a fresh, trusted preflight execution."""
     if not isinstance(value, Mapping) or value.get("version") != "1.0":
         return False
@@ -178,6 +188,25 @@ def valid_production_preflight(value: Mapping[str, Any] | Any) -> bool:
         if name in by_name:
             return False
         by_name[name] = check
-    return set(by_name) == REQUIRED_CHECKS and all(
-        check.get("passed") is True for check in by_name.values()
+    if not (
+        set(by_name) == REQUIRED_CHECKS
+        and all(check.get("passed") is True for check in by_name.values())
+    ):
+        return False
+    model_evidence = by_name["model_configuration"].get("evidence")
+    if not isinstance(model_evidence, Mapping):
+        return False
+    if (
+        expected_agent_provider is not None
+        and model_evidence.get("agent_provider") != dict(expected_agent_provider)
+    ):
+        return False
+    if (
+        expected_runtime_provider is not None
+        and model_evidence.get("runtime_provider") != dict(expected_runtime_provider)
+    ):
+        return False
+    return all(
+        isinstance(model_evidence.get(name), Mapping)
+        for name in ("agent_provider", "runtime_provider")
     )

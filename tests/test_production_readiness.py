@@ -31,6 +31,14 @@ rollout_runner = load_script("run_live_rollout")
 class ProductionReadinessTest(unittest.TestCase):
     @staticmethod
     def production_preflight():
+        agent_provider = {
+            "host": "generator.example", "model": "generator-model",
+            "identity_sha256": "c" * 64,
+        }
+        runtime_provider = {
+            "host": "runtime.example", "model": "simulator-model",
+            "identity_sha256": "b" * 64,
+        }
         return {
             "version": "1.0",
             "scope": "production_pre_training_material_experiment",
@@ -38,7 +46,17 @@ class ProductionReadinessTest(unittest.TestCase):
             "ready": True,
             "failed_checks": [],
             "checks": [
-                {"name": name, "passed": True, "evidence": {}}
+                {
+                    "name": name,
+                    "passed": True,
+                    "evidence": (
+                        {
+                            "agent_provider": agent_provider,
+                            "runtime_provider": runtime_provider,
+                        }
+                        if name == "model_configuration" else {}
+                    ),
+                }
                 for name in sorted(certifier.REQUIRED_CHECKS)
             ],
         }
@@ -580,6 +598,11 @@ class ProductionReadinessTest(unittest.TestCase):
                     "model": "generator-model",
                     "identity_sha256": "c" * 64,
                 },
+                "runtime_provider": {
+                    "host": "runtime.example",
+                    "model": "simulator-model",
+                    "identity_sha256": "b" * 64,
+                },
             },
             "holdout": holdouts[0], "holdouts": holdouts,
         }
@@ -643,6 +666,17 @@ class ProductionReadinessTest(unittest.TestCase):
                 certifier.default_policy(),
                 sandbox_revalidation=self.sandbox_revalidation(history),
             )
+            self.assertFalse(report["certified"])
+            self.assertIn("production_preflight", report["failed_gates"])
+
+    def test_preflight_provider_drift_cannot_certify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            history["config"]["runtime_provider"] = {
+                "host": "other.example", "model": "simulator-model",
+                "identity_sha256": "d" * 64,
+            }
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertIn("production_preflight", report["failed_gates"])
 

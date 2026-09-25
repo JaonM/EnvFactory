@@ -17,7 +17,8 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 只接受由 `certification_profile=production` 启动的实验；pilot 历史即使人工补齐数量也不能升级为生产认证。
 - 认证时重新执行 production preflight，复核 Docker daemon、模型/runtime 配置、签名密钥配对、运行参数与
   工作区容量，并由循环写入 `production_certification_preflight.json`。实验启动时的
-  `production_preflight.json` 仅用于诊断，不能替代认证阶段的新鲜检查。
+  `production_preflight.json` 仅用于诊断，不能替代认证阶段的新鲜检查。preflight 中规范化后的 Agent 与
+  User/Judge provider 身份必须逐项匹配冻结实验清单，任意可用但身份不同的模型配置不能替代原实验环境。
 
 - 连续 3 个独立留出批次，每批至少 300 个实际生成的新任务；开发阶段和各留出批次之间的 seed、
   任务内容均不重叠。

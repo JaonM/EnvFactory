@@ -1184,6 +1184,11 @@ def main():
                       os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
                       os.getenv("LLM_MODEL", ""),
                   ),
+                  runtime_provider=provider_identity(
+                      os.getenv("SANDBOX_LLM_BASE_URL")
+                      or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+                      os.getenv("SANDBOX_LLM_MODEL") or os.getenv("LLM_MODEL", ""),
+                  ),
                   provider_digest=hashlib.sha256(json.dumps([os.getenv("LLM_BASE_URL"), os.getenv("SANDBOX_LLM_BASE_URL")]).encode()).hexdigest())
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)

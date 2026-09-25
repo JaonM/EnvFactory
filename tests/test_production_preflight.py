@@ -66,6 +66,18 @@ class ProductionPreflightTest(unittest.TestCase):
                 if item["name"] == "model_configuration"
             )
             self.assertEqual(model["evidence"]["agent_host"], "agent.example")
+            self.assertTrue(valid_production_preflight(
+                report,
+                expected_agent_provider=model["evidence"]["agent_provider"],
+                expected_runtime_provider=model["evidence"]["runtime_provider"],
+            ))
+            mismatched = dict(model["evidence"]["runtime_provider"])
+            mismatched["model"] = "different"
+            self.assertFalse(valid_production_preflight(
+                report,
+                expected_agent_provider=model["evidence"]["agent_provider"],
+                expected_runtime_provider=mismatched,
+            ))
 
     def test_unavailable_docker_and_bad_runtime_limits_fail(self):
         with tempfile.TemporaryDirectory() as directory:
