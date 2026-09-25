@@ -104,6 +104,8 @@ status 和 termination reasoning 属于 trainer-only metadata。便携 JSONL 采
 循环工程的版本单位是“冻结源码的一次实验”，不是在同一源码上反复抽样。每个候选版本先使用相同
 `--experiment-seed` 做配对回归，再用新 seed 测量分布外良品率。一次候选版本只修复一个可复用根因；
 不允许在运行中的实验目录对应源码上继续修改。最终候选冻结后由调度器自动运行生产留出集，
+每个新构建还必须通过 `task_lineage.json` 证明生成任务与沙箱内运行任务字节一致，且没有发生旧式绝对
+manifest 路径迁移；否则以 `TASK_LINEAGE` 失败，在评分和 live rollout 前终止。
 `history.json` 的最终停止原因只有 `production_prepared_for_agentic_rl` 才表示生产准备认证通过；
 `holdout_target_met` 仅属于 pilot 门禁。
 

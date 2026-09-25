@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from env_factory.task_portability import prepare_sandbox_task
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,6 +27,10 @@ rollout = load("run_live_rollout")
 
 
 class ExperimentTest(unittest.TestCase):
+    @staticmethod
+    def write_task_lineage(output: Path, task_path: Path) -> None:
+        prepare_sandbox_task(task_path, output)
+
     def test_concurrent_attempts_receive_distinct_stable_container_tags(self):
         first = loop.sandbox_image_tag(Path("/tmp/experiment/sample-1/attempt-1"))
         second = loop.sandbox_image_tag(Path("/tmp/experiment/sample-2/attempt-1"))
@@ -250,6 +256,8 @@ class ExperimentTest(unittest.TestCase):
 
             def process(command, cwd, log, timeout):
                 commands.append(command)
+                if "develop_sandbox_with_agent.sh" in " ".join(command):
+                    self.write_task_lineage(output, task_path)
                 if "score_sandbox_offline.py" in " ".join(command):
                     (output / "score_summary.json").write_text(json.dumps({
                         "sandboxes": [{
@@ -364,6 +372,8 @@ class ExperimentTest(unittest.TestCase):
             def process(command, cwd, log, timeout):
                 commands.append(command)
                 rendered = " ".join(command)
+                if "develop_sandbox_with_agent.sh" in rendered:
+                    self.write_task_lineage(output, task_path)
                 if "score_sandbox_offline.py" in rendered:
                     (output / "score_summary.json").write_text(json.dumps({
                         "sandboxes": [{

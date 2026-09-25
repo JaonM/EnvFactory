@@ -84,7 +84,7 @@ TaskSpec、User Simulator FSM，并由沙箱 observation 和真实 rollout 暴�
 
 启用噪声工具时，工具生成阶段至少生成一个噪声工具；默认上限为 3 时至少同时覆盖 `related_irrelevant` 和 `unrelated` 两类。候选工具还要经过独立的反事实有用性审查：凡是能提供原因分析证据、关键事实、比较依据、验证手段或排查资料的工具都不能作为噪声，会从候选集合中自动剔除；若候选集合被全部剔除，则注入一个不读取或修改业务状态的通用无关工具，避免正确的审计结论导致整项任务生成失败。噪声调用惩罚由共享运行时使用 `trajectory.events` 和 `none_tool_calls` 运算符确定性执行，不交给外部 LLM 判断。
 
-用户画像和用户剧本不内嵌到 `task.json`，而是写入 `user_simulation/` 并由 `user_simulation_manifest` 引用。运行时 User Simulator 加载画像和状态机，每轮通过外部 `RuntimeLLMClient` 根据完整实时对话、当前画像、状态、变量和合法出边生成下一条用户消息。协议固定八类结果：`goal_satisfied`、`information_required`、`user_correction`、`user_rejection`、`user_acceptance`、`agent_off_topic`、`agent_premature_completion`、`unrecognized`。前五类走正常转移，后三类走不推进业务状态的有界恢复；超过恢复上限后以 `unresolved_dialogue` 结束。
+用户画像和用户剧本不内嵌到 `task.json`，而是写入任务目录内的便携相对路径 `data/user_simulation/`，并由 `user_simulation_manifest` 引用；业务 fixture 同样固定在 `data/business_data/`。沙箱构建保持这些相对 root 不变，避免同一任务在生成与运行阶段产生两个不同契约身份。运行时 User Simulator 加载画像和状态机，每轮通过外部 `RuntimeLLMClient` 根据完整实时对话、当前画像、状态、变量和合法出边生成下一条用户消息。协议固定八类结果：`goal_satisfied`、`information_required`、`user_correction`、`user_rejection`、`user_acceptance`、`agent_off_topic`、`agent_premature_completion`、`unrecognized`。前五类走正常转移，后三类走不推进业务状态的有界恢复；超过恢复上限后以 `unresolved_dialogue` 结束。
 User Simulator 只能依据用户可见对话和公开证据判断结果，不能因为看不到内部工具 trace 而拒绝一份
 可核查的答案。JSON schema 与 FSM 跨字段语义在同一个 LLM 重试边界内校验；非法 outcome、错误
 transition 或 match_status 冲突会连同具体错误反馈给模型修复，耗尽有界重试后才进入保守 fallback。

@@ -90,6 +90,18 @@ class MaterialExportTest(unittest.TestCase):
                 "protocol": "http", "base_path": "/v1", "version": "1.0",
             }},
         }))
+        task_document = json.loads(task.read_text())
+        task_digest = hashlib.sha256(task.read_bytes()).hexdigest()
+        (sandbox / "task_lineage.json").write_text(json.dumps({
+            "version": "1.0",
+            "source_is_task_list": False,
+            "source_task_content_sha256": digest_json(task_document),
+            "runtime_task_content_sha256": digest_json(task_document),
+            "source_file_sha256": task_digest,
+            "runtime_task_sha256": task_digest,
+            "identity_preserved": True,
+            "legacy_manifest_relocations": [],
+        }))
         (sandbox / "app.py").write_text("# portable runtime\n")
         (sandbox / "Dockerfile").write_text(
             "FROM python@sha256:" + "a" * 64 + "\nUSER sandbox\n"
@@ -490,6 +502,36 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["verified"])
             self.assertFalse(report["provider_identity_ready"])
             self.assertIn("provider_identity_binding", report["failed_gates"])
+
+    def test_bundle_verifier_rejects_rehashed_task_lineage_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            item = manifest["items"][0]
+            lineage_path = (
+                bundle / item["environment_path"] / "task_lineage.json"
+            )
+            lineage = json.loads(lineage_path.read_text())
+            lineage["source_file_sha256"] = "f" * 64
+            lineage_path.write_text(json.dumps(lineage))
+            relative = str(lineage_path.relative_to(bundle))
+            digest = exporter.file_sha256(lineage_path)
+            item["files_sha256"]["task_lineage.json"] = digest
+            manifest["files_sha256"][relative] = digest
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["task_lineage_ready"])
+            self.assertIn("task_lineage", report["failed_gates"])
 
     def test_bundle_verifier_rejects_rehashed_environment_claim(self):
         with tempfile.TemporaryDirectory() as directory:

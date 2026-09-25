@@ -25,6 +25,7 @@ from env_factory.execution_provenance import (
     verify_execution_provenance,
 )
 from env_factory.task_similarity import task_partition_isolation
+from env_factory.task_portability import valid_task_lineage
 
 MODEL = "gpt-5.6-luna"
 ACTIVE_PROCESSES = set()
@@ -591,6 +592,21 @@ def _build_one(project, task_path, output, config, seed=None):
                     buildability=buildability, **common,
                 )
         return failure("infrastructure" if built["timed_out"] else "build", "see build.log", **common)
+    try:
+        task_lineage = json.loads((output / "task_lineage.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        task_lineage = {}
+    common["task_lineage"] = task_lineage
+    if not valid_task_lineage(
+        task_lineage, task_path, output / "task.json"
+    ):
+        return failure(
+            "task_lineage",
+            "generated task identity changed while preparing the sandbox",
+            failure_code="TASK_LINEAGE",
+            repair_target="task_generation_or_artifact_layout",
+            **common,
+        )
     report_path = output / "score_summary.json"
     scored = run_process([sys.executable, str(project / "scripts/score_sandbox_offline.py"), str(output),
                           "--project", str(project), "--threshold", str(config["threshold"]),

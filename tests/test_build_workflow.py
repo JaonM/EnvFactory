@@ -132,6 +132,8 @@ class BuildWorkflowTest(unittest.TestCase):
             workflow,
         )
         self.assertIn("restore_final_acceptance_evidence\n  validate_dockerfile_security", workflow)
+        self.assertIn("from env_factory.task_portability import prepare_sandbox_task", workflow)
+        self.assertIn("prepare_sandbox_task(", workflow)
 
     def test_training_readiness_enables_deterministic_evaluator_mock(self):
         validator = (ROOT / "scripts" / "validate_training_readiness.py").read_text(encoding="utf-8")

@@ -257,42 +257,15 @@ prepare_task() {
   # must use it for User Simulator and reward evaluator LLM calls.
   cp "$project_dir/src/env_factory/runtime_llm.py" "$task_output/runtime_llm.py"
   cp "$project_dir/src/env_factory/sandbox_runtime.py" "$task_output/sandbox_runtime.py"
-  python3 - "$input_path" "$task_output/task.json" "$task_index" "$project_dir" "$task_output" <<'PY'
-import json
-import shutil
+  python3 - "$input_path" "$task_output" "$task_index" <<'PY'
 import sys
 from pathlib import Path
 
-source = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-index = int(sys.argv[3])
-task = source[index] if isinstance(source, list) else source
-project_dir = Path(sys.argv[4])
-task_output = Path(sys.argv[5])
-artifacts = task.get("artifacts") if isinstance(task, dict) else None
-if isinstance(artifacts, dict):
-    def copy_manifest(key, destination_name):
-        manifest = artifacts.get(key)
-        if not isinstance(manifest, dict) or not manifest.get("root"):
-            return
-        source_root = Path(str(manifest["root"]))
-        if not source_root.is_absolute():
-            source_root = project_dir / source_root
-        if not source_root.is_dir():
-            raise SystemExit(f"{key} 目录不存在：{source_root}")
-        destination = task_output / "data" / destination_name
-        shutil.copytree(source_root, destination, dirs_exist_ok=True)
-        rewritten = dict(manifest)
-        rewritten["root"] = f"data/{destination_name}"
-        artifacts[key] = rewritten
-        return rewritten
+from env_factory.task_portability import prepare_sandbox_task
 
-    data_manifest = copy_manifest("data_manifest", "business_data")
-    user_manifest = copy_manifest("user_simulation_manifest", "user_simulation")
-    task["artifacts"] = artifacts
-    for item in task.get("environment", []):
-        if isinstance(item, dict) and item.get("type") == "business_data_manifest" and data_manifest:
-            item["value"] = data_manifest
-Path(sys.argv[2]).write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+prepare_sandbox_task(
+    Path(sys.argv[1]), Path(sys.argv[2]), index=int(sys.argv[3])
+)
 PY
   python3 - "$task_output/task.json" "$task_output/BUILD_CONTRACT.json" <<'PY'
 import json

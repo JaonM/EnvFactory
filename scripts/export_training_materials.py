@@ -39,6 +39,7 @@ from env_factory.task_similarity import task_family_ids
 from env_factory.generation_provenance import valid_generation_provenance
 from env_factory.runtime_provenance import valid_container_rollout_execution
 from env_factory.data_governance import valid_provider_binding
+from env_factory.task_portability import valid_task_lineage
 
 
 def file_sha256(path: Path) -> str:
@@ -379,6 +380,20 @@ def _export_bundle_uncommitted(
                 raise ValueError(f"invalid task generation provenance for {item_id}")
             source_root = Path(str(item["sandbox_root"]))
             destination_root = output / "environments" / item_id
+            try:
+                task_lineage = json.loads(
+                    (source_root / "task_lineage.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except (OSError, json.JSONDecodeError):
+                task_lineage = {}
+            if not valid_task_lineage(
+                task_lineage,
+                Path(str(item["task_path"])),
+                source_root / "task.json",
+            ):
+                raise ValueError(f"task lineage is invalid for {item_id}")
             copied = {}
             for group in ("sandbox_artifacts_sha256", "sandbox_evidence_sha256"):
                 values = item.get(group)
@@ -686,6 +701,7 @@ def verify_bundle(
     verified_container_rollouts = 0
     verified_container_reward_calibrations = 0
     verified_provider_bindings = 0
+    verified_task_lineages = 0
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
             failures.append("bundle_items")
@@ -738,6 +754,18 @@ def verify_bundle(
             task_document = json.loads(task_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             task_document = {}
+        try:
+            task_lineage = json.loads(
+                (root / environment / "task_lineage.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, json.JSONDecodeError):
+            task_lineage = {}
+        if valid_task_lineage(task_lineage, task_path, task_path):
+            verified_task_lineages += 1
+        else:
+            failures.append("task_lineage")
         runtime_interface = (
             task_document.get("requirements", {}).get("runtime_interface")
             if isinstance(task_document, Mapping) else None
@@ -911,6 +939,11 @@ def verify_bundle(
         manifest.get("version") == BUNDLE_VERSION
         and bool(items)
         and verified_provider_bindings == len(items)
+    )
+    task_lineage_ready = (
+        manifest.get("version") == BUNDLE_VERSION
+        and bool(items)
+        and verified_task_lineages == len(items)
     )
     if (
         len(records) != manifest.get("transition_count")
@@ -1123,6 +1156,7 @@ def verify_bundle(
         "container_rollout_ready": container_rollout_ready,
         "container_reward_calibration_ready": container_reward_calibration_ready,
         "provider_identity_ready": provider_identity_ready,
+        "task_lineage_ready": task_lineage_ready,
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None

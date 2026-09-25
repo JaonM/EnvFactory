@@ -5,6 +5,11 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 不是“可直接开训”或训练平台上线认证；训练框架适配、算法兼容性、资源容量、RL 算法收敛、训练后
 策略提升和跨模型泛化都必须在下游系统另行验证。
 
+新生成任务的业务 fixture 与用户 FSM 使用任务目录内的固定相对路径；沙箱准备必须生成
+`task_lineage.json`，证明生成阶段 `task.json` 与运行阶段 `task.json` 字节一致且未执行旧绝对路径迁移。
+循环工程在评分和 live rollout 前重算该证明，最终 bundle 也会独立复核；旧任务仍可开发迁移，但不能
+进入新的生产留出认证样本。
+
 ## 认证硬门禁
 
 `scripts/certify_training_materials.py` 读取冻结实验的 `history.json`，使用以下默认策略：

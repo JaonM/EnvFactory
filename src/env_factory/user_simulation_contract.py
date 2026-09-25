@@ -236,6 +236,8 @@ class UserSimulationContractMixin:
         profiles: list[Any],
         scripts: list[Any],
         artifact_dir: Path,
+        *,
+        manifest_root: str | None = None,
     ) -> dict[str, Any]:
         """Persist the only inputs consumed by the runtime user simulator."""
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -246,7 +248,7 @@ class UserSimulationContractMixin:
         return {
             "version": "3.0",
             "script_model": "finite_state_machine",
-            "root": str(artifact_dir),
+            "root": manifest_root or str(artifact_dir),
             "profiles_file": str(profiles_path.relative_to(artifact_dir)),
             "scripts_file": str(scripts_path.relative_to(artifact_dir)),
         }

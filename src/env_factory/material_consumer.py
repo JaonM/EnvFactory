@@ -144,6 +144,7 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
             "index": f"{BUNDLE_MANIFEST}#items",
             "root_template": "environments/{item_id}",
             "task_contract": "environments/{item_id}/task.json",
+            "task_lineage": "environments/{item_id}/task_lineage.json",
             "docker_build_context": "environments/{item_id}",
             "dockerfile": "environments/{item_id}/Dockerfile",
             "runtime_interface_source": "task.json#requirements.runtime_interface",
@@ -167,5 +168,6 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
             "only_final_transition_is_terminal_or_truncated",
             "final_transition_reward_equals_episode_final_reward",
             "trainer_only_fields_are_not_policy_inputs",
+            "generated_task_equals_runtime_task",
         ],
     }

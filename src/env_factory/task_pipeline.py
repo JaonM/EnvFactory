@@ -452,7 +452,9 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
             records: list[Any] = []
             data_document = "# 无业务数据环境\n\n该任务不预置业务实体、数据表或持久化业务状态。\n"
             data_manifest = self._materialize_business_data(
-                [], data_document, materialized_dir, environment_mode=environment_plan["mode"]
+                [], data_document, materialized_dir / "data" / "business_data",
+                environment_mode=environment_plan["mode"],
+                manifest_root="data/business_data",
             )
         else:
             # 2a. Analyze business entities. This stage does not generate state or perform web search.
@@ -663,8 +665,9 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
             data_manifest = self._materialize_business_data(
                 data_tables,
                 data_document,
-                materialized_dir,
+                materialized_dir / "data" / "business_data",
                 environment_mode=environment_plan["mode"],
+                manifest_root="data/business_data",
             )
 
         media_generation = {"required": False, "language": "python", "code": "", "dependencies": [], "entrypoint": "", "output_dir": ""}
@@ -795,7 +798,10 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
         # task artifact contains only its reusable persona and FSM inputs;
         # pre-generated transcripts would be unused, duplicate truth sources.
         user_simulation_manifest = self._materialize_user_simulation(
-            profiles, user_scripts, materialized_dir / "user_simulation"
+            profiles,
+            user_scripts,
+            materialized_dir / "data" / "user_simulation",
+            manifest_root="data/user_simulation",
         )
 
         # 5. Decompose actions from the stable task/environment contract. User
@@ -6691,6 +6697,7 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
         artifact_dir: Path,
         *,
         environment_mode: str = "business_data",
+        manifest_root: str | None = None,
     ) -> dict[str, Any]:
         """Write table schemas/rows to files and return the compact task manifest."""
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -6732,7 +6739,7 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                 "contains_real_user_data": False,
                 "intended_use": "agentic_rl_training_material",
             },
-            "root": str(artifact_dir),
+            "root": manifest_root or str(artifact_dir),
             "document_file": str(document_path.relative_to(artifact_dir)),
             "tables": manifest_tables,
         }

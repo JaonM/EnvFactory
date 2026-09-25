@@ -165,6 +165,17 @@ class BusinessDataArtifactsTest(unittest.TestCase):
             self.assertEqual((root / "rows/clothing_items.jsonl").read_text().strip(), '{"item_id":"item-1"}')
             self.assertEqual((root / "data_document.md").read_text(), "# 数据说明\n")
 
+    def test_materialized_business_data_can_publish_a_portable_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = TaskGenerationPipeline._materialize_business_data(
+                [],
+                "# 无业务数据",
+                Path(directory) / "data" / "business_data",
+                environment_mode="stateless",
+                manifest_root="data/business_data",
+            )
+            self.assertEqual(manifest["root"], "data/business_data")
+
 
 class AgentActionContractTest(unittest.TestCase):
     def test_stateful_task_rejects_deferred_business_truth(self):
@@ -661,6 +672,17 @@ class AgentActionContractTest(unittest.TestCase):
             self.assertNotIn("sessions", manifest)
             self.assertTrue((root / manifest["profiles_file"]).is_file())
             self.assertTrue((root / manifest["scripts_file"]).is_file())
+
+    def test_user_simulation_manifest_can_publish_a_portable_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "data" / "user_simulation"
+            manifest = TaskGenerationPipeline._materialize_user_simulation(
+                [{"profile_id": "profile-1"}],
+                [{"script_id": "script-1"}],
+                root,
+                manifest_root="data/user_simulation",
+            )
+            self.assertEqual(manifest["root"], "data/user_simulation")
 
     def test_stateful_baseline_must_preserve_explicit_old_value(self):
         description = {"task": "请把商品场景从“景观建筑”更正为“服装”。"}
