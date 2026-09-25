@@ -95,7 +95,7 @@ class MaterialExportTest(unittest.TestCase):
             "FROM python@sha256:" + "a" * 64 + "\nUSER sandbox\n"
         )
         (sandbox / "docker_image_metadata.json").write_text(json.dumps({
-            "version": "3.0",
+            "version": "4.0",
             "image_id": "sha256:" + "d" * 64,
             "runtime_user": "sandbox",
             "smoke_test": {
@@ -104,6 +104,13 @@ class MaterialExportTest(unittest.TestCase):
                 "cap_drop": "ALL",
                 "no_new_privileges": True,
                 "non_root_user": True,
+                "service_health": True,
+                "runtime_tmpfs": {
+                    "path": "/app/.runtime",
+                    "uid": 10001,
+                    "gid": 10001,
+                    "mode": "0700",
+                },
             },
         }))
         (sandbox / "acceptance_result.json").write_text(
@@ -153,6 +160,15 @@ class MaterialExportTest(unittest.TestCase):
             }],
         }
         (sandbox / "live_rollout.json").write_text(json.dumps(rollout))
+        (sandbox / "agentic_training_value_live.json").write_text(json.dumps({
+            "curriculum_training_ready": True,
+            "validation_mode": "live_evaluator",
+            "runtime_execution": rollout["runtime_execution"],
+            "evidence": {"counterfactuals": {
+                "goal_success": {"reward": 1.0},
+                "goal_failure": {"reward": 0.0},
+            }},
+        }))
         item = {
             "task_path": str(task),
             "task_sha256": hashlib.sha256(task.read_bytes()).hexdigest(),
@@ -189,7 +205,11 @@ class MaterialExportTest(unittest.TestCase):
             ],
             "policy": {"score_threshold": 8.0},
             "measurements": {"training_ready": 1},
-            "gates": {"fixture": True},
+            "gates": {
+                "fixture": True,
+                "container_rollout_execution": True,
+                "container_reward_calibration": True,
+            },
             "failed_gates": [],
             "material_verification": {"verified": True},
             "materials_manifest": manifest,
@@ -236,6 +256,14 @@ class MaterialExportTest(unittest.TestCase):
                 },
             )
             self.assertEqual(
+                card["composition"]["reward_calibration_execution"],
+                {
+                    "modes": {"docker_http": 1},
+                    "validated_container_items": 1,
+                    "unique_container_images": 1,
+                },
+            )
+            self.assertEqual(
                 card["distribution_status"],
                 "internal_only_until_legal_and_security_review",
             )
@@ -252,7 +280,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "9.0")
+            self.assertEqual(contract["bundle_version"], "10.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -353,6 +381,41 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["verified"])
             self.assertFalse(report["container_rollout_ready"])
             self.assertIn("container_rollout_execution", report["failed_gates"])
+
+    def test_bundle_verifier_rejects_rehashed_reward_container_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            item = manifest["items"][0]
+            calibration_path = (
+                bundle / item["environment_path"]
+                / "agentic_training_value_live.json"
+            )
+            calibration = json.loads(calibration_path.read_text())
+            changed_image = "sha256:" + "e" * 64
+            calibration["runtime_execution"]["container_image_id"] = changed_image
+            calibration_path.write_text(json.dumps(calibration))
+            item["reward_runtime_execution"]["container_image_id"] = changed_image
+            relative = str(calibration_path.relative_to(bundle))
+            digest = exporter.file_sha256(calibration_path)
+            item["files_sha256"]["agentic_training_value_live.json"] = digest
+            manifest["files_sha256"][relative] = digest
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["container_reward_calibration_ready"])
+            self.assertIn(
+                "container_reward_calibration", report["failed_gates"]
+            )
 
     def test_bundle_verifier_rejects_rehashed_environment_claim(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -510,11 +573,13 @@ class MaterialExportTest(unittest.TestCase):
             card = json.loads(card_path.read_text())
             card["version"] = "1.4"
             card["composition"].pop("runtime_execution")
+            card["composition"].pop("reward_calibration_execution")
             card_path.write_text(json.dumps(card))
             manifest_path = bundle / "bundle_manifest.json"
             manifest = json.loads(manifest_path.read_text())
             manifest["version"] = "8.0"
             manifest["items"][0].pop("runtime_execution")
+            manifest["items"][0].pop("reward_runtime_execution")
             manifest["files_sha256"]["consumer_contract.json"] = (
                 exporter.file_sha256(contract_path)
             )
@@ -531,6 +596,40 @@ class MaterialExportTest(unittest.TestCase):
             self.assertTrue(report["verified"], report)
             self.assertTrue(report["generation_provenance_ready"])
             self.assertFalse(report["container_rollout_ready"])
+
+    def test_legacy_v9_bundle_keeps_rollout_claim_without_reward_container_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            contract_path = bundle / "consumer_contract.json"
+            contract_path.write_text(json.dumps(exporter.consumer_contract("9.0")))
+            card_path = bundle / "dataset_card.json"
+            card = json.loads(card_path.read_text())
+            card["version"] = "1.5"
+            card["composition"].pop("reward_calibration_execution")
+            card_path.write_text(json.dumps(card))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = "9.0"
+            manifest["items"][0].pop("reward_runtime_execution")
+            manifest["files_sha256"]["consumer_contract.json"] = (
+                exporter.file_sha256(contract_path)
+            )
+            manifest["files_sha256"]["dataset_card.json"] = (
+                exporter.file_sha256(card_path)
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertTrue(report["verified"], report)
+            self.assertTrue(report["container_rollout_ready"])
+            self.assertFalse(report["container_reward_calibration_ready"])
 
     def test_rehashed_bundle_cannot_remove_environment_rebuild_entrypoint(self):
         with tempfile.TemporaryDirectory() as directory:

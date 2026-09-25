@@ -10,7 +10,7 @@ class RuntimeProvenanceTest(unittest.TestCase):
     def evidence(self, root: Path):
         image_id = "sha256:" + "a" * 64
         (root / "docker_image_metadata.json").write_text(json.dumps({
-            "version": "3.0",
+            "version": "4.0",
             "image_id": image_id,
             "runtime_user": "sandbox",
             "smoke_test": {
@@ -19,6 +19,13 @@ class RuntimeProvenanceTest(unittest.TestCase):
                 "cap_drop": "ALL",
                 "no_new_privileges": True,
                 "non_root_user": True,
+                "service_health": True,
+                "runtime_tmpfs": {
+                    "path": "/app/.runtime",
+                    "uid": 10001,
+                    "gid": 10001,
+                    "mode": "0700",
+                },
             },
         }))
         return {

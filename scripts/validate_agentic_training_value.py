@@ -8,9 +8,12 @@ import copy
 import importlib.util
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+
+from env_factory.sandbox_http import HTTPSandboxClient
 
 
 PLACEHOLDERS = {"fixture-value", "example", "placeholder", "todo", "unknown", "test"}
@@ -116,7 +119,13 @@ def dependency_swap_positions(
     return None
 
 
-def validate(root: Path, *, evaluator_mode: str = "mock") -> dict[str, Any]:
+def validate(
+    root: Path,
+    *,
+    evaluator_mode: str = "mock",
+    base_url: str | None = None,
+    container_image_id: str | None = None,
+) -> dict[str, Any]:
     if evaluator_mode not in {"mock", "live"}:
         raise ValueError("evaluator_mode must be mock or live")
     task = load(root / "task.json")
@@ -166,16 +175,45 @@ def validate(root: Path, *, evaluator_mode: str = "mock") -> dict[str, Any]:
         elif empty_critical_collection(arguments):
             failures.append({"gate": "semantic_fixture", "message": f"tool step {index} uses an empty collection"})
 
+    if bool(base_url) != bool(container_image_id):
+        raise ValueError("base_url and container_image_id must be provided together")
+    if base_url and evaluator_mode != "live":
+        raise ValueError("container execution requires evaluator_mode=live")
+    if base_url and re.fullmatch(r"sha256:[0-9a-f]{64}", str(container_image_id)) is None:
+        raise ValueError("container_image_id must be a Docker sha256 image ID")
     os.environ.setdefault("SANDBOX_TRAINER_API_KEY", "envfactory-agentic-value-key")
     os.environ["SANDBOX_EVALUATOR_MOCK"] = "1" if evaluator_mode == "mock" else "0"
-    app = import_app(root)
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    app = HTTPSandboxClient(base_url) if base_url else import_app(root)
     from sandbox_runtime import AcceptanceScenarioRunner
+
+    trainer_headers = {
+        "Authorization": f"Bearer {os.environ['SANDBOX_TRAINER_API_KEY']}"
+    }
+
+    def remote_business_snapshot() -> Any:
+        status, body, _ = app.handle("GET", "/v1/state", None, trainer_headers)
+        if status != 200 or not isinstance(body, Mapping):
+            raise RuntimeError("trainer state endpoint failed")
+        snapshot = body.get("business_state")
+        if not isinstance(snapshot, Mapping):
+            raise RuntimeError("trainer state endpoint returned an invalid snapshot")
+        return dict(snapshot)
 
     runner = AcceptanceScenarioRunner(
         app.handle,
-        trainer_headers={"Authorization": f"Bearer {os.environ['SANDBOX_TRAINER_API_KEY']}"},
-        business_snapshot=getattr(app, "business_snapshot", None),
-        mutate_business_state=getattr(app, "mutate_business_state", None),
+        trainer_headers=trainer_headers,
+        business_snapshot=(
+            remote_business_snapshot
+            if base_url
+            else getattr(app, "business_snapshot", None)
+        ),
+        # A production container deliberately has no generic state-mutation
+        # endpoint. Counterfactuals must use the public business tools.
+        mutate_business_state=(
+            None if base_url else getattr(app, "mutate_business_state", None)
+        ),
     )
 
     def execute(name: str, scenario: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -297,6 +335,20 @@ def validate(root: Path, *, evaluator_mode: str = "mock") -> dict[str, Any]:
             failures.append({"gate": "noise_selection", "message": "noise tool trajectory must produce reward <= 0", "reward": noise_reward})
 
     failed_gates = sorted({item["gate"] for item in failures})
+    runtime_execution = (
+        {
+            "version": "1.0",
+            "mode": "docker_http",
+            "container_image_id": container_image_id,
+            "transport": "loopback_http",
+            "read_only_root": True,
+            "cap_drop": "ALL",
+            "no_new_privileges": True,
+            "non_root_user": True,
+        }
+        if base_url
+        else {"version": "1.0", "mode": "in_process", "container_image_id": None}
+    )
     return {
         "curriculum_training_ready": not failures,
         "agentic_training_ready": not failures,
@@ -304,6 +356,7 @@ def validate(root: Path, *, evaluator_mode: str = "mock") -> dict[str, Any]:
         "sandbox_profile": contract.get("sandbox_profile", category),
         "agentic_eligible": tool_required,
         "validation_mode": "offline_mock" if evaluator_mode == "mock" else "live_evaluator",
+        "runtime_execution": runtime_execution,
         "hard_gates_passed": not failures,
         "failed_gates": failed_gates,
         "evidence": evidence,
@@ -319,9 +372,19 @@ def main() -> int:
         "--evaluator-mode", choices=("mock", "live"), default="mock",
         help="live exercises the configured production reward evaluator",
     )
+    parser.add_argument("--base-url")
+    parser.add_argument("--container-image-id")
     args = parser.parse_args()
     root = args.root.resolve()
-    report = validate(root, evaluator_mode=args.evaluator_mode)
+    try:
+        report = validate(
+            root,
+            evaluator_mode=args.evaluator_mode,
+            base_url=args.base_url,
+            container_image_id=args.container_image_id,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     output = args.output or root / "agentic_training_value.json"
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))

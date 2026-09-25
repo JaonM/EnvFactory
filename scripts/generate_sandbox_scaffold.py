@@ -193,7 +193,7 @@ docker run --rm --read-only \\
   --memory "${SANDBOX_MEMORY:-512m}" \\
   --pids-limit "${SANDBOX_PIDS_LIMIT:-128}" \\
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \\
-  --tmpfs /app/.runtime:rw,nosuid,size=64m \\
+  --tmpfs /app/.runtime:rw,nosuid,size=64m,uid=10001,gid=10001,mode=0700 \\
   -p "${SANDBOX_PORT:-8000}:8000" \\
   -e SANDBOX_TRAINER_API_KEY \\
   -e SANDBOX_LLM_API_KEY \\

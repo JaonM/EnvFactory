@@ -275,6 +275,10 @@ class ExperimentTest(unittest.TestCase):
                     (output / "agentic_training_value_live.json").write_text(json.dumps({
                         "curriculum_training_ready": True,
                         "validation_mode": "live_evaluator",
+                        "runtime_execution": {
+                            "mode": "docker_http",
+                            "container_image_id": "sha256:" + "d" * 64,
+                        },
                     }))
                 return {"exit_code": 0, "timed_out": False, "seconds": .1}
 
@@ -335,6 +339,14 @@ class ExperimentTest(unittest.TestCase):
             )
             self.assertEqual(
                 calibration[calibration.index("--evaluator-mode") + 1], "live"
+            )
+            self.assertEqual(
+                calibration[calibration.index("--base-url") + 1],
+                "http://127.0.0.1:49152",
+            )
+            self.assertEqual(
+                calibration[calibration.index("--container-image-id") + 1],
+                "sha256:" + "d" * 64,
             )
 
     def test_data_governance_failure_prevents_live_rollout(self):

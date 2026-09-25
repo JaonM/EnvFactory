@@ -202,7 +202,7 @@ def start_rollout_container(project, output, image_tag, config):
         "--security-opt", "no-new-privileges:true",
         "--pids-limit", "128", "--memory", "512m", "--cpus", "1.0",
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
-        "--tmpfs", "/app/.runtime:rw,nosuid,size=64m",
+        "--tmpfs", "/app/.runtime:rw,nosuid,size=64m,uid=10001,gid=10001,mode=0700",
     ]
     for name in (
         "SANDBOX_TRAINER_API_KEY", "SANDBOX_LLM_API_KEY",
@@ -751,20 +751,75 @@ def _build_one(project, task_path, output, config, seed=None):
                 )
         if result["passed"]:
             calibration_path = output / "agentic_training_value_live.json"
-            calibration_run = run_process([
+            calibration_command = [
                 sys.executable,
                 str(project / "scripts/validate_agentic_training_value.py"),
                 "--root", str(output), "--output", str(calibration_path),
                 "--evaluator-mode", "live",
-            ], project, output / "live_reward_calibration.log", config["rollout_timeout"])
+            ]
+            calibration_runtime = None
+            calibration_runtime_dir = output / ".reward_calibration_runtime"
+            if config.get("sandbox_runtime", "none") == "docker":
+                calibration_runtime_dir.mkdir(exist_ok=True)
+                calibration_runtime = start_rollout_container(
+                    project, calibration_runtime_dir, image_tag, config
+                )
+                result["container_reward_calibration"] = {
+                    key: value for key, value in calibration_runtime.items()
+                    if key not in {"base_url", "container_id"}
+                }
+                if calibration_runtime.get("started") is not True:
+                    result.update(
+                        passed=False,
+                        live_rollout_verified=False,
+                        failure_class="infrastructure",
+                        failure_code="INFRA",
+                        repair_target="runner_or_provider",
+                        detail="validated reward calibration container failed to start",
+                    )
+                    result["elapsed_seconds"] = time.monotonic() - started
+                    return result
+                calibration_command.extend([
+                    "--base-url", calibration_runtime["base_url"],
+                    "--container-image-id", calibration_runtime["image_id"],
+                ])
+            try:
+                calibration_run = run_process(
+                    calibration_command,
+                    project,
+                    output / "live_reward_calibration.log",
+                    config["rollout_timeout"],
+                )
+            finally:
+                if calibration_runtime and calibration_runtime.get("container_id"):
+                    stopped = stop_rollout_container(
+                        project,
+                        calibration_runtime_dir,
+                        calibration_runtime["container_id"],
+                        config,
+                    )
+                    result.setdefault("container_reward_calibration", {})[
+                        "stop"
+                    ] = stopped
             try:
                 calibration = json.loads(calibration_path.read_text())
             except (OSError, json.JSONDecodeError):
                 calibration = {}
+            calibration_execution = calibration.get("runtime_execution", {})
             calibration_passed = (
                 calibration_run["exit_code"] == 0
                 and calibration.get("curriculum_training_ready") is True
                 and calibration.get("validation_mode") == "live_evaluator"
+                and (
+                    calibration_runtime is None
+                    or (
+                        calibration_execution.get("mode") == "docker_http"
+                        and calibration_execution.get("container_image_id")
+                        == calibration_runtime.get("image_id")
+                        and result.get("container_reward_calibration", {})
+                        .get("stop", {}).get("exit_code") == 0
+                    )
+                )
             )
             result.update(
                 live_reward_calibration=calibration,

@@ -38,9 +38,15 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
   安全 smoke 容器还会使用 `importlib.metadata` 导出排序后的实际 Python 分发包名称与版本到
   `python_packages.json`；认证器复核其摘要、结构、唯一性，并确认每个无条件直接 pin 的安装版本一致。
   该 inventory 用于依赖可追溯，不等同于漏洞扫描、许可证判断或 SBOM 法务审批。
+  pytest 通过后还必须在同一安全边界内按镜像默认命令启动服务，并从容器网络命名空间内验证
+  `/health`。`/app/.runtime` 使用显式 UID/GID 与权限的 tmpfs，使非 root 进程能够创建 episode SQLite；
+  只有测试通过但服务无法启动的镜像不能生成当前 v4 容器 provenance。
 - 工具契约、真实业务结果、mutation resistance 和奖励反事实全部通过。
 - 奖励假阳性率不高于 0.5%，假阴性率不高于 2%。
-- 奖励反事实必须使用生产配置的真实 evaluator 重跑；mock 报告只用于离线构建测试，不能进入生产认证。
+- 奖励反事实必须使用生产配置的真实 evaluator，并通过刚刚构建的同一 Docker 镜像的 loopback HTTP
+  协议重跑；宿主进程导入沙箱或 mock 报告只用于离线构建测试，不能进入生产认证。校准报告保存实际
+  镜像 ID 和只读根文件系统、非 root、capability drop、no-new-privileges 运行属性，认证器与镜像构建
+  证据独立交叉验证。
 - 每份 rollout 保存任务 SHA-256、沙箱可执行输入摘要、Agent/User/Judge 模型及 provider 摘要；认证时重新
   计算并拒绝把其他任务或沙箱的轨迹挂接到当前样本。
 - 生产留出集的 live rollout 必须通过随机 loopback 端口调用刚刚构建并验证的 Docker 镜像；宿主进程
@@ -115,7 +121,7 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 
 生产认证还会原子生成 `training_materials_bundle/`。该目录不保留本机绝对路径，按内容身份保存每个
 环境的任务、运行时代码、业务数据、验收证据和 `live_rollout.json`，并生成 `transitions.jsonl` 与
-`bundle_manifest.json`。Bundle v9 同时包含去除本机路径的 `certification.json`、机器可读
+`bundle_manifest.json`。Bundle v10 同时包含去除本机路径的 `certification.json`、机器可读
 `dataset_card.json`。JSONL 每行是一条可重建的 schema v2 transition，并携带任务、类别、episode、
 任务生成模型与 provider 身份、生成 seed、Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与
 `bundle_sha256` 再次校验；导出失败或包校验失败时，即使此前统计门禁通过，也不会产生
@@ -127,10 +133,13 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 就让语义损坏的轨迹通过。JSONL 由固定字段白名单投影产生；完整 trainer-only 证据仍保存在对应环境目录，
 并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。
 
-Bundle v9 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
+Bundle v10 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
 记录身份与排序、环境目录和 Docker 重建入口、运行接口来源，以及 policy input/output、环境反馈和
 trainer-only 证据边界。验证器使用内置规范与文件逐项比较；即使同时修改契约并重算所有外层哈希，也不能
-把 trainer-only 字段伪装成策略输入。历史 v3/v4 包仍可验证完整性，但不能满足当前生产认证的受信发布门禁。
+把 trainer-only 字段伪装成策略输入。Bundle v10 还要求每个环境携带并校验
+`agentic_training_value_live.json` 的容器执行身份；rollout 与奖励校准都必须匹配同一份 v4 镜像
+provenance。v9 包仍可验证其原有完整性，但缺少这一新语义，不能满足当前生产准备认证。更早版本也只能
+验证各自声明的历史契约，不能满足当前受信发布门禁。
 
 生产发布还要求使用组织持有的 Ed25519 私钥对最终 `bundle_manifest.json` 生成 detached signature，并由
 显式指定的受信任公钥复验。报告和包中只保存公钥 SHA-256 身份，不保存私钥、私钥路径或公钥内容。

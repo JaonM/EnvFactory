@@ -56,7 +56,7 @@ class ContainerProvenanceTest(unittest.TestCase):
             ],
         }))
         metadata = {
-            "version": "3.0",
+            "version": "4.0",
             "tag": "fixture",
             "base_image": image,
             "image_id": "sha256:" + "b" * 64,
@@ -72,6 +72,13 @@ class ContainerProvenanceTest(unittest.TestCase):
                 "cap_drop": "ALL",
                 "no_new_privileges": True,
                 "non_root_user": True,
+                "service_health": True,
+                "runtime_tmpfs": {
+                    "path": "/app/.runtime",
+                    "uid": 10001,
+                    "gid": 10001,
+                    "mode": "0700",
+                },
             },
         }
         (root / "docker_image_metadata.json").write_text(json.dumps(metadata))
@@ -84,6 +91,16 @@ class ContainerProvenanceTest(unittest.TestCase):
             self.assertTrue(verify_container_provenance(
                 root, expected_tag="fixture"
             )["verified"])
+
+    def test_pytest_only_smoke_cannot_replace_service_startup_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = self.fixture(root)
+            metadata["smoke_test"].pop("service_health")
+            (root / "docker_image_metadata.json").write_text(json.dumps(metadata))
+            report = verify_container_provenance(root)
+            self.assertFalse(report["verified"])
+            self.assertIn("container_smoke_test", report["failed_gates"])
 
     def test_floating_base_image_and_dependency_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

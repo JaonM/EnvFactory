@@ -34,7 +34,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "packages": [{"name": "pytest", "version": "9.1.1"}],
         }))
         (evidence / "docker_image_metadata.json").write_text(json.dumps({
-            "version": "3.0",
+            "version": "4.0",
             "tag": "fixture",
             "base_image": pinned_image,
             "image_id": "sha256:" + "d" * 64,
@@ -56,6 +56,13 @@ class ProductionReadinessTest(unittest.TestCase):
                 "cap_drop": "ALL",
                 "no_new_privileges": True,
                 "non_root_user": True,
+                "service_health": True,
+                "runtime_tmpfs": {
+                    "path": "/app/.runtime",
+                    "uid": 10001,
+                    "gid": 10001,
+                    "mode": "0700",
+                },
             },
         }))
         (evidence / "training_readiness.json").write_text(json.dumps({
@@ -81,6 +88,16 @@ class ProductionReadinessTest(unittest.TestCase):
         (evidence / "agentic_training_value_live.json").write_text(json.dumps({
             "curriculum_training_ready": True,
             "validation_mode": "live_evaluator",
+            "runtime_execution": {
+                "version": "1.0",
+                "mode": "docker_http",
+                "container_image_id": "sha256:" + "d" * 64,
+                "transport": "loopback_http",
+                "read_only_root": True,
+                "cap_drop": "ALL",
+                "no_new_privileges": True,
+                "non_root_user": True,
+            },
             "evidence": {"counterfactuals": {
                 "goal_success": {"reward": 1.0},
                 "goal_failure": {"reward": 0.0},
@@ -302,6 +319,7 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertEqual(report["measurements"]["episodes"], 9000)
             self.assertTrue(report["gates"]["rollout_provenance"])
             self.assertTrue(report["gates"]["container_rollout_execution"])
+            self.assertTrue(report["gates"]["container_reward_calibration"])
             self.assertTrue(report["gates"]["category_mix"])
             self.assertTrue(report["gates"]["user_simulator_outcome_coverage"])
             self.assertTrue(report["gates"]["data_governance"])
@@ -423,6 +441,22 @@ class ProductionReadinessTest(unittest.TestCase):
             live_report.write_text(json.dumps(value))
             report = certifier.certify(history, certifier.default_policy())
             self.assertFalse(report["gates"]["tool_and_reward_integrity"])
+
+    def test_in_process_reward_calibration_cannot_certify_production(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = self.make_history(root)
+            live_report = root / "evidence/agentic_training_value_live.json"
+            value = json.loads(live_report.read_text())
+            value["runtime_execution"] = {
+                "version": "1.0",
+                "mode": "in_process",
+                "container_image_id": None,
+            }
+            live_report.write_text(json.dumps(value))
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["container_reward_calibration"])
 
     def test_credential_finding_breaks_data_governance_gate(self):
         with tempfile.TemporaryDirectory() as directory:

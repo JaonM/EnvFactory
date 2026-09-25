@@ -62,6 +62,23 @@ class BuildWorkflowTest(unittest.TestCase):
             self.assertIn("--cap-drop ALL", docker_run)
             self.assertIn("no-new-privileges:true", docker_run)
             self.assertIn("--pids-limit", docker_run)
+            self.assertIn(
+                "/app/.runtime:rw,nosuid,size=64m,uid=10001,gid=10001,mode=0700",
+                docker_run,
+            )
+
+    def test_container_smoke_starts_service_with_writable_non_root_runtime(self):
+        builder = (ROOT / "scripts/build_docker_sandbox_image.sh").read_text(
+            encoding="utf-8"
+        )
+        loop = (ROOT / "scripts/loop_experiment.py").read_text(encoding="utf-8")
+        runtime_mount = (
+            "/app/.runtime:rw,nosuid,size=64m,uid=10001,gid=10001,mode=0700"
+        )
+        self.assertIn(runtime_mount, builder)
+        self.assertIn(runtime_mount, loop)
+        self.assertIn('docker exec "$smoke_cid"', builder)
+        self.assertIn("service_health", builder)
 
     def test_sandbox_score_uses_ten_point_critical_gate_rubric(self):
         scorer = load_script("score_sandbox.py")

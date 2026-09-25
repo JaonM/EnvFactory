@@ -45,7 +45,7 @@ def valid_container_rollout_execution(
     smoke = metadata.get("smoke_test", {}) if isinstance(metadata, Mapping) else {}
     return (
         isinstance(metadata, Mapping)
-        and metadata.get("version") == "3.0"
+        and metadata.get("version") == "4.0"
         and metadata.get("image_id") == execution["container_image_id"]
         and isinstance(metadata.get("runtime_user"), str)
         and metadata["runtime_user"] not in {"", "root", "0"}
@@ -55,4 +55,11 @@ def valid_container_rollout_execution(
         and smoke.get("cap_drop") == "ALL"
         and smoke.get("no_new_privileges") is True
         and smoke.get("non_root_user") is True
+        and smoke.get("service_health") is True
+        and smoke.get("runtime_tmpfs") == {
+            "path": "/app/.runtime",
+            "uid": 10001,
+            "gid": 10001,
+            "mode": "0700",
+        }
     )

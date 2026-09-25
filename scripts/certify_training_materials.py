@@ -492,6 +492,10 @@ def certify(
         and report.get("validation_mode") == "live_evaluator"
         for report in agentic_reports
     )
+    container_reward_calibration = bool(qualified) and all(
+        valid_container_rollout_execution(report, Path(str(item.get("output", ""))))
+        for item, report in zip(qualified, agentic_reports)
+    )
     counterfactuals = _counterfactual_counts(agentic_reports)
     false_positive_rate = (
         counterfactuals["negative_errors"] / counterfactuals["negative_total"]
@@ -647,6 +651,7 @@ def certify(
         "user_simulator_outcomes": dict(user_outcomes),
         "runtime_integrity": runtime_integrity,
         "tool_and_reward_integrity": tool_and_reward_integrity,
+        "container_reward_calibration": container_reward_calibration,
         "data_governance": {
             "reports": len(governance_reports),
             "verified": governed_materials,
@@ -745,6 +750,7 @@ def certify(
         ),
         "runtime_state_integrity": runtime_integrity,
         "tool_and_reward_integrity": tool_and_reward_integrity,
+        "container_reward_calibration": container_reward_calibration,
         "data_governance": measurements["data_governance"]["all_verified"],
         "container_reproducibility": measurements["container_reproducibility"][
             "all_verified"

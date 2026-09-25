@@ -119,7 +119,15 @@ selected=""
 manifest_file="$(mktemp "${TMPDIR:-/tmp}/env-factory-manifest.XXXXXX")"
 resolved_dockerfile="$(mktemp "${TMPDIR:-/tmp}/env-factory-dockerfile.XXXXXX")"
 package_inventory="$(mktemp "${TMPDIR:-/tmp}/env-factory-packages.XXXXXX")"
-cleanup() { rm -f "$manifest_file" "$resolved_dockerfile" "$package_inventory"; }
+smoke_cid_file="$(mktemp "${TMPDIR:-/tmp}/env-factory-smoke-cid.XXXXXX")"
+rm -f "$smoke_cid_file"
+cleanup() {
+  if [[ -s "$smoke_cid_file" ]]; then
+    smoke_cid="$(tr -d '[:space:]' < "$smoke_cid_file")"
+    if [[ -n "$smoke_cid" ]]; then docker rm -f "$smoke_cid" >/dev/null 2>&1 || true; fi
+  fi
+  rm -f "$manifest_file" "$resolved_dockerfile" "$package_inventory" "$smoke_cid_file"
+}
 trap cleanup EXIT
 read -r docker_os docker_arch < <(docker info --format '{{.OSType}} {{.Architecture}}')
 for candidate in "${candidates[@]}"; do
@@ -174,11 +182,38 @@ docker run --rm --network none --read-only \
   --cap-drop ALL --security-opt no-new-privileges:true \
   --pids-limit 128 --memory 512m --cpus 1.0 \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-  --tmpfs /app/.runtime:rw,nosuid,size=64m \
+  --tmpfs /app/.runtime:rw,nosuid,size=64m,uid=10001,gid=10001,mode=0700 \
   -e SANDBOX_TRAINER_API_KEY=container-smoke-test \
   -e SANDBOX_EVALUATOR_MOCK=1 \
   -e PYTHONDONTWRITEBYTECODE=1 \
   "$tag" python3 -m pytest -q -p no:cacheprovider
+echo "在相同安全边界内验证沙箱服务能够启动并响应健康检查" >&2
+docker run -d --rm --cidfile "$smoke_cid_file" --network none --read-only \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --pids-limit 128 --memory 512m --cpus 1.0 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --tmpfs /app/.runtime:rw,nosuid,size=64m,uid=10001,gid=10001,mode=0700 \
+  -e SANDBOX_TRAINER_API_KEY=container-smoke-test \
+  -e SANDBOX_EVALUATOR_MOCK=1 \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  "$tag" >/dev/null
+smoke_cid="$(tr -d '[:space:]' < "$smoke_cid_file")"
+service_healthy=false
+for _ in $(seq 1 50); do
+  if docker exec "$smoke_cid" python3 -c \
+    'import json,urllib.request; value=json.load(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=1)); assert value.get("status") == "ok"'; then
+    service_healthy=true
+    break
+  fi
+  sleep 0.2
+done
+if [[ "$service_healthy" != "true" ]]; then
+  docker logs "$smoke_cid" >&2 || true
+  echo "沙箱服务未能在生产安全边界内启动" >&2
+  exit 7
+fi
+docker rm -f "$smoke_cid" >/dev/null
+: > "$smoke_cid_file"
 echo "采集镜像内 Python 分发包 inventory" >&2
 docker run --rm --network none --read-only \
   --cap-drop ALL --security-opt no-new-privileges:true \
@@ -209,7 +244,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 Path(sys.argv[1]).write_text(json.dumps({
-    "version": "3.0",
+    "version": "4.0",
     "tag": sys.argv[2],
     "base_image": sys.argv[3],
     "image_id": sys.argv[4],
@@ -226,6 +261,13 @@ Path(sys.argv[1]).write_text(json.dumps({
         "cap_drop": "ALL",
         "no_new_privileges": True,
         "non_root_user": True,
+        "service_health": True,
+        "runtime_tmpfs": {
+            "path": "/app/.runtime",
+            "uid": 10001,
+            "gid": 10001,
+            "mode": "0700",
+        },
     },
     "built_at": datetime.now(timezone.utc).isoformat(),
 }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -239,6 +281,8 @@ if [[ "$start" == "true" ]]; then
     --pids-limit "${SANDBOX_PIDS_LIMIT:-128}"
     --memory "${SANDBOX_MEMORY_LIMIT:-512m}"
     --cpus "${SANDBOX_CPU_LIMIT:-1.0}"
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m
+    --tmpfs /app/.runtime:rw,nosuid,size=64m,uid=10001,gid=10001,mode=0700
   )
   for env_name in SANDBOX_TRAINER_API_KEY SANDBOX_LLM_API_KEY SANDBOX_LLM_BASE_URL SANDBOX_LLM_MODEL SANDBOX_LLM_TIMEOUT_SECONDS SANDBOX_LLM_MAX_RETRIES SANDBOX_EVALUATOR_MOCK; do
     if [[ -n "${!env_name:-}" ]]; then run_args+=(--env "$env_name"); fi

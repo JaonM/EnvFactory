@@ -104,7 +104,7 @@ def verify_container_provenance(
     except (OSError, json.JSONDecodeError):
         metadata = {}
         failures.append("metadata")
-    if not isinstance(metadata, Mapping) or metadata.get("version") != "3.0":
+    if not isinstance(metadata, Mapping) or metadata.get("version") != "4.0":
         failures.append("metadata_schema")
         metadata = {}
     if PINNED_IMAGE.fullmatch(str(metadata.get("base_image", ""))) is None:
@@ -162,6 +162,13 @@ def verify_container_provenance(
         and smoke.get("cap_drop") == "ALL"
         and smoke.get("no_new_privileges") is True
         and smoke.get("non_root_user") is True
+        and smoke.get("service_health") is True
+        and smoke.get("runtime_tmpfs") == {
+            "path": "/app/.runtime",
+            "uid": 10001,
+            "gid": 10001,
+            "mode": "0700",
+        }
     ):
         failures.append("container_smoke_test")
     platform = metadata.get("platform", {})
