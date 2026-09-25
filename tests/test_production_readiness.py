@@ -64,6 +64,9 @@ class ProductionReadinessTest(unittest.TestCase):
                             "bundle_version": "12.0",
                         }
                         if name == "bundle_signing_identity" else {}
+                        if name != "evaluator_role_separation" else {
+                            "agent_and_evaluator_distinct": True,
+                        }
                     ),
                 }
                 for name in sorted(certifier.REQUIRED_CHECKS)
@@ -785,6 +788,24 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["gates"]["environment_integrity"])
             self.assertEqual(report["measurements"]["llm_fallbacks"], 1)
 
+    def test_same_provider_agent_and_evaluator_cannot_certify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            rollout = history["holdouts"][0]["jobs"][0]["result"][
+                "live_rollout"
+            ]
+            rollout["runtime_provider_sha256"] = rollout[
+                "agent_provider_sha256"
+            ]
+            report = self.certify(history)
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["evaluator_independence"])
+            self.assertEqual(
+                report["measurements"]["evaluator_independence"]
+                    ["same_provider_items"],
+                1,
+            )
+
     def test_invalid_user_simulator_protocol_breaks_certification(self):
         with tempfile.TemporaryDirectory() as directory:
             history = self.make_history(Path(directory))
@@ -1294,6 +1315,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "task_lineage_ready": True,
             "production_preflight_ready": True,
             "metadata_privacy_ready": True,
+            "evaluator_independence_ready": True,
             "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
@@ -1311,6 +1333,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "task_lineage_ready": True,
             "production_preflight_ready": True,
             "metadata_privacy_ready": True,
+            "evaluator_independence_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])

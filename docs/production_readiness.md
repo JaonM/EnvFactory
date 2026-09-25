@@ -98,6 +98,8 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
   沙箱的数据治理授权报告；摘要必须是规范的 64 位小写十六进制。两个报告分别格式合法但身份不一致时，
   不能把轨迹视为已获授权的生产素材。Live 奖励校准报告也必须保存按同一规范计算的 evaluator provider
   身份并匹配 `user_simulator_and_reward` 授权，避免只证明“某个 Judge 在容器中执行过”。
+- 生产 profile 要求 Rollout Agent 与 User/Reward Judge 使用不同的规范 provider 身份，并从每份真实
+  rollout 重算同身份比例；当前上限为 0。该门禁避免直接自评，但不等同于证明 Judge 完全无偏。
 - 生产留出集的 live rollout 必须通过随机 loopback 端口调用刚刚构建并验证的 Docker 镜像；宿主进程
   直接导入 `app.py` 只允许用于开发检查，不能作为生产证据。轨迹保存实际 Docker image ID、HTTP 传输
   模式和只读根文件系统、非 root、capability drop、no-new-privileges 状态，并与

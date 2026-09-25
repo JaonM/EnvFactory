@@ -250,6 +250,11 @@ class MaterialExportTest(unittest.TestCase):
             "measurements": {
                 "training_ready": 1,
                 "production_experiment_profile": True,
+                "evaluator_independence": {
+                    "same_provider_items": 0,
+                    "total_items": 1,
+                    "same_provider_rate": 0.0,
+                },
                 "production_preflight": {
                     "version": "1.0",
                     "scope": "production_pre_training_material_experiment",
@@ -283,6 +288,9 @@ class MaterialExportTest(unittest.TestCase):
                                     "bundle_version": "12.0",
                                 }
                                 if name == "bundle_signing_identity" else {}
+                                if name != "evaluator_role_separation" else {
+                                    "agent_and_evaluator_distinct": True,
+                                }
                             ),
                         }
                         for name in sorted(exporter.REQUIRED_CHECKS)
@@ -296,6 +304,7 @@ class MaterialExportTest(unittest.TestCase):
                 "provider_identity_consistency": True,
                 "production_experiment_profile": True,
                 "production_preflight": True,
+                "evaluator_independence": True,
             },
             "failed_gates": [],
             "material_verification": {"verified": True},

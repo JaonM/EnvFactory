@@ -721,6 +721,7 @@ def verify_bundle(
                 {
                     "production_experiment_profile",
                     "production_preflight",
+                    "evaluator_independence",
                 } <= set(portable_certification["gates"])
                 and portable_certification.get("measurements", {}).get(
                     "production_experiment_profile"
@@ -786,6 +787,7 @@ def verify_bundle(
     verified_container_reward_calibrations = 0
     verified_provider_bindings = 0
     verified_preflight_provider_bindings = 0
+    verified_same_provider_evaluator_items = 0
     verified_task_lineages = 0
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
@@ -967,6 +969,11 @@ def verify_bundle(
                         verified_preflight_provider_bindings += 1
                     else:
                         failures.append("preflight_provider_binding")
+                if (
+                    rollout.get("agent_provider_sha256")
+                    == rollout.get("runtime_provider_sha256")
+                ):
+                    verified_same_provider_evaluator_items += 1
         if item.get("episode_count") != len(rollout.get("episodes", [])):
             failures.append("item_episode_count")
         if item.get("transition_count") != len(projected):
@@ -1103,6 +1110,25 @@ def verify_bundle(
         )
         and bool(items)
         and verified_preflight_provider_bindings == len(items)
+    )
+    evaluator_independence_ready = (
+        supports_bundle_feature(
+            str(manifest.get("version")), "production_preflight"
+        )
+        and portable_certification.get("gates", {}).get(
+            "evaluator_independence"
+        ) is True
+        and portable_certification.get("measurements", {}).get(
+            "evaluator_independence"
+        ) == {
+            "same_provider_items": verified_same_provider_evaluator_items,
+            "total_items": len(items),
+            "same_provider_rate": (
+                verified_same_provider_evaluator_items / len(items)
+                if items else 1.0
+            ),
+        }
+        and verified_same_provider_evaluator_items == 0
     )
     if (
         len(records) != manifest.get("transition_count")
@@ -1325,6 +1351,7 @@ def verify_bundle(
         "production_preflight_ready": production_preflight_ready,
         "preflight_provider_bindings": verified_preflight_provider_bindings,
         "metadata_privacy_ready": portable_metadata_privacy["safe"],
+        "evaluator_independence_ready": evaluator_independence_ready,
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None

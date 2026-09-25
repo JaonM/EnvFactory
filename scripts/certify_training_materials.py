@@ -1130,6 +1130,14 @@ def certify(
     provider_identity_consistency = (
         bool(qualified) and provider_bindings_verified == len(qualified)
     )
+    same_provider_evaluator_items = sum(
+        item.get("live_rollout", {}).get("agent_provider_sha256")
+        == item.get("live_rollout", {}).get("runtime_provider_sha256")
+        for item in qualified
+    )
+    same_provider_evaluator_rate = (
+        same_provider_evaluator_items / len(qualified) if qualified else 1.0
+    )
     container_rollout_execution = bool(qualified) and all(
         valid_container_rollout_execution(
             item.get("live_rollout"), Path(str(item.get("output", "")))
@@ -1383,6 +1391,11 @@ def certify(
             "expected": len(qualified),
             "all_verified": provider_identity_consistency,
         },
+        "evaluator_independence": {
+            "same_provider_items": same_provider_evaluator_items,
+            "total_items": len(qualified),
+            "same_provider_rate": same_provider_evaluator_rate,
+        },
         "container_rollout_execution": container_rollout_execution,
         "trajectory_schema_complete": (
             bool(audited_episodes)
@@ -1495,6 +1508,11 @@ def certify(
         "rollout_outcome_integrity": rollout_outcome_integrity,
         "rollout_provenance": rollout_provenance,
         "provider_identity_consistency": provider_identity_consistency,
+        "evaluator_independence": (
+            bool(qualified)
+            and same_provider_evaluator_rate
+                <= policy["max_same_provider_evaluator_rate"]
+        ),
         "container_rollout_execution": container_rollout_execution,
         "trajectory_schema": measurements["trajectory_schema_complete"],
         "user_simulator_protocol": (
@@ -1580,6 +1598,7 @@ def default_policy() -> dict[str, Any]:
         "max_environment_error_rate": 0.001,
         "max_reward_false_positive_rate": 0.005,
         "max_reward_false_negative_rate": 0.02,
+        "max_same_provider_evaluator_rate": 0.0,
         "min_user_simulator_protocol_rate": 0.995,
         "min_user_outcome_categories": 3,
         "min_category_shares": {
@@ -1622,6 +1641,7 @@ def attach_bundle_verification(
         and verification.get("task_lineage_ready") is True
         and verification.get("production_preflight_ready") is True
         and verification.get("metadata_privacy_ready") is True
+        and verification.get("evaluator_independence_ready") is True
         and verification.get("source_dataset_sha256")
         == report.get("materials_manifest", {}).get("dataset_sha256")
     )

@@ -108,6 +108,7 @@ class ProductionPreflightTest(unittest.TestCase):
                 set(report["failed_checks"]),
                 {
                     "docker_daemon", "required_executables",
+                    "evaluator_role_separation",
                     "model_runtime_limits", "bundle_signing_identity",
                     "workspace_capacity",
                 },

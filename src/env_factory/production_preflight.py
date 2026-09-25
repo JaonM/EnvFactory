@@ -107,6 +107,13 @@ def run_production_preflight(
         "runtime_provider": runtime_provider,
         "urls_valid": urls_valid,
     })
+    evaluator_separated = (
+        agent_provider["identity_sha256"]
+        != runtime_provider["identity_sha256"]
+    )
+    record("evaluator_role_separation", evaluator_separated, {
+        "agent_and_evaluator_distinct": evaluator_separated,
+    })
 
     timeout_checks: dict[str, bool] = {}
     for name, role in roles.items():
@@ -165,6 +172,7 @@ REQUIRED_CHECKS = {
     "required_executables",
     "docker_daemon",
     "model_configuration",
+    "evaluator_role_separation",
     "model_runtime_limits",
     "bundle_signing_identity",
     "workspace_capacity",
@@ -204,6 +212,10 @@ def valid_production_preflight(
         set(by_name) == REQUIRED_CHECKS
         and all(check.get("passed") is True for check in by_name.values())
     ):
+        return False
+    if by_name["evaluator_role_separation"].get("evidence") != {
+        "agent_and_evaluator_distinct": True,
+    }:
         return False
     signing_evidence = by_name["bundle_signing_identity"].get("evidence")
     if not (
@@ -252,9 +264,14 @@ def valid_production_preflight(
             is not None
         )
 
-    return all(
+    providers_valid = all(
         valid_provider(model_evidence.get(name))
         for name in (
             "generation_provider", "agent_provider", "runtime_provider"
         )
+    )
+    return (
+        providers_valid
+        and model_evidence["agent_provider"]["identity_sha256"]
+            != model_evidence["runtime_provider"]["identity_sha256"]
     )

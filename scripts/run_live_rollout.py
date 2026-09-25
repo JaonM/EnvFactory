@@ -301,6 +301,10 @@ def main():
               **provider_attestation,
               "runtime_execution": runtime_execution,
               "same_model_bias_possible": client.model == runtime.model,
+              "same_provider_identity": (
+                  provider_attestation["agent_provider_sha256"]
+                  == provider_attestation["runtime_provider_sha256"]
+              ),
               "live_rollout_verified": False, "passed": False}
     from loop_experiment import write_json
     with tempfile.TemporaryDirectory(prefix="envfactory-rollout-") as temporary:
