@@ -177,6 +177,10 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 其中“生产级”修饰的是素材生成、验证和交付流程，不表示 EnvFactory 是 RL 训练框架，也不表示这些
 素材已经在目标算法、目标基础模型和目标算力配置上完成训练验证。
 
+认证结果发布采用原子文件替换：先完整写入 `training_materials_manifest.json`，再把
+`production_readiness.json` 作为最终提交标记发布。进程中断最多留下未被报告引用的清单或临时文件，
+不会先暴露一份声称认证成功但其素材清单尚未落盘的报告；最终签名 Bundle 仍是跨机器交付的权威产物。
+
 通过或失败时都会生成 `training_materials_manifest.json`，列出当前合格候选的任务 SHA-256、沙箱
 可移植文件树 SHA-256、原始证据指纹、rollout 摘要哈希、类别、分数和 episode 数量，并记录认证时的
 评估器源码摘要，再为整批清单生成 `dataset_sha256`。

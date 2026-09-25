@@ -1415,11 +1415,13 @@ def main():
                         certification = attach_bundle_verification(
                             certification, bundle_verification
                         )
-                    write_json(root / "production_readiness.json", certification)
                     write_json(
                         root / "training_materials_manifest.json",
                         certification["materials_manifest"],
                     )
+                    # The report is the final commit marker. Its referenced
+                    # manifest has already been atomically published.
+                    write_json(root / "production_readiness.json", certification)
                     passed = certification["certified"]
                     reason = (
                         "production_prepared_for_agentic_rl"

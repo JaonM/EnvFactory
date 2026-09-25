@@ -674,6 +674,16 @@ class ProductionReadinessTest(unittest.TestCase):
         self.assertLess(certifier.wilson_lower(9, 10), .9)
         self.assertGreater(certifier.wilson_lower(900, 1000), .87)
 
+    def test_certification_json_publication_is_atomic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "report.json"
+            value = {"certified": False, "原因": "证据不足"}
+            certifier.write_json_atomic(path, value)
+            self.assertEqual(json.loads(path.read_text()), value)
+            self.assertEqual(
+                list(path.parent.glob(f".{path.name}.*.tmp")), []
+            )
+
     def test_production_profile_can_pass_complete_pretraining_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             # Exercise the authoritative on-disk representation: tuples in a

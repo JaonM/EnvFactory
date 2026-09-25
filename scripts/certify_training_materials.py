@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from typing import Any, Iterable, Mapping
 
 from env_factory.material_artifacts import (
@@ -79,6 +80,20 @@ REQUIRED_OUTBOUND_SURFACES = {
 
 def load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json_atomic(path: Path, value: Any) -> None:
+    """Publish one JSON document without exposing partial file contents."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def sandbox_revalidation_key(root: Path, task_path: Path) -> str:
@@ -1869,14 +1884,13 @@ def main() -> int:
                 "error_type": type(exc).__name__,
             }
         report = attach_bundle_verification(report, bundle_verification)
-    rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     output = args.output or args.history.with_name("production_readiness.json")
-    output.write_text(rendered, encoding="utf-8")
     manifest_path = output.with_name("training_materials_manifest.json")
-    manifest_path.write_text(
-        json.dumps(report["materials_manifest"], ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    # Publish dependencies first. The readiness report is the final commit
+    # marker and must never precede its referenced material manifest.
+    write_json_atomic(manifest_path, report["materials_manifest"])
+    write_json_atomic(output, report)
+    rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     print(rendered, end="")
     return 0 if report["certified"] else 1
 
