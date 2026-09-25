@@ -39,7 +39,9 @@ Pilot 通过只表示可以进入更大规模认证，
 
 ## 配置和恢复
 
-- `--threshold` 默认 8，统一采用大于等于；任务静态评分也是前置筛选。失败任务仍计入总请求数。
+- `--threshold` 默认 8，统一采用大于等于；production 模式不允许低于 8。该值会进入冻结实验配置，
+  并与 canonical 认证策略及其摘要绑定；不能通过 CLI、认证 API 或重写报告降低其他生产门槛。
+  任务静态评分也是前置筛选，失败任务仍计入总请求数。
 - `--validation offline` 只执行离线门禁，不能证明真实训练质量；默认 `live` 会追加真实模型 rollout。
 - `--certification-profile production` 强制 `--sandbox-runtime docker`，每个候选环境必须实际构建内容寻址
   镜像并通过安全容器 smoke test；不能用 `none` 生成生产认证。pilot 可显式设置

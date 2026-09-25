@@ -1107,6 +1107,8 @@ def main():
         or args.holdout_rollout_episodes < 10
     ):
         parser.error("production certification requires 3 batches, 300 requests per batch and 10 episodes per sandbox")
+    if args.certification_profile == "production" and args.threshold < 8:
+        parser.error("production certification requires --threshold >= 8")
     if args.certification_profile == "production" and args.sandbox_runtime != "docker":
         parser.error("production certification requires --sandbox-runtime docker")
     project = args.project.resolve()

@@ -72,6 +72,16 @@ def verify(
             "gate": "generation_provenance",
             "message": "v4 manifest items need valid generation provenance",
         })
+    policy_digest = manifest.get("certification_policy_sha256")
+    if manifest.get("version") == "4.0" and not (
+        isinstance(policy_digest, str)
+        and len(policy_digest) == 64
+        and all(character in "0123456789abcdef" for character in policy_digest)
+    ):
+        failures.append({
+            "gate": "certification_policy",
+            "message": "v4 manifest needs a canonical certification policy digest",
+        })
     seen = set()
     seen_roots = set()
     for index, item in enumerate(items):

@@ -702,6 +702,25 @@ class ProductionReadinessTest(unittest.TestCase):
             )
             self.assertEqual(len(report["materials_manifest"]["dataset_sha256"]), 64)
 
+    def test_relaxed_policy_cannot_certify_training_materials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            policy = certifier.default_policy()
+            policy["min_tasks"] = 1
+            report = certifier.certify(
+                history,
+                policy,
+                sandbox_revalidation=self.sandbox_revalidation(history),
+                production_preflight=self.production_preflight(history["config"]),
+            )
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["certification_policy"])
+            self.assertIn("certification_policy", report["failed_gates"])
+            self.assertEqual(report["policy"]["min_tasks"], 300)
+            self.assertFalse(
+                report["measurements"]["certification_policy"]["verified"]
+            )
+
     def test_pilot_profile_cannot_claim_production_certification(self):
         with tempfile.TemporaryDirectory() as directory:
             history = self.make_history(Path(directory))
@@ -1393,6 +1412,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "generation_provenance_ready": True,
             "container_rollout_ready": True,
             "portable_build_context_ready": True,
+            "certification_policy_ready": True,
             "container_reward_calibration_ready": True,
             "provider_identity_ready": True,
             "task_lineage_ready": True,
@@ -1417,6 +1437,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "generation_provenance_ready": True,
             "container_rollout_ready": True,
             "portable_build_context_ready": True,
+            "certification_policy_ready": True,
             "container_reward_calibration_ready": True,
             "provider_identity_ready": True,
             "task_lineage_ready": True,

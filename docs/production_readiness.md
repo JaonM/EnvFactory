@@ -14,6 +14,12 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 
 `scripts/certify_training_materials.py` 读取冻结实验的 `history.json`，使用以下默认策略：
 
+认证策略本身也是受保护证据。策略版本 `1.0` 的完整字段由代码中的 canonical policy 唯一生成，
+质量分阈值必须位于 8–10 且与冻结实验配置一致；样本量、良品率、置信区间、奖励误判率等其他门槛
+不能由调用方覆盖。认证报告、素材清单、便携包和数据集卡共同保存策略 SHA-256，验证器会检查策略
+内容、摘要、门禁和度量四者一致。传入删字段、加字段或放宽门槛的策略只会使认证失败，不会改变
+实际计算所采用的标准。
+
 - 只接受由 `certification_profile=production` 启动的实验；pilot 历史即使人工补齐数量也不能升级为生产认证。
 - 认证时重新执行 production preflight，复核 Docker daemon、模型/runtime 配置、签名密钥配对、运行参数与
   工作区容量，并由循环写入 `production_certification_preflight.json`。实验启动时的
@@ -168,6 +174,8 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 - `offline_target_met`：只证明离线契约可执行，不能证明真实模型轨迹可采集。
 
 认证报告会显式保存 `does_not_certify`，防止将训练前环境质量误表述为训练效果。
+其中“生产级”修饰的是素材生成、验证和交付流程，不表示 EnvFactory 是 RL 训练框架，也不表示这些
+素材已经在目标算法、目标基础模型和目标算力配置上完成训练验证。
 
 通过或失败时都会生成 `training_materials_manifest.json`，列出当前合格候选的任务 SHA-256、沙箱
 可移植文件树 SHA-256、原始证据指纹、rollout 摘要哈希、类别、分数和 episode 数量，并记录认证时的

@@ -33,6 +33,7 @@ FEATURE_VERSIONS = {
     "model_response_authorization": {"16.0"},
     "consumer_record_validation": {"16.0"},
     "portable_build_context": {"16.0"},
+    "certification_policy_binding": {"16.0"},
 }
 
 

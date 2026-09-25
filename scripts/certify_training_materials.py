@@ -39,6 +39,10 @@ from env_factory.data_governance import (
     valid_provider_binding as valid_governed_provider_binding,
 )
 from env_factory.container_provenance import verify_container_provenance
+from env_factory.certification_policy import (
+    canonical_certification_policy,
+    policy_for_experiment,
+)
 from env_factory.execution_provenance import verify_execution_provenance
 from env_factory.task_similarity import near_duplicate_rate, task_partition_isolation
 from env_factory.generation_provenance import generation_provenance_snapshot
@@ -766,6 +770,14 @@ def certify(
 ) -> dict[str, Any]:
     project = project or Path(__file__).resolve().parents[1]
     config = history.get("config", {})
+    expected_policy, policy_config_valid = policy_for_experiment(config)
+    certification_policy_verified = (
+        policy_config_valid
+        and isinstance(policy, Mapping)
+        and dict(policy) == expected_policy
+    )
+    policy = expected_policy
+    certification_policy_sha256 = digest_json(policy)
     production_experiment = (
         isinstance(config, Mapping)
         and config.get("certification_profile") == "production"
@@ -1416,11 +1428,17 @@ def certify(
         "evaluator_source_digest": history.get("config", {}).get("source_digest"),
         "execution_provenance": recorded_execution,
         "experiment_config_sha256": experiment_config_sha256,
+        "certification_policy_sha256": certification_policy_sha256,
         "items": material_items,
     }
     material_manifest["dataset_sha256"] = digest_json(material_manifest)
 
     measurements = {
+        "certification_policy": {
+            "version": policy["version"],
+            "sha256": certification_policy_sha256,
+            "verified": certification_policy_verified,
+        },
         "requested_tasks": total,
         "generated_tasks": len(generated),
         "parseable_tasks": len(task_documents),
@@ -1586,6 +1604,7 @@ def certify(
     }
 
     gates = {
+        "certification_policy": certification_policy_verified,
         "production_experiment_profile": production_experiment,
         "production_preflight": preflight_verified,
         "materialized_sample_size": (
@@ -1700,34 +1719,7 @@ def certify(
 
 
 def default_policy() -> dict[str, Any]:
-    return {
-        "score_threshold": 8.0,
-        "min_tasks": 300,
-        "min_holdout_batches": 3,
-        "min_task_yield": 0.90,
-        "min_task_yield_ci95_lower": 0.85,
-        "min_build_yield": 0.90,
-        "min_build_yield_ci95_lower": 0.85,
-        "min_end_to_end_rate": 0.85,
-        "min_end_to_end_ci95_lower": 0.80,
-        "min_category_rate": 0.75,
-        "max_near_duplicate_rate": 0.05,
-        "min_episodes_per_qualified_sandbox": 10,
-        "min_agent_success_rate_per_sandbox": 2 / 3,
-        "min_total_episodes": 7500,
-        "max_environment_error_rate": 0.001,
-        "max_reward_false_positive_rate": 0.005,
-        "max_reward_false_negative_rate": 0.02,
-        "max_same_provider_evaluator_rate": 0.0,
-        "min_user_simulator_protocol_rate": 0.995,
-        "min_user_outcome_categories": 3,
-        "min_category_shares": {
-            "direct_response": 0.10,
-            "simple_agentic": 0.20,
-            "multi_step_agentic": 0.35,
-        },
-        "max_category_shares": {"direct_response": 0.30},
-    }
+    return canonical_certification_policy()
 
 
 def attach_artifact_verification(
@@ -1757,6 +1749,7 @@ def attach_bundle_verification(
         and verification.get("generation_provenance_ready") is True
         and verification.get("container_rollout_ready") is True
         and verification.get("portable_build_context_ready") is True
+        and verification.get("certification_policy_ready") is True
         and verification.get("container_reward_calibration_ready") is True
         and verification.get("provider_identity_ready") is True
         and verification.get("task_lineage_ready") is True
@@ -1790,7 +1783,7 @@ def main() -> int:
     parser.add_argument("--revalidation-timeout", type=int, default=1800)
     args = parser.parse_args()
     history = load(args.history.resolve())
-    policy = default_policy()
+    policy, _ = policy_for_experiment(history.get("config", {}))
     project = args.project.resolve()
     production_preflight = run_production_preflight(
         project,

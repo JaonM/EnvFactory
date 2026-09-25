@@ -426,6 +426,24 @@ class ExperimentTest(unittest.TestCase):
             completed.stderr,
         )
 
+    def test_production_profile_cannot_lower_material_score_threshold(self):
+        completed = __import__("subprocess").run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/loop_experiment.py"),
+                "--certification-profile", "production",
+                "--threshold", "7.9",
+                "--sandbox-runtime", "docker",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            "production certification requires --threshold >= 8",
+            completed.stderr,
+        )
+
     def test_production_profile_requires_trusted_bundle_signing_keys(self):
         completed = __import__("subprocess").run(
             [

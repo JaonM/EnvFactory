@@ -15,6 +15,7 @@ from env_factory.material_artifacts import (
 )
 from env_factory.execution_provenance import collect_execution_provenance
 from env_factory.material_attestation import public_key_identity
+from env_factory.certification_policy import canonical_certification_policy
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -266,12 +267,14 @@ class MaterialExportTest(unittest.TestCase):
             "generation_provenance": self.generation_provenance(),
         }
         item["generation_provenance"]["task_sha256"] = item["task_sha256"]
+        policy = canonical_certification_policy()
         manifest = {
             "version": "4.0",
             "kind": "agentic_rl_pretraining_materials",
             "evaluator_source_digest": "source",
             "execution_provenance": collect_execution_provenance(ROOT),
             "experiment_config_sha256": "f" * 64,
+            "certification_policy_sha256": digest_json(policy),
             "items": [item],
         }
         manifest["dataset_sha256"] = digest_json(manifest)
@@ -287,8 +290,13 @@ class MaterialExportTest(unittest.TestCase):
                 "cross_model_generalization",
                 "exported_rollouts_as_direct_policy_optimization_targets",
             ],
-            "policy": {"score_threshold": 8.0},
+            "policy": policy,
             "measurements": {
+                "certification_policy": {
+                    "version": policy["version"],
+                    "sha256": digest_json(policy),
+                    "verified": True,
+                },
                 "training_ready": 1,
                 "production_experiment_profile": True,
                 "evaluator_independence": {
@@ -375,6 +383,7 @@ class MaterialExportTest(unittest.TestCase):
                 "evaluator_independence": True,
                 "model_response_provenance": True,
                 "model_response_authorization": True,
+                "certification_policy": True,
             },
             "failed_gates": [],
             "material_verification": {"verified": True},
@@ -594,6 +603,47 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["verified"])
             self.assertFalse(report["experiment_config_ready"])
             self.assertIn("portable_certification", report["failed_gates"])
+
+    def test_v16_verifier_rejects_rehashed_relaxed_certification_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "bundle"
+            exporter.export_bundle(self.source(root), bundle, ROOT)
+
+            certification_path = bundle / "certification.json"
+            certification = json.loads(certification_path.read_text())
+            certification["policy"]["min_tasks"] = 1
+            policy_digest = digest_json(certification["policy"])
+            certification["measurements"]["certification_policy"][
+                "sha256"
+            ] = policy_digest
+            certification_path.write_text(json.dumps(certification))
+
+            card_path = bundle / "dataset_card.json"
+            card = json.loads(card_path.read_text())
+            card["certification"]["policy_sha256"] = policy_digest
+            card_path.write_text(json.dumps(card))
+
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["certification_policy_sha256"] = policy_digest
+            manifest["files_sha256"]["certification.json"] = (
+                exporter.file_sha256(certification_path)
+            )
+            manifest["files_sha256"]["dataset_card.json"] = (
+                exporter.file_sha256(card_path)
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["certification_policy_ready"])
+            self.assertIn("certification_policy", report["failed_gates"])
 
     def test_v16_verifier_rejects_direct_training_relabeling(self):
         with tempfile.TemporaryDirectory() as directory:

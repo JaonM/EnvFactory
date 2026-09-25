@@ -46,6 +46,7 @@ from env_factory.task_similarity import task_family_ids
 from env_factory.generation_provenance import valid_generation_provenance
 from env_factory.runtime_provenance import valid_container_rollout_execution
 from env_factory.data_governance import valid_provider_binding
+from env_factory.certification_policy import valid_certification_policy
 from env_factory.task_portability import valid_task_lineage
 from env_factory.production_preflight import (
     REQUIRED_CHECKS,
@@ -176,6 +177,9 @@ def _dataset_card(
             "name": certification.get("certification"),
             "scope": certification.get("scope"),
             "certified": certification.get("certified") is True,
+            "policy_sha256": certification.get("materials_manifest", {}).get(
+                "certification_policy_sha256"
+            ),
         },
         "intended_uses": [
             "reconstruct_agentic_sandbox_environments",
@@ -352,6 +356,23 @@ def _export_bundle_uncommitted(
         and re.fullmatch(r"[0-9a-f]{64}", experiment_config_sha256) is not None
     ):
         raise ValueError("source manifest lacks a valid experiment configuration digest")
+    certification_policy = certification.get("policy")
+    certification_policy_sha256 = source_manifest.get(
+        "certification_policy_sha256"
+    )
+    if not (
+        valid_certification_policy(certification_policy)
+        and certification_policy_sha256 == digest_json(certification_policy)
+        and certification.get("gates", {}).get("certification_policy") is True
+        and certification.get("measurements", {}).get(
+            "certification_policy"
+        ) == {
+            "version": certification_policy["version"],
+            "sha256": certification_policy_sha256,
+            "verified": True,
+        }
+    ):
+        raise ValueError("certification policy is not canonical or bound")
     expected_key_identity = (
         attestation.get("key_identity_sha256")
         if attestation.get("status") == "signed" else None
@@ -589,6 +610,7 @@ def _export_bundle_uncommitted(
         "kind": "portable_agentic_rl_training_materials",
         "source_dataset_sha256": source_manifest.get("dataset_sha256"),
         "experiment_config_sha256": experiment_config_sha256,
+        "certification_policy_sha256": certification_policy_sha256,
         "execution_provenance_sha256": digest_json(
             source_manifest.get("execution_provenance")
         ),
@@ -653,6 +675,15 @@ def verify_bundle(
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
         or not isinstance(manifest.get("source_dataset_sha256"), str)
         or len(manifest["source_dataset_sha256"]) != 64
+        or (
+            supports_bundle_feature(
+                str(manifest.get("version")), "certification_policy_binding"
+            )
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(manifest.get("certification_policy_sha256", "")),
+            ) is None
+        )
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
@@ -727,6 +758,28 @@ def verify_bundle(
         "cross_model_generalization",
         "exported_rollouts_as_direct_policy_optimization_targets",
     }
+    certification_policy_ready = (
+        not supports_bundle_feature(
+            str(manifest.get("version")), "certification_policy_binding"
+        )
+        or (
+            valid_certification_policy(portable_certification.get("policy"))
+            and digest_json(portable_certification.get("policy"))
+                == manifest.get("certification_policy_sha256")
+            and portable_certification.get("gates", {}).get(
+                "certification_policy"
+            ) is True
+            and portable_certification.get("measurements", {}).get(
+                "certification_policy"
+            ) == {
+                "version": portable_certification["policy"]["version"],
+                "sha256": manifest.get("certification_policy_sha256"),
+                "verified": True,
+            }
+        )
+    ) if isinstance(portable_certification, Mapping) else False
+    if not certification_policy_ready:
+        failures.append("certification_policy")
     if not (
         isinstance(portable_certification, Mapping)
         and portable_certification.get("version") == "1.0"
@@ -737,6 +790,7 @@ def verify_bundle(
         and portable_certification.get("failed_gates") == []
         and portable_certification.get("source_dataset_sha256")
             == manifest.get("source_dataset_sha256")
+        and certification_policy_ready
         and (
             not supports_bundle_feature(
                 str(manifest.get("version")), "experiment_binding"
@@ -1572,6 +1626,13 @@ def verify_bundle(
         and digest_json(dataset_card.get("build_environment"))
             == manifest.get("execution_provenance_sha256")
         and dataset_card.get("certification", {}).get("certified") is True
+        and (
+            not supports_bundle_feature(
+                str(version), "certification_policy_binding"
+            )
+            or dataset_card.get("certification", {}).get("policy_sha256")
+                == manifest.get("certification_policy_sha256")
+        )
         and dataset_card.get("distribution_status")
             == "internal_only_until_legal_and_security_review"
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
@@ -1651,6 +1712,7 @@ def verify_bundle(
         "generation_provenance_ready": generation_provenance_ready,
         "container_rollout_ready": container_rollout_ready,
         "portable_build_context_ready": portable_build_context_ready,
+        "certification_policy_ready": certification_policy_ready,
         "container_reward_calibration_ready": container_reward_calibration_ready,
         "provider_identity_ready": provider_identity_ready,
         "task_lineage_ready": task_lineage_ready,
