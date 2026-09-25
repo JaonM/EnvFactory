@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -11,6 +12,7 @@ import sys
 import tempfile
 
 from env_factory.llm import LLMClient
+from env_factory.material_artifacts import digest_json, portable_artifact_digest
 from env_factory.runtime_llm import RuntimeLLMConfig
 from env_factory.sandbox_runtime import BusinessGoalEvaluator
 
@@ -111,6 +113,7 @@ def episode(app, task, client, seed, max_steps):
             messages.append({"role": "user", "content": f"Invalid action: {exc}. Return a corrected JSON action."})
             if protocol_errors >= 3:
                 termination = "agent_protocol_error"
+                transitions[-1]["terminated"] = True
                 break
     if transitions and termination == "step_budget":
         transitions[-1]["truncated"] = True
@@ -229,6 +232,10 @@ def main():
     task = json.loads((root / "task.json").read_text())
     report = {"schema_version": "2.0", "mode": "live_rollout", "agent_model": client.model,
               "runtime_model": runtime.model, "episodes": [],
+              "task_sha256": hashlib.sha256((root / "task.json").read_bytes()).hexdigest(),
+              "sandbox_artifacts_digest": portable_artifact_digest(root),
+              "agent_provider_sha256": digest_json({"base_url": client.base_url, "model": client.model}),
+              "runtime_provider_sha256": digest_json({"base_url": runtime.base_url, "model": runtime.model}),
               "same_model_bias_possible": client.model == runtime.model,
               "live_rollout_verified": False, "passed": False}
     from loop_experiment import write_json

@@ -116,7 +116,9 @@ def dependency_swap_positions(
     return None
 
 
-def validate(root: Path) -> dict[str, Any]:
+def validate(root: Path, *, evaluator_mode: str = "mock") -> dict[str, Any]:
+    if evaluator_mode not in {"mock", "live"}:
+        raise ValueError("evaluator_mode must be mock or live")
     task = load(root / "task.json")
     contract = task.get("training_contract") if isinstance(task.get("training_contract"), Mapping) else {}
     category = contract.get("category", task.get("training_category", "multi_step_agentic"))
@@ -134,7 +136,18 @@ def validate(root: Path) -> dict[str, Any]:
         if kind not in by_kind:
             failures.append({"gate": "scenario_coverage", "message": f"missing {kind}"})
     if failures:
-        return {"curriculum_training_ready": False, "agentic_training_ready": False, "training_category": category, "agentic_eligible": tool_required, "failed_gates": ["scenario_coverage"], "evidence": evidence, "failures": failures}
+        return {
+            "curriculum_training_ready": False,
+            "agentic_training_ready": False,
+            "training_category": category,
+            "agentic_eligible": tool_required,
+            "validation_mode": (
+                "offline_mock" if evaluator_mode == "mock" else "live_evaluator"
+            ),
+            "failed_gates": ["scenario_coverage"],
+            "evidence": evidence,
+            "failures": failures,
+        }
 
     success_scenario = scenario_without_assertions(by_kind["goal_success"])
     tool_steps = [step for step in success_scenario.get("steps", []) if isinstance(step, Mapping) and step.get("operation") == "tool_call"]
@@ -154,7 +167,7 @@ def validate(root: Path) -> dict[str, Any]:
             failures.append({"gate": "semantic_fixture", "message": f"tool step {index} uses an empty collection"})
 
     os.environ.setdefault("SANDBOX_TRAINER_API_KEY", "envfactory-agentic-value-key")
-    os.environ.setdefault("SANDBOX_EVALUATOR_MOCK", "1")
+    os.environ["SANDBOX_EVALUATOR_MOCK"] = "1" if evaluator_mode == "mock" else "0"
     app = import_app(root)
     from sandbox_runtime import AcceptanceScenarioRunner
 
@@ -290,6 +303,7 @@ def validate(root: Path) -> dict[str, Any]:
         "training_category": category,
         "sandbox_profile": contract.get("sandbox_profile", category),
         "agentic_eligible": tool_required,
+        "validation_mode": "offline_mock" if evaluator_mode == "mock" else "live_evaluator",
         "hard_gates_passed": not failures,
         "failed_gates": failed_gates,
         "evidence": evidence,
@@ -301,9 +315,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="验证沙箱是否能训练真实 Agentic 行为")
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--evaluator-mode", choices=("mock", "live"), default="mock",
+        help="live exercises the configured production reward evaluator",
+    )
     args = parser.parse_args()
     root = args.root.resolve()
-    report = validate(root)
+    report = validate(root, evaluator_mode=args.evaluator_mode)
     output = args.output or root / "agentic_training_value.json"
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))

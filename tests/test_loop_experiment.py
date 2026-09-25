@@ -227,6 +227,62 @@ class ExperimentTest(unittest.TestCase):
             self.assertEqual(result["failure_class"], "task_quality")
             self.assertEqual(result["failure_code"], "EXTERNAL_CAPABILITY_UNAVAILABLE")
 
+    def test_live_build_runs_real_reward_counterfactual_calibration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_path = root / "task.json"
+            task_path.write_text("{}")
+            output = root / "sandbox"
+            output.mkdir()
+            quality = SimpleNamespace(to_dict=lambda: {
+                "eligible": True, "score": 9, "training_category": "simple_agentic",
+            })
+            commands = []
+
+            def process(command, cwd, log, timeout):
+                commands.append(command)
+                if "score_sandbox_offline.py" in " ".join(command):
+                    (output / "score_summary.json").write_text(json.dumps({
+                        "sandboxes": [{
+                            "passed": True, "score": 10,
+                            "model": loop.MODEL, "review_model": loop.MODEL,
+                            "evidence_fingerprint": "proof",
+                        }],
+                    }))
+                elif "run_live_rollout.py" in " ".join(command):
+                    (output / "live_rollout.json").write_text(json.dumps({
+                        "passed": True, "live_rollout_verified": True,
+                        "quality_score": 1.0, "episodes": [],
+                    }))
+                elif "validate_agentic_training_value.py" in " ".join(command):
+                    (output / "agentic_training_value_live.json").write_text(json.dumps({
+                        "curriculum_training_ready": True,
+                        "validation_mode": "live_evaluator",
+                    }))
+                return {"exit_code": 0, "timed_out": False, "seconds": .1}
+
+            config = {
+                "threshold": 8, "max_attempts": 2, "build_timeout": 10,
+                "score_timeout": 10, "rollout_timeout": 10,
+                "build_mode": "clean", "validation": "live",
+                "rollout_episodes": 3, "rollout_steps": 20,
+                "rollout_min_success_rate": 0,
+            }
+            with (
+                patch("env_factory.task_quality.score_file", return_value=quality),
+                patch.object(loop, "run_process", side_effect=process),
+            ):
+                result = loop.build_one(ROOT, task_path, output, config)
+            self.assertTrue(result["passed"])
+            self.assertTrue(result["live_reward_calibration_verified"])
+            calibration = next(
+                command for command in commands
+                if "validate_agentic_training_value.py" in " ".join(command)
+            )
+            self.assertEqual(
+                calibration[calibration.index("--evaluator-mode") + 1], "live"
+            )
+
     def test_holdout_requires_fresh_tasks_and_two_of_three_successes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

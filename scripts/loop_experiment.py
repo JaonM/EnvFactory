@@ -125,10 +125,12 @@ def input_digest(path):
 def failure(stage, detail, **extra):
     targets = {"generation": "task_pipeline", "task_quality": "task_contract",
                "build": "sandbox_builder", "offline_validation": "runtime_or_contract",
-               "infrastructure": "runner_or_provider", "live_rollout": "inspect_live_trajectory"}
+               "infrastructure": "runner_or_provider", "live_rollout": "inspect_live_trajectory",
+               "live_reward_calibration": "inspect_reward_evaluator"}
     codes = {"generation": "GEN_SEMANTIC", "task_quality": "TASK_BUILDABILITY",
              "build": "BUILD_BUSINESS", "offline_validation": "REWARD_OR_RUNTIME",
-             "infrastructure": "INFRA", "live_rollout": "ROLLOUT_ENVIRONMENT"}
+             "infrastructure": "INFRA", "live_rollout": "ROLLOUT_ENVIRONMENT",
+             "live_reward_calibration": "LIVE_REWARD_CALIBRATION"}
     return {"passed": False, "failure_class": stage, "repair_target": targets.get(stage, "inspect"),
             "failure_code": codes.get(stage, "UNKNOWN"), "detail": detail,
             "live_rollout_verified": False, **extra}
@@ -430,6 +432,43 @@ def build_one(project, task_path, output, config, seed=None):
                 repair_target=("rollout_policy" if owner == "agent" else "inspect_live_trajectory"),
                 detail=live.get("conclusion", "rollout failed"),
             )
+        else:
+            calibration_path = output / "agentic_training_value_live.json"
+            calibration_run = run_process([
+                sys.executable,
+                str(project / "scripts/validate_agentic_training_value.py"),
+                "--root", str(output), "--output", str(calibration_path),
+                "--evaluator-mode", "live",
+            ], project, output / "live_reward_calibration.log", config["rollout_timeout"])
+            try:
+                calibration = json.loads(calibration_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                calibration = {}
+            calibration_passed = (
+                calibration_run["exit_code"] == 0
+                and calibration.get("curriculum_training_ready") is True
+                and calibration.get("validation_mode") == "live_evaluator"
+            )
+            result.update(
+                live_reward_calibration=calibration,
+                live_reward_calibration_process=calibration_run,
+                live_reward_calibration_verified=calibration_passed,
+            )
+            if not calibration_passed:
+                result.update(
+                    passed=False,
+                    live_rollout_verified=False,
+                    failure_class=(
+                        "infrastructure" if calibration_run["timed_out"]
+                        else "live_reward_calibration"
+                    ),
+                    failure_code=(
+                        "INFRA" if calibration_run["timed_out"]
+                        else "LIVE_REWARD_CALIBRATION"
+                    ),
+                    repair_target="inspect_reward_evaluator",
+                    detail=calibration.get("failed_gates", ["live calibration unavailable"]),
+                )
     result["elapsed_seconds"] = time.monotonic() - started
     return result
 
