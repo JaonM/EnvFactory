@@ -4,9 +4,6 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from env_factory.execution_provenance import collect_execution_provenance
-
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -241,7 +238,7 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertTrue(report["gates"]["trajectory_privacy"])
             self.assertTrue(report["gates"]["execution_environment"])
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
-            self.assertEqual(report["materials_manifest"]["version"], "2.0")
+            self.assertEqual(report["materials_manifest"]["version"], "3.0")
             self.assertEqual(
                 report["materials_manifest"]["evaluator_source_digest"],
                 "evaluator-source-v1",
@@ -476,7 +473,6 @@ class ProductionReadinessTest(unittest.TestCase):
             manifest = {
                 "version": "2.0", "kind": "agentic_rl_pretraining_materials",
                 "evaluator_source_digest": "old-evaluator",
-                "execution_provenance": collect_execution_provenance(ROOT),
                 "items": [item],
             }
             manifest["dataset_sha256"] = verifier.digest_json(manifest)

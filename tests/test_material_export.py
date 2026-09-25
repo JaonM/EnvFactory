@@ -86,7 +86,7 @@ class MaterialExportTest(unittest.TestCase):
             "successful_episodes": 1,
         }
         manifest = {
-            "version": "2.0",
+            "version": "3.0",
             "kind": "agentic_rl_pretraining_materials",
             "evaluator_source_digest": "source",
             "execution_provenance": collect_execution_provenance(ROOT),

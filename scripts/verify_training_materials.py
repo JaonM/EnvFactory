@@ -49,12 +49,12 @@ def verify(
     base = {key: value for key, value in manifest.items() if key != "dataset_sha256"}
     if manifest.get("dataset_sha256") != digest_json(base):
         failures.append({"gate": "dataset_digest", "message": "manifest digest changed"})
-    if manifest.get("version") == "2.0" and not valid_execution_provenance(
+    if manifest.get("version") == "3.0" and not valid_execution_provenance(
         manifest.get("execution_provenance")
     ):
         failures.append({
             "gate": "execution_provenance",
-            "message": "v2 manifest needs a valid execution environment snapshot",
+            "message": "v3 manifest needs a valid execution environment snapshot",
         })
     items = manifest.get("items")
     if not isinstance(items, list) or not items:
@@ -81,11 +81,11 @@ def verify(
             failures.append({"gate": "task_digest", "item": index})
         expected_fingerprint = item.get("sandbox_evidence_fingerprint")
         artifact_hashes = item.get("sandbox_artifacts_sha256")
-        if manifest.get("version") == "2.0" and not (
+        if manifest.get("version") in {"2.0", "3.0"} and not (
             isinstance(artifact_hashes, Mapping) and artifact_hashes
         ):
             failures.append({"gate": "manifest_schema", "item": index,
-                             "message": "v2 item needs sandbox_artifacts_sha256"})
+                             "message": "v2/v3 item needs sandbox_artifacts_sha256"})
             continue
         if isinstance(artifact_hashes, Mapping) and artifact_hashes:
             changed = verify_artifact_digests(root, artifact_hashes)
@@ -95,7 +95,7 @@ def verify(
                     "message": f"changed or missing artifacts: {changed}",
                 })
         else:
-            # Backward compatibility for v1 manifests. V2 deliberately avoids
+            # Backward compatibility for v1 manifests. V2/v3 deliberately avoid
             # recomputing a fingerprint that also depends on the current
             # evaluator source tree.
             try:
@@ -112,11 +112,11 @@ def verify(
             if actual_fingerprint != expected_fingerprint:
                 failures.append({"gate": "sandbox_digest", "item": index})
         evidence_hashes = item.get("sandbox_evidence_sha256")
-        if manifest.get("version") == "2.0" and not (
+        if manifest.get("version") in {"2.0", "3.0"} and not (
             isinstance(evidence_hashes, Mapping) and evidence_hashes
         ):
             failures.append({"gate": "manifest_schema", "item": index,
-                             "message": "v2 item needs sandbox_evidence_sha256"})
+                             "message": "v2/v3 item needs sandbox_evidence_sha256"})
         elif isinstance(evidence_hashes, Mapping):
             actual_evidence = evidence_artifact_digests(root)
             if dict(evidence_hashes) != actual_evidence:

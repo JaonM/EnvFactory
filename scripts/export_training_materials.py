@@ -186,8 +186,8 @@ def _export_bundle_uncommitted(
     if certification.get("material_verification", {}).get("verified") is not True:
         raise ValueError("source material verification is required before export")
     source_manifest = certification.get("materials_manifest")
-    if not isinstance(source_manifest, Mapping) or source_manifest.get("version") != "2.0":
-        raise ValueError("a v2 materials manifest is required")
+    if not isinstance(source_manifest, Mapping) or source_manifest.get("version") != "3.0":
+        raise ValueError("a v3 materials manifest is required")
     try:
         from verify_training_materials import verify
     except ModuleNotFoundError:

@@ -556,7 +556,7 @@ def certify(
         item["sandbox_evidence_fingerprint"] for item in material_items
     ]
     material_manifest = {
-        "version": "2.0",
+        "version": "3.0",
         "kind": "agentic_rl_pretraining_materials",
         "evaluator_source_digest": history.get("config", {}).get("source_digest"),
         "execution_provenance": recorded_execution,
