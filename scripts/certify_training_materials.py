@@ -36,6 +36,7 @@ from env_factory.container_provenance import verify_container_provenance
 from env_factory.execution_provenance import verify_execution_provenance
 from env_factory.task_similarity import near_duplicate_rate, task_partition_isolation
 from env_factory.generation_provenance import generation_provenance_snapshot
+from env_factory.runtime_provenance import valid_container_rollout_execution
 
 
 Z_95 = 1.959963984540054
@@ -216,6 +217,7 @@ def valid_rollout_provenance(item: Mapping[str, Any]) -> bool:
             isinstance(live.get(name), str) and len(live[name]) == 64
             for name in ("agent_provider_sha256", "runtime_provider_sha256")
         )
+        and valid_container_rollout_execution(live, root)
     )
 
 
@@ -439,6 +441,12 @@ def certify(
     rollout_provenance = bool(qualified) and all(
         valid_rollout_provenance(item) for item in qualified
     )
+    container_rollout_execution = bool(qualified) and all(
+        valid_container_rollout_execution(
+            item.get("live_rollout"), Path(str(item.get("output", "")))
+        )
+        for item in qualified
+    )
 
     readiness_reports = [_artifact(item, "training_readiness.json") for item in qualified]
     agentic_reports = [
@@ -629,6 +637,7 @@ def certify(
         "llm_fallbacks": fallbacks,
         "rollout_coverage": rollout_coverage,
         "rollout_provenance": rollout_provenance,
+        "container_rollout_execution": container_rollout_execution,
         "trajectory_schema_complete": bool(episodes) and complete_episodes == len(episodes),
         "user_simulator_calls": len(user_turns),
         "user_simulator_valid_calls": valid_user_turns,
@@ -717,6 +726,7 @@ def certify(
         "near_deduplication": measurements["near_duplicate_rate"] <= policy["max_near_duplicate_rate"],
         "rollout_coverage": rollout_coverage and len(episodes) >= policy["min_total_episodes"],
         "rollout_provenance": rollout_provenance,
+        "container_rollout_execution": container_rollout_execution,
         "trajectory_schema": measurements["trajectory_schema_complete"],
         "user_simulator_protocol": (
             bool(user_turns)
@@ -834,6 +844,7 @@ def attach_bundle_verification(
         and verification.get("dataset_split_ready") is True
         and verification.get("task_family_split_ready") is True
         and verification.get("generation_provenance_ready") is True
+        and verification.get("container_rollout_ready") is True
         and verification.get("source_dataset_sha256")
         == report.get("materials_manifest", {}).get("dataset_sha256")
     )

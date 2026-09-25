@@ -94,6 +94,18 @@ class MaterialExportTest(unittest.TestCase):
         (sandbox / "Dockerfile").write_text(
             "FROM python@sha256:" + "a" * 64 + "\nUSER sandbox\n"
         )
+        (sandbox / "docker_image_metadata.json").write_text(json.dumps({
+            "version": "3.0",
+            "image_id": "sha256:" + "d" * 64,
+            "runtime_user": "sandbox",
+            "smoke_test": {
+                "passed": True,
+                "read_only_root": True,
+                "cap_drop": "ALL",
+                "no_new_privileges": True,
+                "non_root_user": True,
+            },
+        }))
         (sandbox / "acceptance_result.json").write_text(
             '{"business_acceptance":"passed"}'
         )
@@ -117,6 +129,16 @@ class MaterialExportTest(unittest.TestCase):
             "material_visibility_version": "1.0",
             "agent_model": "policy",
             "runtime_model": "simulator",
+            "runtime_execution": {
+                "version": "1.0",
+                "mode": "docker_http",
+                "container_image_id": "sha256:" + "d" * 64,
+                "transport": "loopback_http",
+                "read_only_root": True,
+                "cap_drop": "ALL",
+                "no_new_privileges": True,
+                "non_root_user": True,
+            },
             "episodes": [{
                 "schema_version": "2.0", "seed": 1, "agent_success": True,
                 "termination": "completed", "transitions": [transition],
@@ -184,6 +206,7 @@ class MaterialExportTest(unittest.TestCase):
             self.assertEqual(report["items"], 1)
             self.assertEqual(report["transitions"], 1)
             self.assertTrue(report["production_contract_ready"])
+            self.assertTrue(report["container_rollout_ready"])
             record = json.loads((bundle / "transitions.jsonl").read_text())
             self.assertEqual(record["transition"]["reward"], 1.0)
             self.assertEqual(record["episode_final_reward"], 1.0)
@@ -205,6 +228,14 @@ class MaterialExportTest(unittest.TestCase):
                 {"generator-model": 2},
             )
             self.assertEqual(
+                card["composition"]["runtime_execution"],
+                {
+                    "modes": {"docker_http": 1},
+                    "validated_container_items": 1,
+                    "unique_container_images": 1,
+                },
+            )
+            self.assertEqual(
                 card["distribution_status"],
                 "internal_only_until_legal_and_security_review",
             )
@@ -221,7 +252,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "8.0")
+            self.assertEqual(contract["bundle_version"], "9.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -292,6 +323,36 @@ class MaterialExportTest(unittest.TestCase):
             report = exporter.verify_bundle(bundle)
             self.assertFalse(report["verified"])
             self.assertIn("generation_provenance", report["failed_gates"])
+
+    def test_bundle_verifier_rejects_rehashed_container_rollout_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            item = manifest["items"][0]
+            rollout_path = bundle / item["environment_path"] / "live_rollout.json"
+            rollout = json.loads(rollout_path.read_text())
+            rollout["runtime_execution"]["container_image_id"] = (
+                "sha256:" + "e" * 64
+            )
+            rollout_path.write_text(json.dumps(rollout))
+            relative = str(rollout_path.relative_to(bundle))
+            digest = exporter.file_sha256(rollout_path)
+            item["files_sha256"]["live_rollout.json"] = digest
+            manifest["files_sha256"][relative] = digest
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["container_rollout_ready"])
+            self.assertIn("container_rollout_execution", report["failed_gates"])
 
     def test_bundle_verifier_rejects_rehashed_environment_claim(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -436,6 +497,40 @@ class MaterialExportTest(unittest.TestCase):
             self.assertTrue(report["verified"], report)
             self.assertTrue(report["production_contract_ready"])
             self.assertFalse(report["trusted_attestation"])
+
+    def test_legacy_v8_bundle_keeps_generation_contract_without_container_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            contract_path = bundle / "consumer_contract.json"
+            contract_path.write_text(json.dumps(exporter.consumer_contract("8.0")))
+            card_path = bundle / "dataset_card.json"
+            card = json.loads(card_path.read_text())
+            card["version"] = "1.4"
+            card["composition"].pop("runtime_execution")
+            card_path.write_text(json.dumps(card))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = "8.0"
+            manifest["items"][0].pop("runtime_execution")
+            manifest["files_sha256"]["consumer_contract.json"] = (
+                exporter.file_sha256(contract_path)
+            )
+            manifest["files_sha256"]["dataset_card.json"] = exporter.file_sha256(
+                card_path
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertTrue(report["verified"], report)
+            self.assertTrue(report["generation_provenance_ready"])
+            self.assertFalse(report["container_rollout_ready"])
 
     def test_rehashed_bundle_cannot_remove_environment_rebuild_entrypoint(self):
         with tempfile.TemporaryDirectory() as directory:

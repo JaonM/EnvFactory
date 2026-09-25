@@ -245,6 +245,16 @@ class ProductionReadinessTest(unittest.TestCase):
                         "runtime_model": "simulator-model",
                         "agent_provider_sha256": "a" * 64,
                         "runtime_provider_sha256": "b" * 64,
+                        "runtime_execution": {
+                            "version": "1.0",
+                            "mode": "docker_http",
+                            "container_image_id": "sha256:" + "d" * 64,
+                            "transport": "loopback_http",
+                            "read_only_root": True,
+                            "cap_drop": "ALL",
+                            "no_new_privileges": True,
+                            "non_root_user": True,
+                        },
                         "episodes": episodes,
                     },
                 }
@@ -291,6 +301,7 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertIn("rl_training_convergence", report["does_not_certify"])
             self.assertEqual(report["measurements"]["episodes"], 9000)
             self.assertTrue(report["gates"]["rollout_provenance"])
+            self.assertTrue(report["gates"]["container_rollout_execution"])
             self.assertTrue(report["gates"]["category_mix"])
             self.assertTrue(report["gates"]["user_simulator_outcome_coverage"])
             self.assertTrue(report["gates"]["data_governance"])
@@ -389,6 +400,18 @@ class ProductionReadinessTest(unittest.TestCase):
             result["live_rollout"]["task_sha256"] = "0" * 64
             report = certifier.certify(history, certifier.default_policy())
             self.assertFalse(report["gates"]["rollout_provenance"])
+
+    def test_in_process_rollout_cannot_certify_container_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            rollout = history["holdouts"][0]["jobs"][0]["result"]["live_rollout"]
+            rollout["runtime_execution"] = {
+                "version": "1.0", "mode": "in_process", "container_image_id": None,
+            }
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["rollout_provenance"])
+            self.assertFalse(report["gates"]["container_rollout_execution"])
 
     def test_mock_reward_counterfactuals_cannot_certify_production(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -546,6 +569,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "dataset_split_ready": True,
             "task_family_split_ready": True,
             "generation_provenance_ready": True,
+            "container_rollout_ready": True,
             "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
@@ -556,6 +580,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "dataset_split_ready": True,
             "task_family_split_ready": True,
             "generation_provenance_ready": True,
+            "container_rollout_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])
@@ -574,6 +599,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "dataset_split_ready": True,
             "task_family_split_ready": True,
             "generation_provenance_ready": True,
+            "container_rollout_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertFalse(report["certified"])

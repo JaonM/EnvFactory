@@ -43,6 +43,11 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 奖励反事实必须使用生产配置的真实 evaluator 重跑；mock 报告只用于离线构建测试，不能进入生产认证。
 - 每份 rollout 保存任务 SHA-256、沙箱可执行输入摘要、Agent/User/Judge 模型及 provider 摘要；认证时重新
   计算并拒绝把其他任务或沙箱的轨迹挂接到当前样本。
+- 生产留出集的 live rollout 必须通过随机 loopback 端口调用刚刚构建并验证的 Docker 镜像；宿主进程
+  直接导入 `app.py` 只允许用于开发检查，不能作为生产证据。轨迹保存实际 Docker image ID、HTTP 传输
+  模式和只读根文件系统、非 root、capability drop、no-new-privileges 状态，并与
+  `docker_image_metadata.json` 独立交叉验证。初末业务状态只能经 Trainer Bearer 保护的 `/v1/state`
+  获取，属于 trainer-only evidence，不进入策略 observation。
 - 每个成功任务保存任务生成 provider、配置模型、实际响应模型计数、逐次 route attempt seed、完成原因、
   token usage 和 provider response ID 的 SHA-256；不保存 prompt、响应正文、凭证或原始 response ID。
   认证器从冻结的 `sample_manifest.json` 独立重建该快照，拒绝模型身份、attempt 顺序、seed、任务类别或
@@ -110,7 +115,7 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 
 生产认证还会原子生成 `training_materials_bundle/`。该目录不保留本机绝对路径，按内容身份保存每个
 环境的任务、运行时代码、业务数据、验收证据和 `live_rollout.json`，并生成 `transitions.jsonl` 与
-`bundle_manifest.json`。Bundle v8 同时包含去除本机路径的 `certification.json`、机器可读
+`bundle_manifest.json`。Bundle v9 同时包含去除本机路径的 `certification.json`、机器可读
 `dataset_card.json`。JSONL 每行是一条可重建的 schema v2 transition，并携带任务、类别、episode、
 任务生成模型与 provider 身份、生成 seed、Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与
 `bundle_sha256` 再次校验；导出失败或包校验失败时，即使此前统计门禁通过，也不会产生
@@ -122,7 +127,7 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 就让语义损坏的轨迹通过。JSONL 由固定字段白名单投影产生；完整 trainer-only 证据仍保存在对应环境目录，
 并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。
 
-Bundle v8 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
+Bundle v9 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
 记录身份与排序、环境目录和 Docker 重建入口、运行接口来源，以及 policy input/output、环境反馈和
 trainer-only 证据边界。验证器使用内置规范与文件逐项比较；即使同时修改契约并重算所有外层哈希，也不能
 把 trainer-only 字段伪装成策略输入。历史 v3/v4 包仍可验证完整性，但不能满足当前生产认证的受信发布门禁。

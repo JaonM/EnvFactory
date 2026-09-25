@@ -694,6 +694,7 @@ class SandboxRuntimeTest(unittest.TestCase):
                     episode_store=store,
                     tool_registry=registry,
                     observation=lambda: {"public": True},
+                    business_snapshot=lambda: {"private": "trainer-only"},
                     reward=lambda: {"reward": 1.0},
                     user_turn=lambda messages: {"user_query": "ok", "should_end": False},
                     data_hash="data-v1",
@@ -705,6 +706,11 @@ class SandboxRuntimeTest(unittest.TestCase):
                 auth = {"Authorization": "Bearer trainer-key"}
                 status, reset, _ = app.handle("POST", "/v1/reset", {"seed": 7}, auth)
                 self.assertEqual(reset["seed"], 7)
+                status, state, _ = app.handle("GET", "/v1/state", headers=auth)
+                self.assertEqual(
+                    (status, state),
+                    (200, {"business_state": {"private": "trainer-only"}}),
+                )
                 status, result, tool_headers = app.handle("POST", "/v1/tools/lookup", {"name": "x"})
                 self.assertEqual((status, result), (200, {"value": "x"}))
                 self.assertTrue(tool_headers["X-Tool-Call-ID"].startswith("call-"))

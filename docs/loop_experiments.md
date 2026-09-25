@@ -55,6 +55,9 @@ Pilot 通过只表示可以进入更大规模认证，
 - live rollout 通过后会以 `SANDBOX_EVALUATOR_MOCK=0` 执行奖励反事实校准，写入
   `agentic_training_value_live.json`。真实 evaluator 的成功轨迹、失败轨迹、无工具、错参数、跳步、乱序和
   噪声轨迹不满足奖励分离时，样本仍不合格；离线 mock 报告不能替代该证据。
+- production profile 保留完成冒烟验证的本地镜像直到 live rollout 结束；Agent 驱动器在宿主侧运行，
+  但所有工具、状态持久化、User Simulator 和奖励调用都通过随机 loopback 端口进入实际容器。容器停止后
+  才删除镜像。轨迹中的 image ID 与构建 provenance 不一致，或退回进程内 app，都会取消生产资格。
 - live rollout 与奖励校准之间执行 policy-visible 隐私审计，写入 `trajectory_privacy.json`。User
   Simulator 内部 outcome/FSM 标签只进入 trainer-only evidence，Agent 可见 `result` 只保留实际传给
   Agent 的 `user_query`；发现凭证或隐藏控制字段时停止样本，不能进入便携训练素材包。
@@ -108,7 +111,7 @@ status 和 termination reasoning 属于 trainer-only metadata。便携 JSONL 采
 `training_materials_bundle/`。该包使用相对路径和内容摘要，可直接迁移到后续 RL 数据转换/训练系统；
 仅存在指向本机输出目录的清单不再足以触发生产准备停止原因。包验证器会从原始 rollout 重建
 transition 投影并验证 episode/step/终止关系；它证明训练素材可摄取，不宣称已经执行 RL 训练。
-Bundle v8 内置 `certification.json`、`dataset_card.json` 和机器可读 `consumer_contract.json`；后者固定
+Bundle v9 内置 `certification.json`、`dataset_card.json` 和机器可读 `consumer_contract.json`；后者固定
 transition JSON Schema、记录顺序、任务生成来源、环境重建入口以及 policy/trainer 可见性边界。数据集卡的构成统计、模型偏差、用途限制与
 内部使用边界会同实际 transition 交叉验证，不能通过重新计算 manifest 哈希伪造更宽泛的认证结论。
 生产 profile 还必须传入 `--bundle-signing-private-key` 与 `--bundle-trusted-public-key`（或在 `.env` 中设置

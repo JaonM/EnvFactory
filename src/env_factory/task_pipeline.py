@@ -3804,7 +3804,7 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
             "version": "1.0",
             "shared_runtime": {
                 "module": "sandbox_runtime.py",
-                "version": "1.1",
+                "version": "1.2",
                 "required_components": [
                     "EpisodeStore",
                     "ManifestDataStore",
@@ -3838,12 +3838,12 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                 "trainer": {
                     "scheme": "bearer",
                     "environment_variable": "SANDBOX_TRAINER_API_KEY",
-                    "required_for": ["reset", "observation", "user_simulator", "agent_response", "reward", "replay"],
+                    "required_for": ["reset", "observation", "state", "user_simulator", "agent_response", "reward", "replay"],
                 },
                 "agent": {
                     "scheme": "none",
                     "allowed_kinds": ["llm_tool"],
-                    "cannot_access": ["user_simulator", "agent_response", "reward", "replay"],
+                    "cannot_access": ["state", "user_simulator", "agent_response", "reward", "replay"],
                 },
             },
             "episode": {
@@ -3892,6 +3892,14 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                     },
                 },
                 {"name": "observation", "kind": "system", "access": "rl_trainer_only", "method": "GET", "path": "/v1/observation"},
+                {
+                    "name": "state", "kind": "trainer_evidence",
+                    "access": "rl_trainer_only", "method": "GET", "path": "/v1/state",
+                    "response_schema": {
+                        "type": "object",
+                        "description": "仅供 Trainer 记录初末业务状态；不得进入 policy observation。",
+                    },
+                },
                 {"name": "tools", "kind": "system", "method": "GET", "path": "/v1/tools"},
                 {
                     "name": "user_simulator",
@@ -4014,6 +4022,7 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
             ("health", "GET", "/health"),
             ("reset", "POST", "/v1/reset"),
             ("observation", "GET", "/v1/observation"),
+            ("state", "GET", "/v1/state"),
             ("tools", "GET", "/v1/tools"),
             ("user_simulator", "POST", "/v1/user_simulator"),
             ("agent_response", "POST", "/v1/agent_response"),

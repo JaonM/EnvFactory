@@ -13,7 +13,7 @@ CERTIFICATION_FILE = "certification.json"
 DATASET_CARD_FILE = "dataset_card.json"
 CONSUMER_CONTRACT_FILE = "consumer_contract.json"
 BUNDLE_SIGNATURE_FILE = "bundle_manifest.sig"
-BUNDLE_VERSION = "8.0"
+BUNDLE_VERSION = "9.0"
 DATASET_SPLITS = ("train", "validation", "test")
 
 
@@ -46,9 +46,9 @@ def assign_dataset_splits(items: list[dict[str, Any]]) -> dict[str, str]:
 
 def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
     """Return the exact portable handoff; consumers need no prompt conventions."""
-    supports_splits = bundle_version in {"6.0", "7.0", BUNDLE_VERSION}
-    supports_families = bundle_version in {"7.0", BUNDLE_VERSION}
-    supports_generation = bundle_version == BUNDLE_VERSION
+    supports_splits = bundle_version in {"6.0", "7.0", "8.0", BUNDLE_VERSION}
+    supports_families = bundle_version in {"7.0", "8.0", BUNDLE_VERSION}
+    supports_generation = bundle_version in {"8.0", BUNDLE_VERSION}
     record_fields = [
         "schema_version", "item_id", "task_sha256", "category",
         "episode_index", "episode_seed", "episode_success",

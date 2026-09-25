@@ -39,8 +39,7 @@ def create_app(*, db_path=None):
         if scores.keys() & extensions.keys(): raise ValueError("custom metrics cannot override compiled scores")
         scores.update(extensions); return aggregator.aggregate(reward_gate.apply(scores, context))
     def reset(episode): data.reset(episode); user.reset(episode); hooks.reset(episode)
-    app = SandboxApplication(episode_store=store, tool_registry=registry, observation=hooks.observation, reward=reward, user_turn=user.turn, reset_hook=reset, data_hash=data.data_hash)
-    app.business_snapshot = lambda: {name: data.table(name) for name in data.baseline}
+    app = SandboxApplication(episode_store=store, tool_registry=registry, observation=hooks.observation, reward=reward, user_turn=user.turn, business_snapshot=lambda: {name: data.table(name) for name in data.baseline}, reset_hook=reset, data_hash=data.data_hash)
     app.mutate_business_state = lambda mutation: data.update(mutation["table"], mutation.get("selector", {}), mutation.get("changes", {}))
     return app
 def main():

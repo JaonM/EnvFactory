@@ -92,6 +92,7 @@ def check_contract(task: dict[str, Any], contract: dict[str, Any], names: list[s
     required = {
         ("health", "GET", "/health"), ("reset", "POST", "/v1/reset"),
         ("observation", "GET", "/v1/observation"), ("tools", "GET", "/v1/tools"),
+        ("state", "GET", "/v1/state"),
         ("user_simulator", "POST", "/v1/user_simulator"), ("reward", "GET", "/v1/reward"),
         ("replay", "GET", "/v1/replay"),
     }
@@ -315,6 +316,10 @@ def runtime_smoke(root: Path, names: list[str], base_url: str) -> None:
     status, _ = call("GET", "/v1/observation", auth=True)
     if not 200 <= status < 300:
         fail(f"observation failed: HTTP {status}")
+    status, state_payload = call("GET", "/v1/state", auth=True)
+    if not 200 <= status < 300 or not isinstance(state_payload, dict) \
+            or not isinstance(state_payload.get("business_state"), dict):
+        fail(f"trainer state snapshot failed: HTTP {status}")
     status, replay_payload = call("GET", "/v1/replay", auth=True)
     if not 200 <= status < 300:
         fail(f"replay failed: HTTP {status}")

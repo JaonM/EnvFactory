@@ -289,6 +289,16 @@ class ExperimentTest(unittest.TestCase):
             with (
                 patch("env_factory.task_quality.score_file", return_value=quality),
                 patch.object(loop, "run_process", side_effect=process),
+                patch.object(loop, "start_rollout_container", return_value={
+                    "started": True,
+                    "container_id": "container-1",
+                    "image_id": "sha256:" + "d" * 64,
+                    "base_url": "http://127.0.0.1:49152",
+                    "security": {},
+                }),
+                patch.object(loop, "stop_rollout_container", return_value={
+                    "exit_code": 0, "timed_out": False, "seconds": .1,
+                }),
             ):
                 result = loop.build_one(ROOT, task_path, output, config)
             self.assertTrue(result["passed"])
@@ -314,6 +324,11 @@ class ExperimentTest(unittest.TestCase):
                 if "run_live_rollout.py" in " ".join(command)
             )
             self.assertLess(governance_index, rollout_index)
+            rollout_command = commands[rollout_index]
+            self.assertEqual(
+                rollout_command[rollout_command.index("--base-url") + 1],
+                "http://127.0.0.1:49152",
+            )
             calibration = next(
                 command for command in commands
                 if "validate_agentic_training_value.py" in " ".join(command)
@@ -455,6 +470,8 @@ class FakeApp:
             value = {}
         elif path == "/v1/tools":
             value = {"tools": [{"type": "function", "function": {"name": "finish", "parameters": {"type": "object"}}}]}
+        elif path == "/v1/state":
+            value = {"business_state": self.business_snapshot()}
         elif path == "/v1/tools/finish":
             self.changed = self.correct
             value = {"updated": 1}
@@ -473,6 +490,20 @@ class FakeApp:
 
 
 class RolloutTest(unittest.TestCase):
+    def test_http_sandbox_client_only_accepts_loopback_origins(self):
+        self.assertEqual(
+            rollout.HTTPSandboxClient("http://127.0.0.1:8000").base_url,
+            "http://127.0.0.1:8000",
+        )
+        for value in (
+            "https://127.0.0.1:8000",
+            "http://sandbox.example:8000",
+            "http://user:secret@127.0.0.1:8000",
+            "http://127.0.0.1:8000/path",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                rollout.HTTPSandboxClient(value)
+
     def test_release_gate_requires_two_of_three_clean_successes(self):
         episodes = [
             {"agent_success": True, "issues": []},

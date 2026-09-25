@@ -1742,6 +1742,7 @@ class SandboxApplication:
         observation: Callable[[], Mapping[str, Any]],
         reward: Callable[[], Mapping[str, Any]],
         user_turn: Callable[[Sequence[Mapping[str, Any]]], Mapping[str, Any]],
+        business_snapshot: Callable[[], Mapping[str, Any]] | None = None,
         reset_hook: Callable[[Episode], None] | None = None,
         data_hash: str = "",
     ) -> None:
@@ -1750,6 +1751,7 @@ class SandboxApplication:
         self.observation_callback = observation
         self.reward_callback = reward
         self.user_turn_callback = user_turn
+        self.business_snapshot = business_snapshot
         self.reset_hook = reset_hook
         self.data_hash = data_hash
 
@@ -1801,7 +1803,7 @@ class SandboxApplication:
             return {"status": "ok"}
         if method == "GET" and path == "/v1/tools":
             return {"tools": self.tool_registry.tools}
-        trainer_paths = {"/v1/reset", "/v1/observation", "/v1/user_simulator", "/v1/agent_response", "/v1/reward", "/v1/replay"}
+        trainer_paths = {"/v1/reset", "/v1/observation", "/v1/state", "/v1/user_simulator", "/v1/agent_response", "/v1/reward", "/v1/replay"}
         mutation = os.getenv("SANDBOX_MUTATION_MODE", "disabled")
         if path in trainer_paths and mutation != "bypass_trainer_auth":
             require_trainer(self._header(headers, "Authorization"))
@@ -1829,6 +1831,12 @@ class SandboxApplication:
             }
         if method == "GET" and path == "/v1/observation":
             return dict(self.observation_callback())
+        if method == "GET" and path == "/v1/state":
+            if self.business_snapshot is None:
+                raise SandboxError(
+                    "STATE_UNAVAILABLE", "business snapshot callback is unavailable", 500
+                )
+            return {"business_state": dict(self.business_snapshot())}
         if method == "POST" and path == "/v1/user_simulator":
             if not isinstance(body, Mapping) or not isinstance(body.get("messages"), list):
                 raise SandboxError("INVALID_ARGUMENT", "messages must be an array", 400)
@@ -1882,7 +1890,7 @@ class SandboxApplication:
             malformed_request_id = request_id()
             error: SandboxError
             trainer_paths = {
-                "/v1/reset", "/v1/observation", "/v1/user_simulator",
+                "/v1/reset", "/v1/observation", "/v1/state", "/v1/user_simulator",
                 "/v1/agent_response", "/v1/reward", "/v1/replay",
             }
             try:

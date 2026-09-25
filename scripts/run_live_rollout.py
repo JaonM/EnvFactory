@@ -10,11 +10,65 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, Request, build_opener
 
 from env_factory.llm import LLMClient
 from env_factory.material_artifacts import digest_json, portable_artifact_digest
 from env_factory.runtime_llm import RuntimeLLMConfig
 from env_factory.sandbox_runtime import BusinessGoalEvaluator
+
+
+class HTTPSandboxClient:
+    """Drive a sandbox through a credential-free loopback HTTP origin."""
+
+    def __init__(self, base_url: str, *, timeout: float = 30.0) -> None:
+        parsed = urlsplit(base_url)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "sandbox base URL must be a credential-free loopback HTTP origin"
+            )
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.opener = build_opener(ProxyHandler({}))
+
+    def handle(self, method, path, body=None, headers=None):
+        payload = None if body is None else json.dumps(body).encode("utf-8")
+        request_headers = {"Accept": "application/json", **dict(headers or {})}
+        if payload is not None:
+            request_headers["Content-Type"] = "application/json"
+        request = Request(
+            self.base_url + path,
+            data=payload,
+            headers=request_headers,
+            method=method,
+        )
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                raw = response.read()
+                return (
+                    response.status,
+                    json.loads(raw) if raw else {},
+                    dict(response.headers.items()),
+                )
+        except HTTPError as exc:
+            raw = exc.read()
+            try:
+                value = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                value = {"error": {"code": "INVALID_HTTP_RESPONSE"}}
+            return exc.code, value, dict(exc.headers.items())
+        except (URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError("sandbox loopback HTTP request failed") from exc
 
 
 def episode(app, task, client, seed, max_steps):
@@ -30,7 +84,10 @@ def episode(app, task, client, seed, max_steps):
         return status, value
 
     request("POST", "/v1/reset", {"episode_id": headers["X-Episode-ID"], "seed": seed})
-    baseline = app.business_snapshot()
+    baseline_payload = request("GET", "/v1/state")[1]
+    baseline = baseline_payload.get("business_state")
+    if not isinstance(baseline, dict):
+        raise RuntimeError("trainer state endpoint returned an invalid baseline")
     initial_reward = request("GET", "/v1/reward")[1]["reward"]
     current_reward = initial_reward
     tools = request("GET", "/v1/tools")[1]["tools"]
@@ -128,7 +185,10 @@ def episode(app, task, client, seed, max_steps):
     final_reward = request("GET", "/v1/reward")[1]["reward"]
     repeated_reward = request("GET", "/v1/reward")[1]["reward"]
     replay = request("GET", "/v1/replay")[1]
-    state = app.business_snapshot()
+    state_payload = request("GET", "/v1/state")[1]
+    state = state_payload.get("business_state")
+    if not isinstance(state, dict):
+        raise RuntimeError("trainer state endpoint returned an invalid final state")
     goal = task.get("task_spec", {}).get("goal_contract", {})
     state_success = None
     if goal.get("row_predicates"):
@@ -218,6 +278,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--base-url")
+    parser.add_argument("--container-image-id")
     parser.add_argument(
         "--min-success-rate", type=float, default=0.0,
         help="minimum successful episode ratio; 0 preserves the one-success witness gate",
@@ -233,11 +295,36 @@ def main():
     os.environ["SANDBOX_MUTATION_MODE"] = "disabled"
     os.environ.setdefault("SANDBOX_TRAINER_API_KEY", "local-rollout-trainer")
     root = args.root.resolve()
-    sys.path.insert(0, str(root))
-    spec = importlib.util.spec_from_file_location("rollout_app", root / "app.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
     task = json.loads((root / "task.json").read_text())
+    if bool(args.base_url) != bool(args.container_image_id):
+        parser.error("--base-url and --container-image-id must be provided together")
+    if args.base_url:
+        import re
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", args.container_image_id) is None:
+            parser.error("--container-image-id must be a Docker sha256 image ID")
+        app = HTTPSandboxClient(args.base_url)
+        module = None
+        runtime_execution = {
+            "version": "1.0",
+            "mode": "docker_http",
+            "container_image_id": args.container_image_id,
+            "transport": "loopback_http",
+            "read_only_root": True,
+            "cap_drop": "ALL",
+            "no_new_privileges": True,
+            "non_root_user": True,
+        }
+    else:
+        sys.path.insert(0, str(root))
+        spec = importlib.util.spec_from_file_location("rollout_app", root / "app.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        app = None
+        runtime_execution = {
+            "version": "1.0",
+            "mode": "in_process",
+            "container_image_id": None,
+        }
     report = {"schema_version": "2.0", "material_visibility_version": "1.0",
               "mode": "live_rollout", "agent_model": client.model,
               "runtime_model": runtime.model, "episodes": [],
@@ -245,11 +332,13 @@ def main():
               "sandbox_artifacts_digest": portable_artifact_digest(root),
               "agent_provider_sha256": digest_json({"base_url": client.base_url, "model": client.model}),
               "runtime_provider_sha256": digest_json({"base_url": runtime.base_url, "model": runtime.model}),
+              "runtime_execution": runtime_execution,
               "same_model_bias_possible": client.model == runtime.model,
               "live_rollout_verified": False, "passed": False}
     from loop_experiment import write_json
     with tempfile.TemporaryDirectory(prefix="envfactory-rollout-") as temporary:
-        app = module.create_app(db_path=Path(temporary) / "episodes.sqlite3")
+        if app is None:
+            app = module.create_app(db_path=Path(temporary) / "episodes.sqlite3")
         for seed in range(args.episodes):
             try:
                 result = episode(app, task, client, seed, args.max_steps)

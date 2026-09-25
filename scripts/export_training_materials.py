@@ -37,6 +37,7 @@ from env_factory.trajectory_schema import episode_errors, policy_transition
 from env_factory.execution_provenance import valid_execution_provenance
 from env_factory.task_similarity import task_family_ids
 from env_factory.generation_provenance import valid_generation_provenance
+from env_factory.runtime_provenance import valid_container_rollout_execution
 
 
 def file_sha256(path: Path) -> str:
@@ -116,6 +117,14 @@ def _dataset_card(
         for item in items
         for attempt in item.get("generation_provenance", {}).get("attempts", [])
     )
+    runtime_modes = Counter(
+        str(item.get("runtime_execution", {}).get("mode")) for item in items
+    )
+    container_images = {
+        str(item.get("runtime_execution", {}).get("container_image_id"))
+        for item in items
+        if item.get("runtime_execution", {}).get("mode") == "docker_http"
+    }
     same_model_items = sum(
         count for (agent, runtime), count in model_pairs.items() if agent == runtime
     )
@@ -126,7 +135,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "1.4",
+        "version": "1.5",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -176,6 +185,11 @@ def _dataset_card(
                 "provider_identities": dict(sorted(generation_providers.items())),
                 "attempts": generation_attempts,
                 "responses": generation_responses,
+            },
+            "runtime_execution": {
+                "modes": dict(sorted(runtime_modes.items())),
+                "validated_container_items": runtime_modes.get("docker_http", 0),
+                "unique_container_images": len(container_images),
             },
         },
         "data_boundary": {
@@ -365,6 +379,10 @@ def _export_bundle_uncommitted(
             rollout = json.loads(rollout_source.read_text(encoding="utf-8"))
             if digest_json(rollout) != item.get("rollout_sha256"):
                 raise ValueError(f"rollout changed for {item_id}")
+            if not valid_container_rollout_execution(rollout, source_root):
+                raise ValueError(
+                    f"rollout did not execute in the validated container for {item_id}"
+                )
             rollout_destination = destination_root / "live_rollout.json"
             rollout_destination.write_text(
                 json.dumps(rollout, ensure_ascii=False, indent=2) + "\n",
@@ -397,6 +415,7 @@ def _export_bundle_uncommitted(
                 "split": split,
                 "task_family_id": task_family_id,
                 "generation_provenance": generation,
+                "runtime_execution": rollout["runtime_execution"],
                 "score": item["score"],
                 "task_sha256": item["task_sha256"],
                 "environment_path": f"environments/{item_id}",
@@ -489,7 +508,7 @@ def verify_bundle(
         failures.append("bundle_digest")
     if (
         manifest.get("version") not in {
-            "3.0", "4.0", "5.0", "6.0", "7.0", BUNDLE_VERSION,
+            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", BUNDLE_VERSION,
         }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
         or not isinstance(manifest.get("source_dataset_sha256"), str)
@@ -497,7 +516,7 @@ def verify_bundle(
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", "6.0", "7.0", BUNDLE_VERSION,
+        "4.0", "5.0", "6.0", "7.0", "8.0", BUNDLE_VERSION,
     }
     if production_contract_ready:
         try:
@@ -619,6 +638,7 @@ def verify_bundle(
     verified_successes = 0
     verified_categories: Counter[str] = Counter()
     verified_model_pairs: Counter[tuple[str, str]] = Counter()
+    verified_container_rollouts = 0
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
             failures.append("bundle_items")
@@ -634,12 +654,12 @@ def verify_bundle(
         seen_item_ids.add(item_id)
         expected_family_id = recomputed_families.get(item_id, "")
         if (
-            manifest.get("version") in {"7.0", BUNDLE_VERSION}
+            manifest.get("version") in {"7.0", "8.0", BUNDLE_VERSION}
             and item.get("task_family_id") != expected_family_id
         ):
             failures.append("task_family_identity")
         generation = item.get("generation_provenance")
-        if manifest.get("version") == BUNDLE_VERSION and (
+        if manifest.get("version") in {"8.0", BUNDLE_VERSION} and (
             not valid_generation_provenance(generation)
             or generation.get("training_category") != item.get("category")
             or generation.get("task_sha256") != item.get("task_sha256")
@@ -685,14 +705,26 @@ def verify_bundle(
         rollout_path = root / environment / "live_rollout.json"
         try:
             rollout = json.loads(rollout_path.read_text(encoding="utf-8"))
+            if manifest.get("version") == BUNDLE_VERSION:
+                execution_valid = valid_container_rollout_execution(
+                    rollout, root / environment
+                ) and item.get("runtime_execution") == rollout.get(
+                    "runtime_execution"
+                )
+                if execution_valid:
+                    verified_container_rollouts += 1
+                else:
+                    failures.append("container_rollout_execution")
             projected = _transition_records(
                 item_id, item, rollout, split=str(item.get("split", "")),
                 task_family_id=(
                     expected_family_id
-                    if manifest.get("version") in {"7.0", BUNDLE_VERSION} else ""
+                    if manifest.get("version") in {"7.0", "8.0", BUNDLE_VERSION} else ""
                 ),
                 generation_provenance=(
-                    generation if manifest.get("version") == BUNDLE_VERSION else None
+                    generation
+                    if manifest.get("version") in {"8.0", BUNDLE_VERSION}
+                    else None
                 ),
             )
         except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
@@ -733,7 +765,7 @@ def verify_bundle(
             "category": str(item.get("category")),
             "task_family_id": (
                 recomputed_families.get(str(item.get("item_id")), "")
-                if manifest.get("version") in {"7.0", BUNDLE_VERSION} else ""
+                if manifest.get("version") in {"7.0", "8.0", BUNDLE_VERSION} else ""
             ),
         }
         for item in items if isinstance(item, Mapping)
@@ -745,7 +777,7 @@ def verify_bundle(
         (str(item.get("category")), str(item.get("split")))
         for item in items if isinstance(item, Mapping)
     )
-    if manifest.get("version") in {"6.0", "7.0", BUNDLE_VERSION} and any(
+    if manifest.get("version") in {"6.0", "7.0", "8.0", BUNDLE_VERSION} and any(
         item.get("split") != expected_splits.get(str(item.get("item_id")))
         for item in items if isinstance(item, Mapping)
     ):
@@ -767,7 +799,7 @@ def verify_bundle(
         family_categories.setdefault(family, set()).add(str(item.get("category")))
         family_splits.setdefault(family, set()).add(str(item.get("split")))
     family_split_ready = (
-        manifest.get("version") in {"7.0", BUNDLE_VERSION}
+        manifest.get("version") in {"7.0", "8.0", BUNDLE_VERSION}
         and bool(family_categories)
         and all(len(values) == 1 for values in family_categories.values())
         and all(len(values) == 1 for values in family_splits.values())
@@ -781,10 +813,15 @@ def verify_bundle(
         if isinstance(value, Mapping)
     ]
     generation_provenance_ready = (
-        manifest.get("version") == BUNDLE_VERSION
+        manifest.get("version") in {"8.0", BUNDLE_VERSION}
         and len(generation_values) == len(items)
         and all(valid_generation_provenance(value) for value in generation_values)
         and len(generation_seeds) == len(set(generation_seeds))
+    )
+    container_rollout_ready = (
+        manifest.get("version") == BUNDLE_VERSION
+        and bool(items)
+        and verified_container_rollouts == len(items)
     )
     if (
         len(records) != manifest.get("transition_count")
@@ -843,10 +880,60 @@ def verify_bundle(
         for value in generation_values if isinstance(value, Mapping)
         for attempt in value.get("attempts", [])
     )
+    expected_runtime_modes = Counter(
+        str(item.get("runtime_execution", {}).get("mode"))
+        for item in items if isinstance(item, Mapping)
+    )
+    expected_container_images = {
+        str(item.get("runtime_execution", {}).get("container_image_id"))
+        for item in items if isinstance(item, Mapping)
+        and item.get("runtime_execution", {}).get("mode") == "docker_http"
+    }
+    version = manifest.get("version")
+    versioned_card_composition = True
+    if version in {"6.0", "7.0", "8.0", BUNDLE_VERSION}:
+        versioned_card_composition = (
+            card_composition.get("splits") == expected_split_counts
+            and card_composition.get("category_splits") == expected_category_splits
+        )
+    if version in {"7.0", "8.0", BUNDLE_VERSION}:
+        versioned_card_composition = versioned_card_composition and (
+            card_composition.get("task_families") == expected_family_count
+            and card_composition.get("near_duplicate_items")
+                == len(items) - expected_family_count
+            and card_composition.get("cross_split_family_overlap") == 0
+        )
+    if version in {"8.0", BUNDLE_VERSION}:
+        versioned_card_composition = versioned_card_composition and (
+            card_composition.get("task_generation") == {
+                "configured_models": dict(
+                    sorted(expected_generation_configured_models.items())
+                ),
+                "actual_response_models": dict(
+                    sorted(expected_generation_actual_models.items())
+                ),
+                "provider_identities": dict(
+                    sorted(expected_generation_providers.items())
+                ),
+                "attempts": expected_generation_attempts,
+                "responses": expected_generation_responses,
+            }
+        )
+    if version == BUNDLE_VERSION:
+        versioned_card_composition = versioned_card_composition and (
+            card_composition.get("runtime_execution") == {
+                "modes": dict(sorted(expected_runtime_modes.items())),
+                "validated_container_items": expected_runtime_modes.get(
+                    "docker_http", 0
+                ),
+                "unique_container_images": len(expected_container_images),
+            }
+        )
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "1.4" if manifest.get("version") == BUNDLE_VERSION
+            "1.5" if manifest.get("version") == BUNDLE_VERSION
+            else "1.4" if manifest.get("version") == "8.0"
             else "1.3" if manifest.get("version") == "7.0"
             else "1.2" if manifest.get("version") == "6.0"
             else "1.1" if manifest.get("version") in {"4.0", "5.0"}
@@ -865,7 +952,7 @@ def verify_bundle(
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
             manifest.get("version") not in {
-                "4.0", "5.0", "6.0", "7.0", BUNDLE_VERSION,
+                "4.0", "5.0", "6.0", "7.0", "8.0", BUNDLE_VERSION,
             }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
         )
@@ -880,31 +967,7 @@ def verify_bundle(
         and card_composition.get("model_pairs") == expected_model_pairs
         and card_composition.get("same_model_pair_items")
             == verified_same_model_items
-        and (
-            manifest.get("version") != BUNDLE_VERSION
-            or (
-                card_composition.get("splits") == expected_split_counts
-                and card_composition.get("category_splits")
-                    == expected_category_splits
-                and card_composition.get("task_families") == expected_family_count
-                and card_composition.get("near_duplicate_items")
-                    == len(items) - expected_family_count
-                and card_composition.get("cross_split_family_overlap") == 0
-                and card_composition.get("task_generation") == {
-                    "configured_models": dict(
-                        sorted(expected_generation_configured_models.items())
-                    ),
-                    "actual_response_models": dict(
-                        sorted(expected_generation_actual_models.items())
-                    ),
-                    "provider_identities": dict(
-                        sorted(expected_generation_providers.items())
-                    ),
-                    "attempts": expected_generation_attempts,
-                    "responses": expected_generation_responses,
-                }
-            )
-        )
+        and versioned_card_composition
         and required_limitations <= card_limits
         and "offline_rl_algorithm_compatibility" in card_limits
         and dataset_card.get("data_boundary", {}).get("policy_transitions")
@@ -924,7 +987,7 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     attestation = manifest.get("attestation")
     trusted_attestation = (
-        manifest.get("version") in {"5.0", "6.0", "7.0", BUNDLE_VERSION}
+        manifest.get("version") in {"5.0", "6.0", "7.0", "8.0", BUNDLE_VERSION}
         and trusted_public_key is not None
         and verify_file(
             root / BUNDLE_MANIFEST,
@@ -946,6 +1009,7 @@ def verify_bundle(
         "dataset_split_ready": dataset_split_ready,
         "task_family_split_ready": family_split_ready,
         "generation_provenance_ready": generation_provenance_ready,
+        "container_rollout_ready": container_rollout_ready,
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None

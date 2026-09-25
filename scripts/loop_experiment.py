@@ -11,11 +11,14 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import time
 import threading
 import uuid
+from urllib.error import URLError
+from urllib.request import ProxyHandler, build_opener
 
 from env_factory.execution_provenance import (
     collect_execution_provenance,
@@ -25,7 +28,9 @@ from env_factory.task_similarity import task_partition_isolation
 
 MODEL = "gpt-5.6-luna"
 ACTIVE_PROCESSES = set()
+ACTIVE_CONTAINER_CIDFILES = set()
 PROCESS_LOCK = threading.Lock()
+CONTAINER_PORT_LOCK = threading.Lock()
 PROCESS_DEADLINE = None
 BUDGET_STATE_PATH = None
 ACTIVE_RUN_STARTED = None
@@ -58,6 +63,20 @@ def interrupt(signum, frame):
                 os.killpg(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
+        cidfiles = tuple(ACTIVE_CONTAINER_CIDFILES)
+    for cidfile in cidfiles:
+        try:
+            container_id = cidfile.read_text(encoding="utf-8").strip()
+            if container_id:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_id],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False,
+                )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            cidfile.unlink(missing_ok=True)
     finish_active_budget("paused")
     raise SystemExit(128 + signum)
 
@@ -146,6 +165,139 @@ def sandbox_image_tag(output: Path) -> str:
     """Give every concurrent attempt a collision-resistant local image tag."""
     identity = hashlib.sha256(str(output.resolve()).encode("utf-8")).hexdigest()[:20]
     return f"envfactory-sandbox-{identity}"
+
+
+def stop_rollout_container(project, output, container_id, config):
+    result = run_process(
+        ["docker", "rm", "-f", container_id], project,
+        output / "live_container_stop.log",
+        min(config.get("rollout_timeout", 600), 60),
+    )
+    (output / ".live_rollout.cid").unlink(missing_ok=True)
+    with PROCESS_LOCK:
+        ACTIVE_CONTAINER_CIDFILES.discard(output / ".live_rollout.cid")
+    return result
+
+
+def start_rollout_container(project, output, image_tag, config):
+    """Start the validated image on a random loopback port for live rollout."""
+    os.environ.setdefault("SANDBOX_TRAINER_API_KEY", "local-rollout-trainer")
+    for target, source in {
+        "SANDBOX_LLM_API_KEY": "LLM_API_KEY",
+        "SANDBOX_LLM_BASE_URL": "LLM_BASE_URL",
+        "SANDBOX_LLM_MODEL": "LLM_MODEL",
+        "SANDBOX_LLM_TIMEOUT_SECONDS": "LLM_TIMEOUT",
+    }.items():
+        if not os.environ.get(target) and os.environ.get(source):
+            os.environ[target] = os.environ[source]
+    os.environ["SANDBOX_EVALUATOR_MOCK"] = "0"
+    os.environ["SANDBOX_MUTATION_MODE"] = "disabled"
+    cid_path = output / ".live_rollout.cid"
+    cid_path.unlink(missing_ok=True)
+    with PROCESS_LOCK:
+        ACTIVE_CONTAINER_CIDFILES.add(cid_path)
+    command_prefix = [
+        "docker", "run", "-d", "--rm", "--cidfile", str(cid_path),
+        "--read-only", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true",
+        "--pids-limit", "128", "--memory", "512m", "--cpus", "1.0",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+        "--tmpfs", "/app/.runtime:rw,nosuid,size=64m",
+    ]
+    for name in (
+        "SANDBOX_TRAINER_API_KEY", "SANDBOX_LLM_API_KEY",
+        "SANDBOX_LLM_BASE_URL", "SANDBOX_LLM_MODEL",
+        "SANDBOX_LLM_TIMEOUT_SECONDS", "SANDBOX_LLM_MAX_RETRIES",
+        "SANDBOX_EVALUATOR_MOCK", "SANDBOX_MUTATION_MODE",
+    ):
+        if os.environ.get(name):
+            command_prefix.extend(["--env", name])
+    start_attempts = []
+    host_port = 0
+    with CONTAINER_PORT_LOCK:
+        for attempt in range(1, 4):
+            cid_path.unlink(missing_ok=True)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                host_port = probe.getsockname()[1]
+            started = run_process(
+                [
+                    *command_prefix,
+                    "--publish", f"127.0.0.1:{host_port}:8000", image_tag,
+                ],
+                project,
+                output / (
+                    "live_container_start.log" if attempt == 1
+                    else f"live_container_start_{attempt}.log"
+                ),
+                min(config.get("rollout_timeout", 600), 120),
+            )
+            start_attempts.append({"attempt": attempt, **started})
+            if started["exit_code"] == 0 and cid_path.is_file():
+                break
+            if cid_path.is_file():
+                failed_container = cid_path.read_text(encoding="utf-8").strip()
+                if failed_container:
+                    stop_rollout_container(
+                        project, output, failed_container, config
+                    )
+                with PROCESS_LOCK:
+                    ACTIVE_CONTAINER_CIDFILES.add(cid_path)
+    if started["exit_code"] != 0 or not cid_path.is_file():
+        with PROCESS_LOCK:
+            ACTIVE_CONTAINER_CIDFILES.discard(cid_path)
+        return {
+            "started": False, "process": started,
+            "start_attempts": start_attempts,
+        }
+    container_id = cid_path.read_text(encoding="utf-8").strip()
+
+    def docker_value(arguments, log_name):
+        path = output / log_name
+        result = run_process(
+            ["docker", *arguments], project, path,
+            min(config.get("rollout_timeout", 600), 60),
+        )
+        value = path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+        return result, value
+
+    inspected, image_id = docker_value(
+        ["inspect", "--format", "{{.Image}}", container_id],
+        "live_container_inspect.log",
+    )
+    import re
+    if (
+        inspected["exit_code"] != 0
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+    ):
+        stop_rollout_container(project, output, container_id, config)
+        return {"started": False, "process": started, "inspect": inspected}
+    base_url = f"http://127.0.0.1:{host_port}"
+    loopback = build_opener(ProxyHandler({}))
+    deadline = time.monotonic() + min(30, config.get("rollout_timeout", 600))
+    healthy = False
+    while time.monotonic() < deadline:
+        try:
+            with loopback.open(base_url + "/health", timeout=2) as response:
+                healthy = response.status == 200
+            if healthy:
+                break
+        except (URLError, TimeoutError, OSError):
+            time.sleep(0.2)
+    if not healthy:
+        stop_rollout_container(project, output, container_id, config)
+        return {"started": False, "process": started, "health": False}
+    return {
+        "started": True,
+        "container_id": container_id,
+        "image_id": image_id,
+        "base_url": base_url,
+        "start_attempts": start_attempts,
+        "security": {
+            "read_only_root": True, "cap_drop": "ALL",
+            "no_new_privileges": True, "non_root_user": True,
+        },
+    }
 
 
 def failure(stage, detail, **extra):
@@ -376,7 +528,7 @@ def run_holdout(project, root, config, previous_reports, *, batch_number=1):
     return report
 
 
-def build_one(project, task_path, output, config, seed=None):
+def _build_one(project, task_path, output, config, seed=None):
     from env_factory.task_quality import score_file
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -421,18 +573,6 @@ def build_one(project, task_path, output, config, seed=None):
     assert built is not None
     common["build"] = built
     common["build_attempts"] = build_attempts
-    if config.get("sandbox_runtime", "none") == "docker":
-        cleanup = run_process(
-            ["docker", "image", "rm", image_tag],
-            project,
-            output / "container_cleanup.log",
-            min(config.get("score_timeout", 1800), 120),
-        )
-        common["container_cleanup"] = cleanup
-        if built["exit_code"] == 0 and cleanup["exit_code"] != 0:
-            return failure(
-                "infrastructure", "validated container image cleanup failed", **common
-            )
     if built["exit_code"] != 0:
         buildability_path = output / "buildability.json"
         if buildability_path.is_file():
@@ -502,11 +642,44 @@ def build_one(project, task_path, output, config, seed=None):
             result["elapsed_seconds"] = time.monotonic() - started
             return result
         live_path = output / "live_rollout.json"
-        live_run = run_process([sys.executable, str(project / "scripts/run_live_rollout.py"), str(output),
-                               "--output", str(live_path), "--episodes", str(config["rollout_episodes"]),
-                               "--max-steps", str(config["rollout_steps"]),
-                               "--min-success-rate", str(config.get("rollout_min_success_rate", 0.0))], project,
-                              output / "rollout.log", config["rollout_timeout"])
+        live_command = [
+            sys.executable, str(project / "scripts/run_live_rollout.py"),
+            str(output), "--output", str(live_path),
+            "--episodes", str(config["rollout_episodes"]),
+            "--max-steps", str(config["rollout_steps"]),
+            "--min-success-rate", str(config.get("rollout_min_success_rate", 0.0)),
+        ]
+        container_runtime = None
+        if config.get("sandbox_runtime", "none") == "docker":
+            container_runtime = start_rollout_container(
+                project, output, image_tag, config
+            )
+            result["container_rollout"] = {
+                key: value for key, value in container_runtime.items()
+                if key not in {"base_url", "container_id"}
+            }
+            if container_runtime.get("started") is not True:
+                result.update(failure(
+                    "infrastructure", "validated rollout container failed to start",
+                    **common,
+                ))
+                result["elapsed_seconds"] = time.monotonic() - started
+                return result
+            live_command.extend([
+                "--base-url", container_runtime["base_url"],
+                "--container-image-id", container_runtime["image_id"],
+            ])
+        try:
+            live_run = run_process(
+                live_command, project, output / "rollout.log",
+                config["rollout_timeout"],
+            )
+        finally:
+            if container_runtime and container_runtime.get("container_id"):
+                stopped = stop_rollout_container(
+                    project, output, container_runtime["container_id"], config
+                )
+                result.setdefault("container_rollout", {})["stop"] = stopped
         live = json.loads(live_path.read_text()) if live_path.exists() else {}
         result.update(live_rollout=live, live_process=live_run,
                       live_rollout_verified=live.get("live_rollout_verified", False))
@@ -515,10 +688,24 @@ def build_one(project, task_path, output, config, seed=None):
         result["score"] = round(
             min(10.0, result["offline_score"] * 0.9 + float(live.get("quality_score", 0))), 2
         )
-        result["passed"] = live_run["exit_code"] == 0 and live.get("passed") is True
+        result["passed"] = (
+            live_run["exit_code"] == 0
+            and live.get("passed") is True
+            and (
+                not container_runtime
+                or result.get("container_rollout", {}).get("stop", {}).get("exit_code") == 0
+            )
+        )
         if not result["passed"]:
             owner = live.get("failure_owner")
-            infrastructure = live_run["timed_out"] or owner == "infrastructure"
+            infrastructure = (
+                live_run["timed_out"]
+                or owner == "infrastructure"
+                or container_runtime is not None
+                and result.get("container_rollout", {}).get("stop", {}).get(
+                    "exit_code"
+                ) != 0
+            )
             result.update(
                 failure_class="infrastructure" if infrastructure else "live_rollout",
                 failure_code=("INFRA" if infrastructure else
@@ -601,6 +788,34 @@ def build_one(project, task_path, output, config, seed=None):
                 )
     result["elapsed_seconds"] = time.monotonic() - started
     return result
+
+
+def build_one(project, task_path, output, config, seed=None):
+    """Build and validate one sandbox, always reclaiming its local image."""
+    result = None
+    try:
+        result = _build_one(project, task_path, output, config, seed)
+        return result
+    finally:
+        if config.get("sandbox_runtime", "none") == "docker":
+            cleanup = run_process(
+                ["docker", "image", "rm", sandbox_image_tag(output)],
+                project,
+                output / "container_cleanup.log",
+                min(config.get("score_timeout", 1800), 120),
+            )
+            if result is not None:
+                result["container_cleanup"] = cleanup
+                built = result.get("build", {})
+                if built.get("exit_code") == 0 and cleanup["exit_code"] != 0:
+                    result.update(
+                        passed=False,
+                        live_rollout_verified=False,
+                        failure_class="infrastructure",
+                        failure_code="INFRA",
+                        repair_target="runner_or_provider",
+                        detail="validated container image cleanup failed",
+                    )
 
 
 def run_round(project, root, config, report):
