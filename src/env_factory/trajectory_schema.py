@@ -83,6 +83,25 @@ def transition_errors(transition: Any, *, expected_step: int) -> list[str]:
     trainer_metadata = transition.get("trainer_metadata")
     if trainer_metadata is not None and not isinstance(trainer_metadata, Mapping):
         errors.append(f"{prefix}:trainer_metadata")
+    elif isinstance(trainer_metadata, Mapping) and "user_simulator" in trainer_metadata:
+        simulator = trainer_metadata.get("user_simulator")
+        visible = transition.get("result")
+        if not isinstance(simulator, Mapping):
+            errors.append(f"{prefix}:user_simulator_metadata")
+        else:
+            if not isinstance(action, Mapping) or action.get("kind") != "respond":
+                errors.append(f"{prefix}:user_simulator_action")
+            if not isinstance(visible, Mapping) or (
+                visible.get("user_query") != simulator.get("user_query")
+            ):
+                errors.append(f"{prefix}:user_simulator_visible_result")
+            if transition.get("terminated") is not simulator.get("should_end"):
+                errors.append(f"{prefix}:user_simulator_terminal")
+            if (
+                simulator.get("should_end") is False
+                and simulator.get("termination_reason") is not None
+            ):
+                errors.append(f"{prefix}:premature_termination_reason")
     return errors
 
 
@@ -123,6 +142,17 @@ def episode_errors(episode: Any) -> list[str]:
             errors.append("episode:terminal_flag")
         if last.get("reward") != episode.get("final_reward"):
             errors.append("episode:final_reward_mismatch")
+        trainer_metadata = last.get("trainer_metadata")
+        simulator = (
+            trainer_metadata.get("user_simulator")
+            if isinstance(trainer_metadata, Mapping) else None
+        )
+        if (
+            isinstance(simulator, Mapping)
+            and simulator.get("should_end") is True
+            and episode.get("termination") != simulator.get("termination_reason")
+        ):
+            errors.append("episode:user_simulator_termination_mismatch")
         for index in range(len(transitions) - 1):
             if transitions[index].get("next_observation") != transitions[index + 1].get(
                 "observation"

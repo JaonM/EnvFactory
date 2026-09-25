@@ -131,7 +131,7 @@ class MaterialExportTest(unittest.TestCase):
             "assistant_output": '{"kind":"respond","content":"done"}',
             "observation": {},
             "action": {"kind": "respond", "content": "done"},
-            "result": {"status": 200},
+            "result": {"status": 200, "user_query": user_result["user_query"]},
             "next_observation": {},
             "reward": 1.0,
             "terminated": True,
@@ -250,6 +250,7 @@ class MaterialExportTest(unittest.TestCase):
             self.assertNotIn("trainer_metadata", record["transition"])
             card = json.loads((bundle / "dataset_card.json").read_text())
             self.assertEqual(card["composition"]["items"], 1)
+
             self.assertEqual(card["composition"]["transitions"], 1)
             self.assertEqual(
                 card["composition"]["task_generation"]["configured_models"],
@@ -302,6 +303,17 @@ class MaterialExportTest(unittest.TestCase):
             changed = exporter.verify_bundle(bundle)
             self.assertFalse(changed["verified"])
             self.assertIn("bundle_files", changed["failed_gates"])
+
+    def test_transition_termination_must_match_user_simulator_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            certification = self.source(Path(directory))
+            item = certification["materials_manifest"]["items"][0]
+            rollout = json.loads(
+                (Path(item["sandbox_root"]) / "live_rollout.json").read_text()
+            )
+            rollout["episodes"][0]["transitions"][0]["terminated"] = False
+            with self.assertRaisesRegex(ValueError, "user_simulator_terminal"):
+                exporter._transition_records("fixture", item, rollout)
 
     def test_bundle_verifier_rejects_semantically_rewritten_transition_jsonl(self):
         with tempfile.TemporaryDirectory() as directory:

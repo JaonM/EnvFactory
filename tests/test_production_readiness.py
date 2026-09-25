@@ -421,7 +421,10 @@ class ProductionReadinessTest(unittest.TestCase):
                         "assistant_output": '{"kind":"respond","content":"done"}',
                         "observation": {},
                         "action": {"kind": "respond", "content": "done"},
-                        "result": {"status": 200},
+                        "result": {
+                            "status": 200,
+                            "user_query": self.fixture_user_turn(episode)["user_query"],
+                        },
                         "trainer_metadata": {
                             "user_simulator": self.fixture_user_turn(episode),
                         },
