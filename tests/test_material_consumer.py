@@ -61,6 +61,7 @@ class MaterialConsumerTest(unittest.TestCase):
         records = contract["records"]
         self.assertEqual(contract["bundle_version"], "16.0")
         self.assertIn("task_lineage", contract["environments"])
+        self.assertIn("dockerignore", contract["environments"])
         self.assertIn("generated_task_equals_runtime_task", contract["invariants"])
         self.assertEqual(records["split_unit"], "item_id")
         self.assertIn("split", records["required_fields"])

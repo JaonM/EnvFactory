@@ -1756,6 +1756,7 @@ def attach_bundle_verification(
         and verification.get("task_family_split_ready") is True
         and verification.get("generation_provenance_ready") is True
         and verification.get("container_rollout_ready") is True
+        and verification.get("portable_build_context_ready") is True
         and verification.get("container_reward_calibration_ready") is True
         and verification.get("provider_identity_ready") is True
         and verification.get("task_lineage_ready") is True

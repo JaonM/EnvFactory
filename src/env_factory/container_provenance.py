@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
+from .material_artifacts import docker_build_context_digest, docker_context_errors
+
 
 EXACT_REQUIREMENT = re.compile(
     r"^[A-Za-z0-9_.-]+(?:\[[A-Za-z0-9_,.-]+\])?==[^\s;]+(?:\s*;.*)?$"
@@ -95,6 +97,7 @@ def verify_container_provenance(
     root: Path, *, expected_tag: str | None = None
 ) -> dict[str, Any]:
     failures = []
+    failures.extend(docker_context_errors(root))
     metadata_path = root / "docker_image_metadata.json"
     dockerfile = root / "Dockerfile"
     requirements = root / "requirements-dev.txt"
@@ -104,9 +107,15 @@ def verify_container_provenance(
     except (OSError, json.JSONDecodeError):
         metadata = {}
         failures.append("metadata")
-    if not isinstance(metadata, Mapping) or metadata.get("version") != "4.0":
+    if not isinstance(metadata, Mapping) or metadata.get("version") != "5.0":
         failures.append("metadata_schema")
         metadata = {}
+    try:
+        context_digest = docker_build_context_digest(root)
+    except (OSError, ValueError):
+        context_digest = ""
+    if metadata.get("build_context_sha256") != context_digest:
+        failures.append("build_context_digest")
     if PINNED_IMAGE.fullmatch(str(metadata.get("base_image", ""))) is None:
         failures.append("base_image_digest")
     if expected_tag is not None and metadata.get("tag") != expected_tag:

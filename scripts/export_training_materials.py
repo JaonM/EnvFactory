@@ -14,7 +14,11 @@ import shutil
 import tempfile
 from typing import Any, Mapping
 
-from env_factory.material_artifacts import digest_json
+from env_factory.material_artifacts import (
+    digest_json,
+    docker_context_errors,
+    portable_artifact_digests,
+)
 from env_factory.material_consumer import (
     BUNDLE_MANIFEST,
     BUNDLE_SIGNATURE_FILE,
@@ -896,6 +900,7 @@ def verify_bundle(
     verified_preflight_provider_bindings = 0
     verified_same_provider_evaluator_items = 0
     verified_task_lineages = 0
+    verified_portable_build_contexts = 0
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
             failures.append("bundle_items")
@@ -976,6 +981,28 @@ def verify_bundle(
             and bool(runtime_interface)
         ):
             failures.append("environment_reconstruction_contract")
+        if supports_bundle_feature(
+            str(manifest.get("version")), "portable_build_context"
+        ):
+            environment_root = root / environment
+            try:
+                portable_files = portable_artifact_digests(environment_root)
+            except (OSError, ValueError):
+                portable_files = {}
+            context_valid = (
+                not docker_context_errors(environment_root)
+                and bool(portable_files)
+                and all(
+                    item_files.get(relative) == digest
+                    for relative, digest in portable_files.items()
+                )
+                and ".dockerignore" in portable_files
+                and "Dockerfile" in portable_files
+            )
+            if context_valid:
+                verified_portable_build_contexts += 1
+            else:
+                failures.append("portable_build_context")
         rollout_path = root / environment / "live_rollout.json"
         try:
             rollout = json.loads(rollout_path.read_text(encoding="utf-8"))
@@ -983,7 +1010,10 @@ def verify_bundle(
                 str(manifest.get("version")), "container_rollout"
             ):
                 execution_valid = valid_container_rollout_execution(
-                    rollout, root / environment
+                    rollout, root / environment,
+                    require_build_context=supports_bundle_feature(
+                        str(manifest.get("version")), "portable_build_context"
+                    ),
                 ) and item.get("runtime_execution") == rollout.get(
                     "runtime_execution"
                 )
@@ -1044,7 +1074,10 @@ def verify_bundle(
                 calibration.get("curriculum_training_ready") is True
                 and calibration.get("validation_mode") == "live_evaluator"
                 and valid_container_rollout_execution(
-                    calibration, root / environment
+                    calibration, root / environment,
+                    require_build_context=supports_bundle_feature(
+                        str(manifest.get("version")), "portable_build_context"
+                    ),
                 )
                 and item.get("reward_runtime_execution")
                 == calibration.get("runtime_execution")
@@ -1196,6 +1229,13 @@ def verify_bundle(
         supports_bundle_feature(str(manifest.get("version")), "container_rollout")
         and bool(items)
         and verified_container_rollouts == len(items)
+    )
+    portable_build_context_ready = (
+        supports_bundle_feature(
+            str(manifest.get("version")), "portable_build_context"
+        )
+        and bool(items)
+        and verified_portable_build_contexts == len(items)
     )
     container_reward_calibration_ready = (
         supports_bundle_feature(
@@ -1610,6 +1650,7 @@ def verify_bundle(
         "task_family_split_ready": family_split_ready,
         "generation_provenance_ready": generation_provenance_ready,
         "container_rollout_ready": container_rollout_ready,
+        "portable_build_context_ready": portable_build_context_ready,
         "container_reward_calibration_ready": container_reward_calibration_ready,
         "provider_identity_ready": provider_identity_ready,
         "task_lineage_ready": task_lineage_ready,

@@ -1221,7 +1221,7 @@ restore_final_acceptance_evidence() {
 }
 
 required_sandbox_files=(
-  app.py task_impl.py tools.json development_plan.json runtime_llm.py sandbox_runtime.py Dockerfile docker_build.sh docker_run.sh
+  app.py task_impl.py tools.json development_plan.json runtime_llm.py sandbox_runtime.py Dockerfile .dockerignore docker_build.sh docker_run.sh
   requirements-dev.txt acceptance.sh IMPLEMENTATION_REPORT.md
 )
 
@@ -1231,7 +1231,7 @@ required_sandbox_files=(
 platform_owned_files=(
   task.json BUILD_CONTRACT.json development_plan.json tools.json app.py
   runtime_llm.py sandbox_runtime.py acceptance_runner.py acceptance.sh
-  Dockerfile docker_build.sh docker_run.sh requirements-dev.txt
+  Dockerfile .dockerignore docker_build.sh docker_run.sh requirements-dev.txt
 )
 
 snapshot_platform_assets() {

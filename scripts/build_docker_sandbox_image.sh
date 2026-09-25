@@ -161,6 +161,12 @@ awk -v image="$selected" '
 # Make the portable source identical to the context whose image is measured.
 # In particular, COPY . . must not embed the earlier floating-tag Dockerfile.
 cp "$resolved_dockerfile" "$dockerfile"
+context_report="$(python3 "$script_dir/validate_docker_context.py" "$context")" || {
+  echo "Docker 构建上下文不符合可移植/敏感文件隔离契约：$context" >&2
+  exit 3
+}
+echo "$context_report"
+build_context_sha256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["context_sha256"])' "$context_report")"
 docker build --pull --file "$dockerfile" --tag "$tag" "$context"
 # Keep a machine-readable image provenance record beside the sandbox.
 image_id="$(docker image inspect --format '{{.Id}}' "$tag")"
@@ -233,7 +239,7 @@ Path(sys.argv[2]).write_text(
 PY
 python3 - "$context/docker_image_metadata.json" "$tag" "$selected" "$image_id" \
   "$image_os" "$image_arch" "$image_user" "$dockerfile" "$context/requirements-dev.txt" \
-  "$context/python_packages.json" <<'PY'
+  "$context/python_packages.json" "$build_context_sha256" <<'PY'
 import hashlib
 import json
 import sys
@@ -244,7 +250,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 Path(sys.argv[1]).write_text(json.dumps({
-    "version": "4.0",
+    "version": "5.0",
     "tag": sys.argv[2],
     "base_image": sys.argv[3],
     "image_id": sys.argv[4],
@@ -253,6 +259,7 @@ Path(sys.argv[1]).write_text(json.dumps({
     "dockerfile_sha256": digest(sys.argv[8]),
     "requirements_sha256": digest(sys.argv[9]),
     "python_packages_sha256": digest(sys.argv[10]),
+    "build_context_sha256": sys.argv[11],
     "smoke_test": {
         "passed": True,
         "command": "python3 -m pytest -q -p no:cacheprovider",

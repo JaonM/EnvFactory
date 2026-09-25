@@ -7,6 +7,8 @@ import unittest
 import subprocess
 
 from env_factory.material_artifacts import (
+    DOCKERIGNORE_SOURCE,
+    docker_build_context_digest,
     digest_json,
     evidence_artifact_digests,
     portable_artifact_digests,
@@ -121,13 +123,19 @@ class MaterialExportTest(unittest.TestCase):
             "legacy_manifest_relocations": [],
         }))
         (sandbox / "app.py").write_text("# portable runtime\n")
+        (sandbox / ".dockerignore").write_text(DOCKERIGNORE_SOURCE)
+        nested = sandbox / "business" / "rules"
+        nested.mkdir(parents=True)
+        (nested / "engine.py").write_text("VALUE = 1\n")
+        (nested / "config.json").write_text('{"enabled":true}\n')
         (sandbox / "Dockerfile").write_text(
             "FROM python@sha256:" + "a" * 64 + "\nUSER sandbox\n"
         )
         (sandbox / "docker_image_metadata.json").write_text(json.dumps({
-            "version": "4.0",
+            "version": "5.0",
             "image_id": "sha256:" + "d" * 64,
             "runtime_user": "sandbox",
+            "build_context_sha256": docker_build_context_digest(sandbox),
             "smoke_test": {
                 "passed": True,
                 "read_only_root": True,
@@ -386,6 +394,7 @@ class MaterialExportTest(unittest.TestCase):
             self.assertTrue(report["production_contract_ready"])
             self.assertTrue(report["consumer_records_ready"])
             self.assertTrue(report["container_rollout_ready"])
+            self.assertTrue(report["portable_build_context_ready"])
             record = json.loads((bundle / "transitions.jsonl").read_text())
             self.assertEqual(record["transition"]["reward"], 1.0)
             self.assertEqual(record["episode_final_reward"], 1.0)
@@ -454,6 +463,9 @@ class MaterialExportTest(unittest.TestCase):
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
             )
             copied_app = next((bundle / "environments").glob("*/app.py"))
+            copied_environment = copied_app.parent
+            self.assertTrue((copied_environment / "business/rules/engine.py").is_file())
+            self.assertTrue((copied_environment / "business/rules/config.json").is_file())
             copied_app.write_text("# tampered\n")
             changed = exporter.verify_bundle(bundle)
             self.assertFalse(changed["verified"])
@@ -1156,6 +1168,8 @@ class MaterialExportTest(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest))
             report = exporter.verify_bundle(bundle)
             self.assertFalse(report["verified"])
+            self.assertFalse(report["portable_build_context_ready"])
+            self.assertIn("portable_build_context", report["failed_gates"])
             self.assertIn(
                 "environment_reconstruction_contract", report["failed_gates"]
             )

@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
+from .material_artifacts import docker_build_context_digest
+
 
 FIELDS = {
     "version", "mode", "container_image_id", "transport", "read_only_root",
@@ -15,7 +17,8 @@ FIELDS = {
 
 
 def valid_container_rollout_execution(
-    rollout: Mapping[str, Any] | Any, sandbox_root: Path
+    rollout: Mapping[str, Any] | Any, sandbox_root: Path, *,
+    require_build_context: bool = True,
 ) -> bool:
     if not isinstance(rollout, Mapping):
         return False
@@ -42,10 +45,20 @@ def valid_container_rollout_execution(
         )
     except (OSError, json.JSONDecodeError):
         return False
+    context_digest = None
+    if require_build_context:
+        try:
+            context_digest = docker_build_context_digest(sandbox_root)
+        except (OSError, ValueError):
+            return False
     smoke = metadata.get("smoke_test", {}) if isinstance(metadata, Mapping) else {}
     return (
         isinstance(metadata, Mapping)
-        and metadata.get("version") == "4.0"
+        and metadata.get("version") in ({"5.0"} if require_build_context else {"4.0", "5.0"})
+        and (
+            not require_build_context
+            or metadata.get("build_context_sha256") == context_digest
+        )
         and metadata.get("image_id") == execution["container_image_id"]
         and isinstance(metadata.get("runtime_user"), str)
         and metadata["runtime_user"] not in {"", "root", "0"}

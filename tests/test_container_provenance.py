@@ -6,6 +6,10 @@ import unittest
 import importlib.util
 
 from env_factory.container_provenance import verify_container_provenance
+from env_factory.material_artifacts import (
+    DOCKERIGNORE_SOURCE,
+    docker_build_context_digest,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +46,7 @@ class ContainerProvenanceTest(unittest.TestCase):
         )
 
     def fixture(self, root: Path):
+        (root / ".dockerignore").write_text(DOCKERIGNORE_SOURCE)
         image = "registry.example/python@sha256:" + "a" * 64
         dockerfile = root / "Dockerfile"
         requirements = root / "requirements-dev.txt"
@@ -56,7 +61,7 @@ class ContainerProvenanceTest(unittest.TestCase):
             ],
         }))
         metadata = {
-            "version": "4.0",
+            "version": "5.0",
             "tag": "fixture",
             "base_image": image,
             "image_id": "sha256:" + "b" * 64,
@@ -65,6 +70,7 @@ class ContainerProvenanceTest(unittest.TestCase):
             "dockerfile_sha256": hashlib.sha256(dockerfile.read_bytes()).hexdigest(),
             "requirements_sha256": hashlib.sha256(requirements.read_bytes()).hexdigest(),
             "python_packages_sha256": hashlib.sha256(packages.read_bytes()).hexdigest(),
+            "build_context_sha256": docker_build_context_digest(root),
             "smoke_test": {
                 "passed": True,
                 "network": "none",
@@ -101,6 +107,26 @@ class ContainerProvenanceTest(unittest.TestCase):
             report = verify_container_provenance(root)
             self.assertFalse(report["verified"])
             self.assertIn("container_smoke_test", report["failed_gates"])
+
+    def test_dockerignore_drift_breaks_reproducibility(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            (root / ".dockerignore").write_text(".git\n")
+            report = verify_container_provenance(root)
+            self.assertFalse(report["verified"])
+            self.assertIn("dockerignore_contract", report["failed_gates"])
+
+    def test_nested_source_change_breaks_build_context_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            nested = root / "business" / "rules"
+            nested.mkdir(parents=True)
+            (nested / "engine.py").write_text("VALUE = 2\n")
+            report = verify_container_provenance(root)
+            self.assertFalse(report["verified"])
+            self.assertIn("build_context_digest", report["failed_gates"])
 
     def test_floating_base_image_and_dependency_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

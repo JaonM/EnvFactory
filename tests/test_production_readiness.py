@@ -11,6 +11,10 @@ from env_factory.sandbox_scoring import (
     valid_score_report,
 )
 from env_factory.task_quality import score_file
+from env_factory.material_artifacts import (
+    DOCKERIGNORE_SOURCE,
+    docker_build_context_digest,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -277,6 +281,7 @@ class ProductionReadinessTest(unittest.TestCase):
         evidence = root / "evidence"
         evidence.mkdir()
         (evidence / "app.py").write_text("# immutable sandbox\n")
+        (evidence / ".dockerignore").write_text(DOCKERIGNORE_SOURCE)
         pinned_image = "registry.example/python@sha256:" + "c" * 64
         (evidence / "Dockerfile").write_text(
             f"FROM {pinned_image}\nUSER sandbox\n"
@@ -287,7 +292,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "packages": [{"name": "pytest", "version": "9.1.1"}],
         }))
         (evidence / "docker_image_metadata.json").write_text(json.dumps({
-            "version": "4.0",
+            "version": "5.0",
             "tag": "fixture",
             "base_image": pinned_image,
             "image_id": "sha256:" + "d" * 64,
@@ -302,6 +307,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "python_packages_sha256": __import__("hashlib").sha256(
                 (evidence / "python_packages.json").read_bytes()
             ).hexdigest(),
+            "build_context_sha256": docker_build_context_digest(evidence),
             "smoke_test": {
                 "passed": True,
                 "network": "none",
@@ -1386,6 +1392,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "task_family_split_ready": True,
             "generation_provenance_ready": True,
             "container_rollout_ready": True,
+            "portable_build_context_ready": True,
             "container_reward_calibration_ready": True,
             "provider_identity_ready": True,
             "task_lineage_ready": True,
@@ -1409,6 +1416,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "task_family_split_ready": True,
             "generation_provenance_ready": True,
             "container_rollout_ready": True,
+            "portable_build_context_ready": True,
             "container_reward_calibration_ready": True,
             "provider_identity_ready": True,
             "task_lineage_ready": True,

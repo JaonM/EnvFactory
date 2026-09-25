@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from env_factory.task_routing import TRAINING_CATEGORIES, training_contract
+from env_factory.material_artifacts import DOCKERIGNORE_SOURCE
 
 
 ROOT = Path(__file__).parents[1]
@@ -57,6 +58,9 @@ class BuildWorkflowTest(unittest.TestCase):
             self.assertTrue((root / "acceptance.sh").stat().st_mode & 0o111)
             self.assertTrue((root / "acceptance_runner.py").is_file())
             self.assertTrue((root / "IMPLEMENTATION_REPORT.md").is_file())
+            self.assertEqual(
+                (root / ".dockerignore").read_text(), DOCKERIGNORE_SOURCE
+            )
             docker_run = (root / "docker_run.sh").read_text(encoding="utf-8")
             self.assertIn("--read-only", docker_run)
             self.assertIn("--cap-drop ALL", docker_run)

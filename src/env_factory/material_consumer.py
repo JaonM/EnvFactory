@@ -32,6 +32,7 @@ FEATURE_VERSIONS = {
     "model_response_provenance": {"15.0", "16.0"},
     "model_response_authorization": {"16.0"},
     "consumer_record_validation": {"16.0"},
+    "portable_build_context": {"16.0"},
 }
 
 
@@ -282,6 +283,11 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
             } if supports_lineage else {}),
             "docker_build_context": "environments/{item_id}",
             "dockerfile": "environments/{item_id}/Dockerfile",
+            **({
+                "dockerignore": "environments/{item_id}/.dockerignore",
+            } if supports_bundle_feature(
+                bundle_version, "portable_build_context"
+            ) else {}),
             "runtime_interface_source": "task.json#requirements.runtime_interface",
         },
         "visibility": {
@@ -332,5 +338,11 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
                 if supports_trajectory_purpose else []
             ),
             *(["generated_task_equals_runtime_task"] if supports_lineage else []),
+            *(
+                ["portable_inventory_covers_complete_docker_build_context"]
+                if supports_bundle_feature(
+                    bundle_version, "portable_build_context"
+                ) else []
+            ),
         ],
     }

@@ -120,6 +120,8 @@ transition JSON Schema、记录顺序、任务生成来源、环境重建入口�
 内部使用边界会同实际 transition 交叉验证，不能通过重新计算 manifest 哈希伪造更宽泛的认证结论。
 每条 transition 还必须通过独立消费者记录校验；消息和 transition 都采用精确字段集合，不能夹带未声明的
 trainer-only 元数据。
+环境交付同时要求 `portable_build_context_ready`：平台规范化 `.dockerignore`，递归清点全部 Docker 重建
+输入，并拒绝凭证文件、运行数据库、reviewer 日志、符号链接和未声明隐藏路径进入构建上下文。
 导出的验收 rollout 会被机器标记为认证证据而非已认证的直接策略优化目标；生产准备认证覆盖环境的
 新鲜 rollout 采集能力，不替代下游算法对轨迹用途的审批。
 每次 Agent 与 User Simulator/Reward Judge 的外部响应还会保存实际返回模型的聚合 provenance 和响应 ID

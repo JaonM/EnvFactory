@@ -80,9 +80,12 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
   安全 smoke 容器还会使用 `importlib.metadata` 导出排序后的实际 Python 分发包名称与版本到
   `python_packages.json`；认证器复核其摘要、结构、唯一性，并确认每个无条件直接 pin 的安装版本一致。
   该 inventory 用于依赖可追溯，不等同于漏洞扫描、许可证判断或 SBOM 法务审批。
+  Docker 构建前还必须通过平台持有的 `.dockerignore` 契约：凭证文件、运行数据库、日志、reviewer 输出和
+  认证证据不得进入 `COPY . .` 上下文，构建目录内禁止符号链接及未声明隐藏路径。
   pytest 通过后还必须在同一安全边界内按镜像默认命令启动服务，并从容器网络命名空间内验证
   `/health`。`/app/.runtime` 使用显式 UID/GID 与权限的 tmpfs，使非 root 进程能够创建 episode SQLite；
-  只有测试通过但服务无法启动的镜像不能生成当前 v4 容器 provenance。
+  只有测试通过但服务无法启动的镜像不能生成当前 v5 容器 provenance。v5 还绑定规范化完整构建上下文
+  SHA-256，镜像构建后的源码或配置漂移会使认证失败。
 - 工具契约、真实业务结果、mutation resistance 和奖励反事实全部通过。
 - 奖励反事实集合由每个冻结任务的成功轨迹、工具数量、依赖要求和噪声场景推导，不能由报告自行挑选；
   必须覆盖适用的无工具回答、每个工具的参数破坏、每个依赖步骤的跳过、依赖乱序和噪声选择。缺失 case
@@ -181,6 +184,11 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 `bundle_sha256` 再次校验；导出失败或包校验失败时，即使此前统计门禁通过，也不会产生
 `production_prepared_for_agentic_rl`。
 
+Bundle v16 会递归清点 `.dockerignore` 允许进入镜像的完整构建上下文，而不再只复制预定义文件名；嵌套
+Python 包、任务扩展和 JSON 配置都会按内容摘要进入环境目录。导出后验证器重新计算该清单并验证规范化
+`.dockerignore`、Dockerfile 与所有重建输入均存在；因此“源目录曾经构建成功但便携包遗漏运行文件”不能
+获得 `portable_build_context_ready`。
+
 便携包验证器还会从每个环境内的原始 `live_rollout.json` 重新生成预期 transition 流，并与
 `transitions.jsonl` 逐条精确比较。校验范围包含 item/episode/step 引用、模型身份、parsed action 与原始
 输出的一致性、observation 链、reward、usage 以及 terminated/truncated 终止语义，防止只重算文件哈希
@@ -195,7 +203,7 @@ Bundle v16 还包含 `consumer_contract.json`：以 JSON Schema 固定 transitio
 记录身份与排序、环境目录和 Docker 重建入口、运行接口来源，以及 policy input/output、环境反馈和
 trainer-only 证据边界。验证器使用内置规范与文件逐项比较；即使同时修改契约并重算所有外层哈希，也不能
 把 trainer-only 字段伪装成策略输入。Bundle v16 还要求每个环境携带并校验
-`agentic_training_value_live.json` 的容器执行身份；rollout 与奖励校准都必须匹配同一份 v4 镜像
+`agentic_training_value_live.json` 的容器执行身份；rollout 与奖励校准都必须匹配同一份 v5 镜像
 provenance，并重新读取 `data_governance.json` 复核 Agent、User Simulator 与 Reward Judge 的模型和
 provider 摘要授权，并校验 `task_lineage.json`。Bundle v16 还从每次 Agent 响应和 trainer-only runtime
 replay 重算 provider 实际返回的模型分布与响应 ID 摘要；配置的模型别名不能再替代实际响应 provenance，

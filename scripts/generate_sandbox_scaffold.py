@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse, json
 from pathlib import Path
 
+from env_factory.material_artifacts import DOCKERIGNORE_SOURCE
+
 APP_SOURCE = '''#!/usr/bin/env python3
 from __future__ import annotations
 import argparse, json
@@ -296,6 +298,7 @@ def generate(root: Path, *, preserve_implementation: bool = False) -> None:
     if not scaffold_test.exists():
         scaffold_test.write_text(SCAFFOLD_TEST_SOURCE, encoding="utf-8")
     (root / "Dockerfile").write_text(DOCKERFILE_SOURCE, encoding="utf-8")
+    (root / ".dockerignore").write_text(DOCKERIGNORE_SOURCE, encoding="utf-8")
     for name, source in (("docker_build.sh", DOCKER_BUILD_SOURCE), ("docker_run.sh", DOCKER_RUN_SOURCE)):
         path = root / name
         path.write_text(source, encoding="utf-8")

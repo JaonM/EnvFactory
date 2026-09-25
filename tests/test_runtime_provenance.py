@@ -4,15 +4,21 @@ import tempfile
 import unittest
 
 from env_factory.runtime_provenance import valid_container_rollout_execution
+from env_factory.material_artifacts import (
+    DOCKERIGNORE_SOURCE,
+    docker_build_context_digest,
+)
 
 
 class RuntimeProvenanceTest(unittest.TestCase):
     def evidence(self, root: Path):
         image_id = "sha256:" + "a" * 64
+        (root / ".dockerignore").write_text(DOCKERIGNORE_SOURCE)
         (root / "docker_image_metadata.json").write_text(json.dumps({
-            "version": "4.0",
+            "version": "5.0",
             "image_id": image_id,
             "runtime_user": "sandbox",
+            "build_context_sha256": docker_build_context_digest(root),
             "smoke_test": {
                 "passed": True,
                 "read_only_root": True,
