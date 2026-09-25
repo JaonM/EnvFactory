@@ -542,6 +542,11 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertTrue(report["gates"]["execution_environment"])
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
             self.assertEqual(report["materials_manifest"]["version"], "4.0")
+            self.assertRegex(
+                report["measurements"]["sandbox_executable_revalidation"]
+                    ["evidence_set_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
             self.assertEqual(
                 report["materials_manifest"]["evaluator_source_digest"],
                 "evaluator-source-v1",
@@ -727,7 +732,10 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["gates"]["sandbox_executable_revalidation"])
             self.assertEqual(
                 report["measurements"]["sandbox_executable_revalidation"],
-                {"verified": 0, "expected": 900, "failures": 900},
+                {
+                    "verified": 0, "expected": 900, "failures": 900,
+                    "evidence_set_sha256": None,
+                },
             )
 
     def test_revalidated_score_must_match_the_frozen_score_envelope(self):
@@ -749,7 +757,11 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["sandbox_executable_revalidation"])
             self.assertEqual(
-                report["measurements"]["sandbox_executable_revalidation"],
+                {
+                    key: value for key, value in
+                    report["measurements"]["sandbox_executable_revalidation"].items()
+                    if key != "evidence_set_sha256"
+                },
                 {"verified": 899, "expected": 900, "failures": 1},
             )
 

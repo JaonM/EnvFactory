@@ -704,6 +704,7 @@ def certify(
     structurally_verified_sandbox_scores: set[int] = set()
     verified_sandbox_scores: set[int] = set()
     executable_revalidated_scores: set[int] = set()
+    executable_revalidation_digests: dict[int, str] = {}
     sandbox_score_failures = []
     executable_revalidation_failures = []
     sandbox_revalidation = sandbox_revalidation or {}
@@ -746,6 +747,9 @@ def certify(
         )
         if executable_verified:
             executable_revalidated_scores.add(id(item))
+            executable_revalidation_digests[id(item)] = digest_json(
+                score_envelope(rerun)
+            )
         structurally_verified = (
             stored == claimed
             and valid_score_report(
@@ -1176,6 +1180,10 @@ def certify(
                 + len(executable_revalidation_failures)
             ),
             "failures": len(executable_revalidation_failures),
+            "evidence_set_sha256": (
+                digest_json(sorted(executable_revalidation_digests.values()))
+                if executable_revalidation_digests else None
+            ),
         },
         "final_result_provenance": {
             "verified": len(verified_final_results),

@@ -27,6 +27,8 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
   的沙箱验收、pytest、外层 conformance、mutation、readiness 和 agentic-value 检查，并要求重跑得到的
   检查状态、总分、模型身份和证据指纹与冻结报告一致。缺少重跑结果、超时或重跑漂移均不能获得认证；
   `--revalidation-workers` 和 `--revalidation-timeout` 只控制并发与单沙箱时间预算，不能跳过该门禁。
+  认证报告保存所有重跑语义 envelope 摘要组成的有序集合 SHA-256；该值不含本机路径和执行日志，并随
+  最终便携包签名，用于识别认证实际采用的整批重验结果。
 - 最终样本分数也不是可信输入。认证器先从原始 episode 重建 rollout 结论，再按照
   `min(10, 0.9 × 离线沙箱分 + rollout质量分)` 重算最终分；只有声明的 `passed` 和分数均与重算结果一致
   时，样本才能进入训练素材清单。
