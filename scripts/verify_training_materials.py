@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
+import re
 from typing import Any, Callable, Mapping
 
 from env_factory.material_artifacts import (
@@ -19,6 +21,70 @@ from env_factory.material_artifacts import (
 from env_factory.execution_provenance import valid_execution_provenance
 from env_factory.generation_provenance import valid_generation_provenance
 from env_factory.certification_policy import valid_certification_policy
+
+
+V5_ITEM_FIELDS = {
+    "task_path",
+    "task_sha256",
+    "sandbox_root",
+    "sandbox_evidence_fingerprint",
+    "sandbox_artifacts_sha256",
+    "sandbox_evidence_sha256",
+    "category",
+    "score",
+    "rollout_sha256",
+    "episode_count",
+    "successful_episodes",
+    "generation_provenance",
+}
+TRAINING_CATEGORIES = {
+    "direct_response", "simple_agentic", "multi_step_agentic",
+}
+
+
+def _integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _v5_item_errors(item: Mapping[str, Any], policy: Mapping[str, Any]) -> list[str]:
+    errors = []
+    score = item.get("score")
+    episode_count = item.get("episode_count")
+    successful_episodes = item.get("successful_episodes")
+    generation = item.get("generation_provenance")
+    score_threshold = (
+        policy.get("score_threshold") if isinstance(policy, Mapping) else None
+    )
+    if set(item) != V5_ITEM_FIELDS:
+        errors.append("fields")
+    for field in ("task_sha256", "sandbox_evidence_fingerprint", "rollout_sha256"):
+        if re.fullmatch(r"[0-9a-f]{64}", str(item.get(field, ""))) is None:
+            errors.append(field)
+    if item.get("category") not in TRAINING_CATEGORIES:
+        errors.append("category")
+    if (
+        not isinstance(score, (int, float))
+        or isinstance(score, bool)
+        or not isinstance(score_threshold, (int, float))
+        or isinstance(score_threshold, bool)
+        or not math.isfinite(float(score))
+        or not float(score_threshold) <= float(score) <= 10.0
+    ):
+        errors.append("score")
+    if (
+        not _integer(episode_count)
+        or episode_count < 0
+        or not _integer(successful_episodes)
+        or not 0 <= successful_episodes <= episode_count
+    ):
+        errors.append("episode_counts")
+    if (
+        not valid_generation_provenance(generation)
+        or generation.get("task_sha256") != item.get("task_sha256")
+        or generation.get("training_category") != item.get("category")
+    ):
+        errors.append("generation_provenance")
+    return sorted(set(errors))
 
 
 def verify_artifact_digests(root: Path, expected: Mapping[str, Any]) -> list[str]:
@@ -96,10 +162,19 @@ def verify(
         })
     seen = set()
     seen_roots = set()
+    seen_tasks = set()
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
             failures.append({"gate": "manifest_schema", "item": index})
             continue
+        if version == MATERIAL_MANIFEST_VERSION:
+            item_errors = _v5_item_errors(item, policy)
+            if item_errors:
+                failures.append({
+                    "gate": "manifest_item_schema",
+                    "item": index,
+                    "message": f"invalid v5 item fields: {item_errors}",
+                })
         task = Path(str(item.get("task_path", "")))
         root = Path(str(item.get("sandbox_root", "")))
         resolved_root = str(root.resolve())
@@ -113,6 +188,9 @@ def verify(
             continue
         if task_digest != item.get("task_sha256"):
             failures.append({"gate": "task_digest", "item": index})
+        if item.get("task_sha256") in seen_tasks:
+            failures.append({"gate": "duplicate_task_identity", "item": index})
+        seen_tasks.add(item.get("task_sha256"))
         expected_fingerprint = item.get("sandbox_evidence_fingerprint")
         artifact_hashes = item.get("sandbox_artifacts_sha256")
         if version in {"2.0", "3.0", "4.0", MATERIAL_MANIFEST_VERSION} and not (
@@ -168,6 +246,15 @@ def verify(
         episodes = rollout.get("episodes", []) if isinstance(rollout, Mapping) else []
         if len(episodes) != item.get("episode_count"):
             failures.append({"gate": "episode_count", "item": index})
+        successful_episodes = sum(
+            episode.get("agent_success") is True
+            for episode in episodes if isinstance(episode, Mapping)
+        )
+        if (
+            version == MATERIAL_MANIFEST_VERSION
+            and successful_episodes != item.get("successful_episodes")
+        ):
+            failures.append({"gate": "successful_episode_count", "item": index})
     return {
         "verified": not failures,
         "items": len(items),

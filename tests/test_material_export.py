@@ -482,6 +482,21 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(changed["verified"])
             self.assertIn("bundle_files", changed["failed_gates"])
 
+    def test_export_rejects_rehashed_source_episode_success_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            manifest = certification["materials_manifest"]
+            manifest["items"][0]["successful_episodes"] = 0
+            manifest["dataset_sha256"] = digest_json({
+                key: value for key, value in manifest.items()
+                if key != "dataset_sha256"
+            })
+            with self.assertRaisesRegex(
+                ValueError, "source material verification failed"
+            ):
+                exporter.export_bundle(certification, root / "bundle", ROOT)
+
     def test_transition_termination_must_match_user_simulator_decision(self):
         with tempfile.TemporaryDirectory() as directory:
             certification = self.source(Path(directory))
