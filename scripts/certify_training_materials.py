@@ -161,8 +161,13 @@ def valid_user_turn(step: Mapping[str, Any]) -> bool:
 
 
 def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, Any]:
-    holdout = history.get("holdout")
-    jobs = holdout.get("jobs", []) if isinstance(holdout, Mapping) else []
+    raw_holdouts = history.get("holdouts")
+    if isinstance(raw_holdouts, list) and raw_holdouts:
+        holdouts = [item for item in raw_holdouts if isinstance(item, Mapping)]
+    else:
+        holdout = history.get("holdout")
+        holdouts = [holdout] if isinstance(holdout, Mapping) else []
+    jobs = [job for holdout in holdouts for job in holdout.get("jobs", [])]
     results = [job.get("result", {}) for job in jobs if isinstance(job, Mapping)]
     total = len(results)
     generated = [item for item in results if Path(str(item.get("task_path", ""))).is_file()]
@@ -266,6 +271,70 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         counterfactuals["positive_errors"] / counterfactuals["positive_total"]
         if counterfactuals["positive_total"] else 1.0
     )
+    batch_measurements = []
+    for batch in holdouts:
+        batch_results = [
+            job.get("result", {}) for job in batch.get("jobs", [])
+            if isinstance(job, Mapping)
+        ]
+        batch_total = len(batch_results)
+        batch_generated = sum(
+            Path(str(item.get("task_path", ""))).is_file() for item in batch_results
+        )
+        batch_task_good = [
+            item for item in batch_results
+            if item.get("task_score", {}).get("eligible") is True
+            and item.get("task_score", {}).get("score", 0) >= policy["score_threshold"]
+        ]
+        batch_built = [
+            item for item in batch_task_good
+            if item.get("sandbox_score", {}).get("passed") is True
+            and item.get("sandbox_score", {}).get("score", 0) >= policy["score_threshold"]
+        ]
+        batch_qualified = [
+            item for item in batch_results
+            if item.get("passed") is True
+            and item.get("score", 0) >= policy["score_threshold"]
+        ]
+        batch_categories = {}
+        for category in sorted({str(item.get("category", "unknown")) for item in batch_results}):
+            members = [
+                item for item in batch_results
+                if str(item.get("category", "unknown")) == category
+            ]
+            count = sum(item in batch_qualified for item in members)
+            batch_categories[category] = count / len(members) if members else 0.0
+        task_rate = len(batch_task_good) / batch_total if batch_total else 0.0
+        build_rate = len(batch_built) / len(batch_task_good) if batch_task_good else 0.0
+        e2e_rate = len(batch_qualified) / batch_total if batch_total else 0.0
+        batch_passed = (
+            batch_generated >= policy["min_tasks"]
+            and batch.get("summary", {}).get("fresh_tasks_verified") is True
+            and task_rate >= policy["min_task_yield"]
+            and wilson_lower(len(batch_task_good), batch_total)
+                >= policy["min_task_yield_ci95_lower"]
+            and build_rate >= policy["min_build_yield"]
+            and wilson_lower(len(batch_built), len(batch_task_good))
+                >= policy["min_build_yield_ci95_lower"]
+            and e2e_rate >= policy["min_end_to_end_rate"]
+            and wilson_lower(len(batch_qualified), batch_total)
+                >= policy["min_end_to_end_ci95_lower"]
+            and bool(batch_categories)
+            and all(rate >= policy["min_category_rate"] for rate in batch_categories.values())
+        )
+        batch_measurements.append({
+            "batch": batch.get("holdout_batch"),
+            "requested": batch_total,
+            "generated": batch_generated,
+            "task_good_yield": task_rate,
+            "task_good_yield_ci95_lower": wilson_lower(len(batch_task_good), batch_total),
+            "sandbox_build_yield": build_rate,
+            "sandbox_build_yield_ci95_lower": wilson_lower(len(batch_built), len(batch_task_good)),
+            "end_to_end_rate": e2e_rate,
+            "end_to_end_ci95_lower": wilson_lower(len(batch_qualified), batch_total),
+            "by_category": batch_categories,
+            "passed": batch_passed,
+        })
     material_items = []
     for item in qualified:
         task_path = Path(str(item.get("task_path", "")))
@@ -333,17 +402,22 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "reward_counterfactuals": counterfactuals,
         "reward_false_positive_rate": false_positive_rate,
         "reward_false_negative_rate": false_negative_rate,
-        "fresh_holdout_verified": (
-            holdout.get("summary", {}).get("fresh_tasks_verified") is True
-            if isinstance(holdout, Mapping) else False
+        "fresh_holdout_verified": bool(holdouts) and all(
+            item.get("summary", {}).get("fresh_tasks_verified") is True
+            for item in holdouts
         ),
+        "holdout_batches": batch_measurements,
         "material_manifest_items": len(material_items),
     }
 
     gates = {
         "materialized_sample_size": (
-            len(task_documents) >= policy["min_tasks"]
+            len(task_documents) >= policy["min_tasks"] * policy["min_holdout_batches"]
             and len(task_documents) == len(generated)
+        ),
+        "independent_holdout_batches": (
+            len(batch_measurements) >= policy["min_holdout_batches"]
+            and all(item["passed"] for item in batch_measurements)
         ),
         "fresh_holdout": measurements["fresh_holdout_verified"],
         "task_good_yield": (
@@ -404,6 +478,7 @@ def default_policy() -> dict[str, Any]:
     return {
         "score_threshold": 8.0,
         "min_tasks": 300,
+        "min_holdout_batches": 3,
         "min_task_yield": 0.90,
         "min_task_yield_ci95_lower": 0.85,
         "min_build_yield": 0.90,
@@ -413,7 +488,7 @@ def default_policy() -> dict[str, Any]:
         "min_category_rate": 0.75,
         "max_near_duplicate_rate": 0.05,
         "min_episodes_per_qualified_sandbox": 10,
-        "min_total_episodes": 2500,
+        "min_total_episodes": 7500,
         "max_environment_error_rate": 0.001,
         "max_reward_false_positive_rate": 0.005,
         "max_reward_false_negative_rate": 0.02,

@@ -277,7 +277,7 @@ def round_numbers(max_rounds):
     return itertools.count(1) if max_rounds == 0 else range(1, max_rounds + 1)
 
 
-def run_holdout(project, root, config, previous_reports):
+def run_holdout(project, root, config, previous_reports, *, batch_number=1):
     """Run one fresh, stricter release set after development targets converge."""
     holdout_root = root / "holdout"
     holdout_config = dict(config)
@@ -289,11 +289,11 @@ def run_holdout(project, root, config, previous_reports):
         rollout_episodes=config["holdout_rollout_episodes"],
         rollout_min_success_rate=config["holdout_rollout_success_rate"],
     )
-    report_path = holdout_root / "round-01" / "round_report.json"
+    report_path = holdout_root / f"round-{batch_number:02d}" / "round_report.json"
     report = (
         json.loads(report_path.read_text())
         if report_path.exists()
-        else {"round": 1, "state": "running"}
+        else {"round": batch_number, "state": "running"}
     )
     if report.get("state") != "complete":
         report = run_round(project, holdout_root, holdout_config, report)
@@ -323,6 +323,7 @@ def run_holdout(project, root, config, previous_reports):
         ),
     )
     report["phase"] = "holdout"
+    report["holdout_batch"] = batch_number
     write_json(report_path, report)
     return report
 
@@ -592,7 +593,7 @@ def main():
     parser.add_argument(
         "--max-total-seconds",
         type=int,
-        default=172800,
+        default=259200,
         help="实验的累计活跃运行时间预算；暂停期间不计时",
     )
     parser.add_argument("--validation", choices=("offline", "live"), default="live")
@@ -608,6 +609,7 @@ def main():
         help="pilot 仅执行候选门禁；production 追加生产级训练素材准备认证",
     )
     parser.add_argument("--holdout-count", type=int, default=400)
+    parser.add_argument("--holdout-batches", type=int, default=3)
     parser.add_argument("--holdout-end-to-end-rate", type=float, default=0.85)
     parser.add_argument("--holdout-rollout-episodes", type=int, default=10)
     parser.add_argument("--holdout-rollout-success-rate", type=float, default=2 / 3)
@@ -629,7 +631,7 @@ def main():
     if not 0 <= args.infrastructure_retries <= 3:
         parser.error("infrastructure retries must be between 0 and 3")
     for key in ("max_concurrency", "max_attempts", "route_attempts", "consecutive_rounds",
-                "build_timeout", "score_timeout", "generation_timeout", "rollout_episodes", "rollout_steps", "rollout_timeout", "max_total_seconds", "holdout_count", "holdout_rollout_episodes", "holdout_seed_offset"):
+                "build_timeout", "score_timeout", "generation_timeout", "rollout_episodes", "rollout_steps", "rollout_timeout", "max_total_seconds", "holdout_count", "holdout_batches", "holdout_rollout_episodes", "holdout_seed_offset"):
         if getattr(args, key) <= 0:
             parser.error(f"{key} must be positive")
     for key in ("target_task_yield", "target_build_yield", "target_end_to_end_rate", "target_category_rate",
@@ -639,9 +641,10 @@ def main():
     if not args.threshold <= args.target_qualified_mean <= 10:
         parser.error("target_qualified_mean must be between threshold and 10")
     if args.certification_profile == "production" and (
-        args.holdout_count < 300 or args.holdout_rollout_episodes < 10
+        args.holdout_count < 300 or args.holdout_batches < 3
+        or args.holdout_rollout_episodes < 10
     ):
-        parser.error("production certification requires at least 300 holdout requests and 10 episodes per sandbox")
+        parser.error("production certification requires 3 batches, 300 requests per batch and 10 episodes per sandbox")
     project = args.project.resolve()
     from dotenv import load_dotenv
     load_dotenv(project / ".env")
@@ -743,16 +746,30 @@ def main():
                 if time.time() >= PROCESS_DEADLINE:
                     finish_active_budget("active_time_budget")
                     return 1
-                holdout = run_holdout(project, root, config, reports)
+                holdouts = []
+                previous_evidence = list(reports)
+                batch_count = (
+                    args.holdout_batches if args.certification_profile == "production" else 1
+                )
+                for batch_number in range(1, batch_count + 1):
+                    holdout = run_holdout(
+                        project, root, config, previous_evidence,
+                        batch_number=batch_number,
+                    )
+                    holdouts.append(holdout)
+                    previous_evidence.append(holdout)
                 history = {
                     "config": config, "stop_reason": "certification_pending",
                     "consecutive_passes": streak,
                     "live_rollout_verified": (
                         summary["live_rollout_verified"]
-                        and holdout["summary"]["all_episodes_environment_clean"]
-                        and holdout["summary"]["all_episodes_fallback_free"]
+                        and all(
+                            item["summary"]["all_episodes_environment_clean"]
+                            and item["summary"]["all_episodes_fallback_free"]
+                            for item in holdouts
+                        )
                     ),
-                    "rounds": reports, "holdout": holdout,
+                    "rounds": reports, "holdout": holdouts[0], "holdouts": holdouts,
                 }
                 if args.certification_profile == "production":
                     from certify_training_materials import (
@@ -778,11 +795,14 @@ def main():
                     )
                     history["production_readiness"] = certification
                 else:
-                    passed = holdout["summary"]["target_met"]
+                    passed = holdouts[0]["summary"]["target_met"]
                     reason = "holdout_target_met" if passed else "holdout_failed"
                 history["stop_reason"] = reason
                 write_json(root / "history.json", history)
-                print(json.dumps({"stop_reason": reason, **holdout["summary"]}, ensure_ascii=False))
+                print(json.dumps({
+                    "stop_reason": reason,
+                    "holdout_batches": [item["summary"] for item in holdouts],
+                }, ensure_ascii=False))
                 finish_active_budget(reason)
                 return 0 if passed else 1
             if reason == "round_budget":

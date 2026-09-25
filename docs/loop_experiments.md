@@ -19,8 +19,9 @@ uv run python scripts/run_sandbox_build_loop.py \
 ```
 
 `--max-rounds 0` 是默认值，表示开发阶段没有轮数上限；仍受累计活跃时间预算和人工暂停控制。
-默认 `--certification-profile production` 使用 400 个留出请求，要求至少形成 300 个全新任务；
-每个合格沙箱执行至少 10 次 rollout。留出集采用独立 seed、从零构建，内容和 seed 不得与开发轮
+默认 `--certification-profile production` 连续执行 3 个独立批次，每批使用 400 个留出请求并要求
+至少形成 300 个全新任务；每个合格沙箱执行至少 10 次 rollout。各批次采用独立 seed、从零构建，
+内容和 seed 不得与开发轮或其他留出批次
 重复。完成后由 `scripts/certify_training_materials.py` 根据置信区间、类别覆盖、重复率、运行时隔离、
 奖励反事实和轨迹完整性生成 `production_readiness.json`。只有停止原因
 `production_prepared_for_agentic_rl` 表示生产级训练素材准备认证通过。
@@ -28,7 +29,8 @@ uv run python scripts/run_sandbox_build_loop.py \
 需要快速验证候选实现时，可显式使用
 `--certification-profile pilot --holdout-count 30 --holdout-rollout-episodes 3 --holdout-end-to-end-rate 0.70`。
 Pilot 通过只表示可以进入更大规模认证，
-不能表示生产准备完成。两种留出集都只执行一次，失败后保留证据并退出，不能回流调参后继续冒充留出集。
+不能表示生产准备完成。Pilot 只执行一个批次；生产认证的三个批次均为一次性留出集，失败后保留证据
+并退出，不能回流调参后继续冒充留出集。
 
 固定回归集可使用 `--task-ids 45,78,92,175`，不能与 `--generate-count` 混用。
 `--build-mode repair` 允许固定任务继承上轮扩展实现，不复制 SQLite 状态及验收报告；其结果表示修复能力，不表示从零构建能力。新任务始终不继承旧任务实现。
@@ -42,7 +44,7 @@ Pilot 通过只表示可以进入更大规模认证，
   `--holdout-rollout-success-rate 0.6666666666666666`。
 - live 模式的最终 10 分由离线可执行证据占 9 分、真实 rollout 占 1 分组成；任何 live 硬失败仍直接取消训练资格，不能依靠离线高分抵消。
 - `--build-timeout`、`--generation-timeout`、`--score-timeout`、`--rollout-timeout` 分阶段限时，超时清理进程组。
-- `--max-total-seconds` 默认 172800，只累计实验进程的活跃执行时间；正常暂停不消耗预算。`runtime_state.json` 保存累计活跃时间和运行状态。质量循环不再因“停滞”或固定 20 轮提前结束；显式设置正数 `--max-rounds` 才启用轮数预算。基础设施超时属于异常中止而非质量收敛。
+- `--max-total-seconds` 默认 259200，只累计实验进程的活跃执行时间；正常暂停不消耗预算。`runtime_state.json` 保存累计活跃时间和运行状态。质量循环不再因“停滞”或固定 20 轮提前结束；显式设置正数 `--max-rounds` 才启用轮数预算。基础设施超时属于异常中止而非质量收敛。
 - 同一个实验目录只允许一个运行进程；每个任务完成即原子保存。相同命令重启可恢复，不重复执行已经完成的任务；未完成构建使用新的 attempt 目录。中断的生成不会自动重新抽样，缺失任务计为失败。
 - 代码、配置或固定输入变化时必须换实验目录，以免把不同版本的结果混为一谈。旧版 history 不能直接作为新实验续跑。
 
