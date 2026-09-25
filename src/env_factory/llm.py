@@ -1,8 +1,11 @@
 """Configurable LLM wrapper for OpenAI-compatible chat APIs."""
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from http.client import IncompleteRead
+import hashlib
 import json
 import os
 import time
@@ -14,6 +17,52 @@ from dotenv import load_dotenv
 
 
 load_dotenv()
+
+
+_TRACE: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "envfactory_llm_trace", default=None
+)
+
+
+@contextmanager
+def capture_llm_trace():
+    """Capture response metadata in the current task context, never payload text."""
+    records: list[dict[str, Any]] = []
+    token = _TRACE.set(records)
+    try:
+        yield records
+    finally:
+        _TRACE.reset(token)
+
+
+def summarize_llm_trace(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    models: dict[str, int] = {}
+    finishes: dict[str, int] = {}
+    usage: dict[str, float | int] = {}
+    response_ids = []
+    for record in records:
+        model = str(record.get("model", ""))
+        finish = str(record.get("finish_reason", ""))
+        if model:
+            models[model] = models.get(model, 0) + 1
+        if finish:
+            finishes[finish] = finishes.get(finish, 0) + 1
+        response_id = record.get("response_id")
+        if isinstance(response_id, str) and response_id:
+            response_ids.append(hashlib.sha256(response_id.encode("utf-8")).hexdigest())
+        values = record.get("usage")
+        if isinstance(values, Mapping):
+            for name, value in values.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    usage[str(name)] = usage.get(str(name), 0) + value
+    return {
+        "version": "1.0",
+        "responses": len(records),
+        "models": dict(sorted(models.items())),
+        "finish_reasons": dict(sorted(finishes.items())),
+        "usage": dict(sorted(usage.items())),
+        "response_id_sha256": sorted(response_ids),
+    }
 
 
 class LLMError(RuntimeError):
@@ -138,7 +187,7 @@ class LLMClient:
         try:
             choice = payload["choices"][0]
             message = choice["message"]
-            return LLMResponse(
+            normalized = LLMResponse(
                 content=message.get("content") or "",
                 model=str(payload.get("model", self.model)),
                 id=payload.get("id"),
@@ -146,6 +195,15 @@ class LLMClient:
                 reasoning_content=message.get("reasoning_content"),
                 usage=payload.get("usage"),
             )
+            trace = _TRACE.get()
+            if trace is not None:
+                trace.append({
+                    "model": normalized.model,
+                    "response_id": normalized.id,
+                    "finish_reason": normalized.finish_reason,
+                    "usage": dict(normalized.usage or {}),
+                })
+            return normalized
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError("LLM response has an unexpected shape") from exc
 

@@ -65,7 +65,9 @@ Pilot 通过只表示可以进入更大规模认证，
   同样拒绝恢复。快照不采集主机名、路径、环境变量或密钥。旧版 history 不能直接作为新实验续跑。
 
 `experiment.json` 保存配置及代码/输入指纹；每个生成请求在模型调用前写入
-`sample_manifest.json`，记录 batch index、route、run seed、sample seed 和可用环境能力。
+`sample_manifest.json`，记录 batch index、route、run seed、sample seed、可用环境能力和生成 provider。
+每次 route attempt 还记录实际响应模型计数、finish reason、token usage 与 provider response ID 哈希；
+不保存 prompt、响应正文、凭证或原始 response ID。生产认证会独立验证 provider、seed 和 attempt 链。
 生成失败时保留目录并写入 `failure.json`，不会再删除失败样本的身份和归因证据。
 `round-*/round_report.json` 保存任务状态；`history.json` 同时保存生成完成率、任务良品率、
 条件构建良品率、端到端良品率、合格样本均分、分类型统计和停止原因。
@@ -105,8 +107,8 @@ status 和 termination reasoning 属于 trainer-only metadata。便携 JSONL 采
 `training_materials_bundle/`。该包使用相对路径和内容摘要，可直接迁移到后续 RL 数据转换/训练系统；
 仅存在指向本机输出目录的清单不再足以触发生产准备停止原因。包验证器会从原始 rollout 重建
 transition 投影并验证 episode/step/终止关系；它证明训练素材可摄取，不宣称已经执行 RL 训练。
-Bundle v7 内置 `certification.json`、`dataset_card.json` 和机器可读 `consumer_contract.json`；后者固定
-transition JSON Schema、记录顺序、环境重建入口以及 policy/trainer 可见性边界。数据集卡的构成统计、模型偏差、用途限制与
+Bundle v8 内置 `certification.json`、`dataset_card.json` 和机器可读 `consumer_contract.json`；后者固定
+transition JSON Schema、记录顺序、任务生成来源、环境重建入口以及 policy/trainer 可见性边界。数据集卡的构成统计、模型偏差、用途限制与
 内部使用边界会同实际 transition 交叉验证，不能通过重新计算 manifest 哈希伪造更宽泛的认证结论。
 生产 profile 还必须传入 `--bundle-signing-private-key` 与 `--bundle-trusted-public-key`（或在 `.env` 中设置
 `ENVFACTORY_BUNDLE_SIGNING_PRIVATE_KEY`、`ENVFACTORY_BUNDLE_TRUSTED_PUBLIC_KEY`）。私钥应由组织密钥管理

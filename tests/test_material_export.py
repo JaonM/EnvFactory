@@ -30,6 +30,43 @@ exporter = load_exporter()
 
 
 class MaterialExportTest(unittest.TestCase):
+    def generation_provenance(self):
+        return {
+            "version": "1.0",
+            "task_id": "task-1",
+            "batch_index": 1,
+            "run_seed": 100,
+            "sample_seed": 101,
+            "task_sha256": "PLACEHOLDER",
+            "training_category": "simple_agentic",
+            "resolved_task_intent": "tool_execution",
+            "hops": 3,
+            "generator_provider": {
+                "host": "generator.example",
+                "model": "generator-model",
+                "identity_sha256": "c" * 64,
+            },
+            "generation_settings": {
+                "route_attempt_limit": 3,
+                "timeout_seconds": 60.0,
+                "network_retries": 2,
+            },
+            "successful_attempt": 1,
+            "attempts": [{
+                "attempt": 1,
+                "seed": 101,
+                "status": "completed",
+                "llm_trace": {
+                    "version": "1.0",
+                    "responses": 2,
+                    "models": {"generator-model": 2},
+                    "finish_reasons": {"stop": 2},
+                    "usage": {"total_tokens": 42},
+                    "response_id_sha256": ["d" * 64, "e" * 64],
+                },
+            }],
+        }
+
     def signing_keys(self, root: Path) -> tuple[Path, Path]:
         private = root / "private.pem"
         public = root / "public.pem"
@@ -106,9 +143,11 @@ class MaterialExportTest(unittest.TestCase):
             "rollout_sha256": digest_json(rollout),
             "episode_count": 1,
             "successful_episodes": 1,
+            "generation_provenance": self.generation_provenance(),
         }
+        item["generation_provenance"]["task_sha256"] = item["task_sha256"]
         manifest = {
-            "version": "3.0",
+            "version": "4.0",
             "kind": "agentic_rl_pretraining_materials",
             "evaluator_source_digest": "source",
             "execution_provenance": collect_execution_provenance(ROOT),
@@ -120,6 +159,8 @@ class MaterialExportTest(unittest.TestCase):
             "scope": "pre_training_material_readiness",
             "certified": True,
             "does_not_certify": [
+                "rl_training_execution",
+                "downstream_training_system_compatibility",
                 "rl_training_convergence",
                 "post_training_policy_improvement",
                 "cross_model_generalization",
@@ -156,6 +197,14 @@ class MaterialExportTest(unittest.TestCase):
             self.assertEqual(card["composition"]["items"], 1)
             self.assertEqual(card["composition"]["transitions"], 1)
             self.assertEqual(
+                card["composition"]["task_generation"]["configured_models"],
+                {"generator-model": 1},
+            )
+            self.assertEqual(
+                card["composition"]["task_generation"]["actual_response_models"],
+                {"generator-model": 2},
+            )
+            self.assertEqual(
                 card["distribution_status"],
                 "internal_only_until_legal_and_security_review",
             )
@@ -172,7 +221,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "7.0")
+            self.assertEqual(contract["bundle_version"], "8.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -224,6 +273,25 @@ class MaterialExportTest(unittest.TestCase):
             report = exporter.verify_bundle(bundle)
             self.assertFalse(report["verified"])
             self.assertIn("dataset_card", report["failed_gates"])
+
+    def test_bundle_verifier_rejects_rehashed_generation_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["items"][0]["generation_provenance"]["sample_seed"] = 999
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertIn("generation_provenance", report["failed_gates"])
 
     def test_bundle_verifier_rejects_rehashed_environment_claim(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -295,10 +363,14 @@ class MaterialExportTest(unittest.TestCase):
             manifest.pop("consumer_contract_file")
             manifest["items"][0].pop("split")
             manifest["items"][0].pop("task_family_id")
+            manifest["items"][0].pop("generation_provenance")
             transition_path = bundle / "transitions.jsonl"
             record = json.loads(transition_path.read_text())
             record.pop("split")
             record.pop("task_family_id")
+            record.pop("generation_model")
+            record.pop("generation_provider_identity_sha256")
+            record.pop("generation_sample_seed")
             transition_path.write_text(json.dumps(record) + "\n")
             manifest["files_sha256"].pop("consumer_contract.json")
             manifest["files_sha256"]["transitions.jsonl"] = exporter.file_sha256(
@@ -336,10 +408,14 @@ class MaterialExportTest(unittest.TestCase):
             manifest.pop("attestation")
             manifest["items"][0].pop("split")
             manifest["items"][0].pop("task_family_id")
+            manifest["items"][0].pop("generation_provenance")
             transition_path = bundle / "transitions.jsonl"
             record = json.loads(transition_path.read_text())
             record.pop("split")
             record.pop("task_family_id")
+            record.pop("generation_model")
+            record.pop("generation_provider_identity_sha256")
+            record.pop("generation_sample_seed")
             transition_path.write_text(json.dumps(record) + "\n")
             manifest["files_sha256"]["consumer_contract.json"] = exporter.file_sha256(
                 contract_path

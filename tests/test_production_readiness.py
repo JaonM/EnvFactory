@@ -121,6 +121,11 @@ class ProductionReadinessTest(unittest.TestCase):
             for index in range(count):
                 global_index = batch * count + index
                 task = root / f"task-{global_index}.json"
+                category = (
+                    "direct_response" if index % 10 < 2
+                    else "simple_agentic" if index % 10 < 5
+                    else "multi_step_agentic"
+                )
                 # A digest-like description avoids intentionally triggering the
                 # semantic near-duplicate detector in this passing fixture.
                 description = __import__("hashlib").sha256(
@@ -128,11 +133,52 @@ class ProductionReadinessTest(unittest.TestCase):
                 ).hexdigest().translate(str.maketrans("0123456789", "ghijklmnop"))
                 task.write_text(json.dumps({
                     "task": description,
+                    "training_category": category,
                     "artifacts": {"data_manifest": {"data_governance": {
                         "origin": "model_generated_synthetic",
                         "contains_real_user_data": False,
                         "intended_use": "agentic_rl_training_material",
                     }}},
+                }))
+                sample_seed = global_index + 1000
+                sample_manifest = root / f"sample-{global_index}.json"
+                sample_manifest.write_text(json.dumps({
+                    "version": "2.0",
+                    "status": "completed",
+                    "task_id": f"task-{global_index}",
+                    "batch_index": index + 1,
+                    "run_seed": batch + 10,
+                    "sample_seed": sample_seed,
+                    "task_sha256": __import__("hashlib").sha256(
+                        task.read_bytes()
+                    ).hexdigest(),
+                    "training_category": category,
+                    "resolved_task_intent": "fixture_intent",
+                    "hops": 3,
+                    "successful_attempt": 1,
+                    "generator_provider": {
+                        "host": "generator.example",
+                        "model": "generator-model",
+                        "identity_sha256": "c" * 64,
+                    },
+                    "generation_settings": {
+                        "route_attempt_limit": 3,
+                        "timeout_seconds": 60.0,
+                        "network_retries": 2,
+                    },
+                    "attempts": [{
+                        "attempt": 1,
+                        "seed": sample_seed,
+                        "status": "completed",
+                        "llm_trace": {
+                            "version": "1.0",
+                            "responses": 2,
+                            "models": {"generator-model": 2},
+                            "finish_reasons": {"stop": 2},
+                            "usage": {"total_tokens": 42},
+                            "response_id_sha256": ["d" * 64, "e" * 64],
+                        },
+                    }],
                 }))
                 episodes = [
                 {
@@ -181,12 +227,9 @@ class ProductionReadinessTest(unittest.TestCase):
                 result = {
                     "task_path": str(task), "output": str(evidence),
                     "container_image_tag": "fixture",
-                    "sample_seed": global_index + 1000,
-                    "category": (
-                        "direct_response" if index % 10 < 2
-                        else "simple_agentic" if index % 10 < 5
-                        else "multi_step_agentic"
-                    ),
+                    "sample_seed": sample_seed,
+                    "sample_manifest": str(sample_manifest),
+                    "category": category,
                     "task_score": {"eligible": True, "score": 9},
                     "sandbox_score": {
                         "passed": True, "score": 9,
@@ -221,6 +264,11 @@ class ProductionReadinessTest(unittest.TestCase):
                 "execution_provenance": certifier.verify_execution_provenance(
                     ROOT, {}
                 )["current"],
+                "generation_provider": {
+                    "host": "generator.example",
+                    "model": "generator-model",
+                    "identity_sha256": "c" * 64,
+                },
             },
             "holdout": holdouts[0], "holdouts": holdouts,
         }
@@ -235,6 +283,11 @@ class ProductionReadinessTest(unittest.TestCase):
             report = certifier.certify(history, certifier.default_policy())
             self.assertTrue(report["certified"], report["failed_gates"])
             self.assertEqual(report["scope"], "pre_training_material_readiness")
+            self.assertIn("rl_training_execution", report["does_not_certify"])
+            self.assertIn(
+                "downstream_training_system_compatibility",
+                report["does_not_certify"],
+            )
             self.assertIn("rl_training_convergence", report["does_not_certify"])
             self.assertEqual(report["measurements"]["episodes"], 9000)
             self.assertTrue(report["gates"]["rollout_provenance"])
@@ -245,7 +298,7 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertTrue(report["gates"]["trajectory_privacy"])
             self.assertTrue(report["gates"]["execution_environment"])
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
-            self.assertEqual(report["materials_manifest"]["version"], "3.0")
+            self.assertEqual(report["materials_manifest"]["version"], "4.0")
             self.assertEqual(
                 report["materials_manifest"]["evaluator_source_digest"],
                 "evaluator-source-v1",
@@ -260,6 +313,19 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["execution_environment"])
             self.assertIn("execution_environment", report["failed_gates"])
+
+    def test_task_generation_provider_drift_breaks_certification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            sample_manifest = Path(result["sample_manifest"])
+            value = json.loads(sample_manifest.read_text())
+            value["generator_provider"]["identity_sha256"] = "f" * 64
+            sample_manifest.write_text(json.dumps(value))
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["generation_provenance"])
+            self.assertIn("generation_provenance", report["failed_gates"])
 
     def test_pilot_sized_holdout_cannot_claim_production_certification(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -452,6 +518,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "trusted_attestation": True,
             "dataset_split_ready": True,
             "task_family_split_ready": True,
+            "generation_provenance_ready": True,
             "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
@@ -461,6 +528,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "trusted_attestation": True,
             "dataset_split_ready": True,
             "task_family_split_ready": True,
+            "generation_provenance_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])
@@ -478,6 +546,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "trusted_attestation": True,
             "dataset_split_ready": True,
             "task_family_split_ready": True,
+            "generation_provenance_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertFalse(report["certified"])

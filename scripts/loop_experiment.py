@@ -838,11 +838,16 @@ def main():
         "project", "output", "task_root", "task_ids",
         "bundle_signing_private_key", "bundle_trusted_public_key",
     }}
+    from env_factory.data_governance import provider_identity
     config.update(project=str(project), task_paths=list(map(str, paths)), model=MODEL,
                   source_digest=source_digest(project), input_digests=[input_digest(path) for path in paths],
                   execution_provenance=collect_execution_provenance(project),
                   bundle_attestation_key_identity_sha256=bundle_key_identity,
                   generation_model=os.getenv("LLM_MODEL"), runtime_model=os.getenv("SANDBOX_LLM_MODEL") or os.getenv("LLM_MODEL"),
+                  generation_provider=provider_identity(
+                      os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+                      os.getenv("LLM_MODEL", ""),
+                  ),
                   provider_digest=hashlib.sha256(json.dumps([os.getenv("LLM_BASE_URL"), os.getenv("SANDBOX_LLM_BASE_URL")]).encode()).hexdigest())
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)

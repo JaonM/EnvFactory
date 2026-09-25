@@ -13,7 +13,7 @@ CERTIFICATION_FILE = "certification.json"
 DATASET_CARD_FILE = "dataset_card.json"
 CONSUMER_CONTRACT_FILE = "consumer_contract.json"
 BUNDLE_SIGNATURE_FILE = "bundle_manifest.sig"
-BUNDLE_VERSION = "7.0"
+BUNDLE_VERSION = "8.0"
 DATASET_SPLITS = ("train", "validation", "test")
 
 
@@ -46,15 +46,20 @@ def assign_dataset_splits(items: list[dict[str, Any]]) -> dict[str, str]:
 
 def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
     """Return the exact portable handoff; consumers need no prompt conventions."""
-    supports_splits = bundle_version in {"6.0", BUNDLE_VERSION}
-    supports_families = bundle_version == BUNDLE_VERSION
+    supports_splits = bundle_version in {"6.0", "7.0", BUNDLE_VERSION}
+    supports_families = bundle_version in {"7.0", BUNDLE_VERSION}
+    supports_generation = bundle_version == BUNDLE_VERSION
     record_fields = [
         "schema_version", "item_id", "task_sha256", "category",
         "episode_index", "episode_seed", "episode_success",
         "episode_termination", "episode_initial_reward", "episode_final_reward",
         "agent_model", "runtime_model", "agent_usage",
         *(["split"] if supports_splits else []),
-        *(["task_family_id"] if supports_families else []), "transition",
+        *(["task_family_id"] if supports_families else []),
+        *([] if not supports_generation else [
+            "generation_model", "generation_provider_identity_sha256",
+            "generation_sample_seed",
+        ]), "transition",
     ]
     return {
         "version": "1.0",
@@ -88,6 +93,13 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
                             "type": "string", "pattern": "^[0-9a-f]{64}$",
                         }} if supports_families else {}
                     ),
+                    **({
+                        "generation_model": {"type": "string", "minLength": 1},
+                        "generation_provider_identity_sha256": {
+                            "type": "string", "pattern": "^[0-9a-f]{64}$",
+                        },
+                        "generation_sample_seed": {"type": "integer"},
+                    } if supports_generation else {}),
                     "episode_index": {"type": "integer", "minimum": 0},
                     "episode_seed": {"type": "integer"},
                     "episode_success": {"type": "boolean"},

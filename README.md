@@ -3,7 +3,8 @@
 任务生成与沙箱构建的可恢复循环、真实模型 rollout 和模型默认配置见 [循环工程实验](docs/loop_experiments.md)。
 
 项目当前以“生产级 Agentic RL 训练素材准备”为认证边界；指标、证据和结果语义见
-[训练素材生产准备认证](docs/production_readiness.md)。该认证不宣称 RL 已完成或训练后模型已经提升。
+[训练素材生产准备认证](docs/production_readiness.md)。EnvFactory 不执行 RL 训练；该认证只覆盖下游接入前
+的任务、环境、轨迹与奖励素材，不宣称能够直接开训、RL 已完成或训练后模型已经提升。
 
 生成契约、工具实现、持久化及验收的最新边界见 [一致性改造说明](docs/runtime_integrity.md)，其中区分静态评分、离线回归与真实训练 rollout 证据。
 

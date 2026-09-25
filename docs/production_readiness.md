@@ -1,8 +1,9 @@
 # Agentic RL 训练素材生产准备认证
 
 EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证明任务、沙箱、工具、业务状态、
-奖励和 rollout 轨迹可以作为后续 RL 系统的生产级输入。它不证明 RL 算法收敛、训练后策略提升，
-也不证明跨模型泛化；这些结论必须在接入训练框架后另行验证。
+奖励和 rollout 轨迹满足下游 RL 系统接入前的素材契约。EnvFactory 本身不执行 RL 训练，因此该状态
+不是“可直接开训”或训练平台上线认证；训练框架适配、算法兼容性、资源容量、RL 算法收敛、训练后
+策略提升和跨模型泛化都必须在下游系统另行验证。
 
 ## 认证硬门禁
 
@@ -39,6 +40,10 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 奖励反事实必须使用生产配置的真实 evaluator 重跑；mock 报告只用于离线构建测试，不能进入生产认证。
 - 每份 rollout 保存任务 SHA-256、沙箱可执行输入摘要、Agent/User/Judge 模型及 provider 摘要；认证时重新
   计算并拒绝把其他任务或沙箱的轨迹挂接到当前样本。
+- 每个成功任务保存任务生成 provider、配置模型、实际响应模型计数、逐次 route attempt seed、完成原因、
+  token usage 和 provider response ID 的 SHA-256；不保存 prompt、响应正文、凭证或原始 response ID。
+  认证器从冻结的 `sample_manifest.json` 独立重建该快照，拒绝模型身份、attempt 顺序、seed、任务类别或
+  响应计数不一致的样本。该溯源证明素材由声明的生成流程产生，不证明模型输出本身正确。
 - 每个任务必须声明业务数据为模型生成的合成数据且不包含真实用户数据。真实 rollout 前执行出站载荷
   审计，记录 Agent、User Simulator 和 Reward Judge 的 provider 身份与可见字段，扫描凭证及疑似 PII；
   发现凭证、缺少合成来源声明或缺少 provider 身份时禁止外发并取消样本资格。
@@ -102,10 +107,11 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 
 生产认证还会原子生成 `training_materials_bundle/`。该目录不保留本机绝对路径，按内容身份保存每个
 环境的任务、运行时代码、业务数据、验收证据和 `live_rollout.json`，并生成 `transitions.jsonl` 与
-`bundle_manifest.json`。Bundle v7 同时包含去除本机路径的 `certification.json`、机器可读
+`bundle_manifest.json`。Bundle v8 同时包含去除本机路径的 `certification.json`、机器可读
 `dataset_card.json`。JSONL 每行是一条可重建的 schema v2 transition，并携带任务、类别、episode、
-Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bundle_sha256` 再次校验；导出失败或包校验
-失败时，即使此前统计门禁通过，也不会产生 `production_prepared_for_agentic_rl`。
+任务生成模型与 provider 身份、生成 seed、Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与
+`bundle_sha256` 再次校验；导出失败或包校验失败时，即使此前统计门禁通过，也不会产生
+`production_prepared_for_agentic_rl`。
 
 便携包验证器还会从每个环境内的原始 `live_rollout.json` 重新生成预期 transition 流，并与
 `transitions.jsonl` 逐条精确比较。校验范围包含 item/episode/step 引用、模型身份、parsed action 与原始
@@ -113,7 +119,7 @@ Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bun
 就让语义损坏的轨迹通过。JSONL 由固定字段白名单投影产生；完整 trainer-only 证据仍保存在对应环境目录，
 并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。
 
-Bundle v7 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
+Bundle v8 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
 记录身份与排序、环境目录和 Docker 重建入口、运行接口来源，以及 policy input/output、环境反馈和
 trainer-only 证据边界。验证器使用内置规范与文件逐项比较；即使同时修改契约并重算所有外层哈希，也不能
 把 trainer-only 字段伪装成策略输入。历史 v3/v4 包仍可验证完整性，但不能满足当前生产认证的受信发布门禁。
@@ -146,8 +152,8 @@ uv run python scripts/verify_training_materials.py \
 
 验证器会分别重新计算任务文件、沙箱可移植文件树、rollout JSON 和整批清单摘要；任何文件变化、
 轨迹数量变化或重复沙箱身份都会返回非零退出码。评估器版本作为 provenance 固化，但后续评估器升级
-不会被误判成已认证沙箱遭到篡改。v1/v2 清单仍可按各自规则验证，但应重新认证并升级为包含执行环境
-provenance 的 v3 后再导入训练系统。
+不会被误判成已认证沙箱遭到篡改。v1/v2/v3 清单仍可按各自规则验证，但应重新认证并升级为同时包含
+执行环境和任务生成 provenance 的 v4 后再导入训练系统。
 
 迁移或导入训练平台后可独立验证便携包：
 

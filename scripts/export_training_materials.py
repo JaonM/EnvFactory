@@ -36,6 +36,7 @@ from env_factory.material_privacy import audit_rollout_privacy
 from env_factory.trajectory_schema import episode_errors, policy_transition
 from env_factory.execution_provenance import valid_execution_provenance
 from env_factory.task_similarity import task_family_ids
+from env_factory.generation_provenance import valid_generation_provenance
 
 
 def file_sha256(path: Path) -> str:
@@ -93,6 +94,28 @@ def _dataset_card(
         (str(item.get("category")), str(item.get("split"))) for item in items
     )
     family_count = len({str(item.get("task_family_id")) for item in items})
+    generation_configured_models = Counter(
+        str(item.get("generation_provenance", {}).get("generator_provider", {}).get("model"))
+        for item in items
+    )
+    generation_actual_models = Counter()
+    for item in items:
+        for attempt in item.get("generation_provenance", {}).get("attempts", []):
+            generation_actual_models.update(attempt.get("llm_trace", {}).get("models", {}))
+    generation_providers = Counter(
+        str(item.get("generation_provenance", {}).get("generator_provider", {}).get(
+            "identity_sha256"
+        ))
+        for item in items
+    )
+    generation_attempts = sum(
+        len(item.get("generation_provenance", {}).get("attempts", [])) for item in items
+    )
+    generation_responses = sum(
+        attempt.get("llm_trace", {}).get("responses", 0)
+        for item in items
+        for attempt in item.get("generation_provenance", {}).get("attempts", [])
+    )
     same_model_items = sum(
         count for (agent, runtime), count in model_pairs.items() if agent == runtime
     )
@@ -103,7 +126,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "1.3",
+        "version": "1.4",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -147,6 +170,13 @@ def _dataset_card(
             "task_families": family_count,
             "near_duplicate_items": len(items) - family_count,
             "cross_split_family_overlap": 0,
+            "task_generation": {
+                "configured_models": dict(sorted(generation_configured_models.items())),
+                "actual_response_models": dict(sorted(generation_actual_models.items())),
+                "provider_identities": dict(sorted(generation_providers.items())),
+                "attempts": generation_attempts,
+                "responses": generation_responses,
+            },
         },
         "data_boundary": {
             "origin": "model_generated_synthetic",
@@ -167,6 +197,7 @@ def _dataset_card(
 def _transition_records(
     item_id: str, item: Mapping[str, Any], rollout: Mapping[str, Any], *,
     split: str = "", task_family_id: str = "",
+    generation_provenance: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if rollout.get("schema_version") != "2.0":
         raise ValueError("rollout schema_version must be 2.0")
@@ -182,6 +213,10 @@ def _transition_records(
     if not isinstance(episodes, list) or not episodes:
         raise ValueError("rollout episodes must be non-empty")
     records = []
+    if generation_provenance is not None and not valid_generation_provenance(
+        generation_provenance
+    ):
+        raise ValueError("task generation provenance is invalid")
     for episode_index, episode in enumerate(episodes):
         errors = episode_errors(episode)
         if errors:
@@ -205,6 +240,13 @@ def _transition_records(
                 "agent_usage": episode["usage"][transition_index],
                 **({"split": split} if split else {}),
                 **({"task_family_id": task_family_id} if task_family_id else {}),
+                **({
+                    "generation_model": generation_provenance["generator_provider"]["model"],
+                    "generation_provider_identity_sha256": generation_provenance[
+                        "generator_provider"
+                    ]["identity_sha256"],
+                    "generation_sample_seed": generation_provenance["sample_seed"],
+                } if generation_provenance is not None else {}),
                 "transition": policy_transition(transition),
             })
     return records
@@ -221,8 +263,8 @@ def _export_bundle_uncommitted(
     if certification.get("material_verification", {}).get("verified") is not True:
         raise ValueError("source material verification is required before export")
     source_manifest = certification.get("materials_manifest")
-    if not isinstance(source_manifest, Mapping) or source_manifest.get("version") != "3.0":
-        raise ValueError("a v3 materials manifest is required")
+    if not isinstance(source_manifest, Mapping) or source_manifest.get("version") != "4.0":
+        raise ValueError("a v4 materials manifest is required")
     try:
         from verify_training_materials import verify
     except ModuleNotFoundError:
@@ -298,6 +340,13 @@ def _export_bundle_uncommitted(
             seen_item_ids.add(item_id)
             task_family_id = family_assignments[item_id]
             split = split_assignments[item_id]
+            generation = item.get("generation_provenance")
+            if (
+                not valid_generation_provenance(generation)
+                or generation.get("training_category") != item.get("category")
+                or generation.get("task_sha256") != item.get("task_sha256")
+            ):
+                raise ValueError(f"invalid task generation provenance for {item_id}")
             source_root = Path(str(item["sandbox_root"]))
             destination_root = output / "environments" / item_id
             copied = {}
@@ -325,6 +374,7 @@ def _export_bundle_uncommitted(
             records = _transition_records(
                 item_id, item, rollout, split=split,
                 task_family_id=task_family_id,
+                generation_provenance=generation,
             )
             for record in records:
                 stream.write(json.dumps(
@@ -346,6 +396,7 @@ def _export_bundle_uncommitted(
                 "category": item["category"],
                 "split": split,
                 "task_family_id": task_family_id,
+                "generation_provenance": generation,
                 "score": item["score"],
                 "task_sha256": item["task_sha256"],
                 "environment_path": f"environments/{item_id}",
@@ -438,7 +489,7 @@ def verify_bundle(
         failures.append("bundle_digest")
     if (
         manifest.get("version") not in {
-            "3.0", "4.0", "5.0", "6.0", BUNDLE_VERSION,
+            "3.0", "4.0", "5.0", "6.0", "7.0", BUNDLE_VERSION,
         }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
         or not isinstance(manifest.get("source_dataset_sha256"), str)
@@ -446,7 +497,7 @@ def verify_bundle(
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", "6.0", BUNDLE_VERSION,
+        "4.0", "5.0", "6.0", "7.0", BUNDLE_VERSION,
     }
     if production_contract_ready:
         try:
@@ -493,6 +544,8 @@ def verify_bundle(
         portable_certification = {}
         failures.append("portable_certification")
     required_limitations = {
+        "rl_training_execution",
+        "downstream_training_system_compatibility",
         "rl_training_convergence",
         "post_training_policy_improvement",
         "cross_model_generalization",
@@ -581,10 +634,17 @@ def verify_bundle(
         seen_item_ids.add(item_id)
         expected_family_id = recomputed_families.get(item_id, "")
         if (
-            manifest.get("version") == BUNDLE_VERSION
+            manifest.get("version") in {"7.0", BUNDLE_VERSION}
             and item.get("task_family_id") != expected_family_id
         ):
             failures.append("task_family_identity")
+        generation = item.get("generation_provenance")
+        if manifest.get("version") == BUNDLE_VERSION and (
+            not valid_generation_provenance(generation)
+            or generation.get("training_category") != item.get("category")
+            or generation.get("task_sha256") != item.get("task_sha256")
+        ):
+            failures.append("generation_provenance")
         try:
             environment = _safe_relative(str(item.get("environment_path", "")))
         except ValueError:
@@ -629,7 +689,10 @@ def verify_bundle(
                 item_id, item, rollout, split=str(item.get("split", "")),
                 task_family_id=(
                     expected_family_id
-                    if manifest.get("version") == BUNDLE_VERSION else ""
+                    if manifest.get("version") in {"7.0", BUNDLE_VERSION} else ""
+                ),
+                generation_provenance=(
+                    generation if manifest.get("version") == BUNDLE_VERSION else None
                 ),
             )
         except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
@@ -670,7 +733,7 @@ def verify_bundle(
             "category": str(item.get("category")),
             "task_family_id": (
                 recomputed_families.get(str(item.get("item_id")), "")
-                if manifest.get("version") == BUNDLE_VERSION else ""
+                if manifest.get("version") in {"7.0", BUNDLE_VERSION} else ""
             ),
         }
         for item in items if isinstance(item, Mapping)
@@ -682,7 +745,7 @@ def verify_bundle(
         (str(item.get("category")), str(item.get("split")))
         for item in items if isinstance(item, Mapping)
     )
-    if manifest.get("version") in {"6.0", BUNDLE_VERSION} and any(
+    if manifest.get("version") in {"6.0", "7.0", BUNDLE_VERSION} and any(
         item.get("split") != expected_splits.get(str(item.get("item_id")))
         for item in items if isinstance(item, Mapping)
     ):
@@ -704,10 +767,24 @@ def verify_bundle(
         family_categories.setdefault(family, set()).add(str(item.get("category")))
         family_splits.setdefault(family, set()).add(str(item.get("split")))
     family_split_ready = (
-        manifest.get("version") == BUNDLE_VERSION
+        manifest.get("version") in {"7.0", BUNDLE_VERSION}
         and bool(family_categories)
         and all(len(values) == 1 for values in family_categories.values())
         and all(len(values) == 1 for values in family_splits.values())
+    )
+    generation_values = [
+        item.get("generation_provenance")
+        for item in items if isinstance(item, Mapping)
+    ]
+    generation_seeds = [
+        value.get("sample_seed") for value in generation_values
+        if isinstance(value, Mapping)
+    ]
+    generation_provenance_ready = (
+        manifest.get("version") == BUNDLE_VERSION
+        and len(generation_values) == len(items)
+        and all(valid_generation_provenance(value) for value in generation_values)
+        and len(generation_seeds) == len(set(generation_seeds))
     )
     if (
         len(records) != manifest.get("transition_count")
@@ -741,10 +818,36 @@ def verify_bundle(
         for category in sorted(verified_category_names)
     }
     expected_family_count = len(set(recomputed_families.values()))
+    expected_generation_configured_models = Counter(
+        str(value.get("generator_provider", {}).get("model"))
+        for value in generation_values if isinstance(value, Mapping)
+    )
+    expected_generation_actual_models = Counter()
+    for value in generation_values:
+        if not isinstance(value, Mapping):
+            continue
+        for attempt in value.get("attempts", []):
+            expected_generation_actual_models.update(
+                attempt.get("llm_trace", {}).get("models", {})
+            )
+    expected_generation_providers = Counter(
+        str(value.get("generator_provider", {}).get("identity_sha256"))
+        for value in generation_values if isinstance(value, Mapping)
+    )
+    expected_generation_attempts = sum(
+        len(value.get("attempts", []))
+        for value in generation_values if isinstance(value, Mapping)
+    )
+    expected_generation_responses = sum(
+        attempt.get("llm_trace", {}).get("responses", 0)
+        for value in generation_values if isinstance(value, Mapping)
+        for attempt in value.get("attempts", [])
+    )
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "1.3" if manifest.get("version") == BUNDLE_VERSION
+            "1.4" if manifest.get("version") == BUNDLE_VERSION
+            else "1.3" if manifest.get("version") == "7.0"
             else "1.2" if manifest.get("version") == "6.0"
             else "1.1" if manifest.get("version") in {"4.0", "5.0"}
             else "1.0"
@@ -762,7 +865,7 @@ def verify_bundle(
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
             manifest.get("version") not in {
-                "4.0", "5.0", "6.0", BUNDLE_VERSION,
+                "4.0", "5.0", "6.0", "7.0", BUNDLE_VERSION,
             }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
         )
@@ -787,6 +890,19 @@ def verify_bundle(
                 and card_composition.get("near_duplicate_items")
                     == len(items) - expected_family_count
                 and card_composition.get("cross_split_family_overlap") == 0
+                and card_composition.get("task_generation") == {
+                    "configured_models": dict(
+                        sorted(expected_generation_configured_models.items())
+                    ),
+                    "actual_response_models": dict(
+                        sorted(expected_generation_actual_models.items())
+                    ),
+                    "provider_identities": dict(
+                        sorted(expected_generation_providers.items())
+                    ),
+                    "attempts": expected_generation_attempts,
+                    "responses": expected_generation_responses,
+                }
             )
         )
         and required_limitations <= card_limits
@@ -808,7 +924,7 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     attestation = manifest.get("attestation")
     trusted_attestation = (
-        manifest.get("version") in {"5.0", "6.0", BUNDLE_VERSION}
+        manifest.get("version") in {"5.0", "6.0", "7.0", BUNDLE_VERSION}
         and trusted_public_key is not None
         and verify_file(
             root / BUNDLE_MANIFEST,
@@ -829,6 +945,7 @@ def verify_bundle(
         "trusted_attestation": trusted_attestation,
         "dataset_split_ready": dataset_split_ready,
         "task_family_split_ready": family_split_ready,
+        "generation_provenance_ready": generation_provenance_ready,
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None

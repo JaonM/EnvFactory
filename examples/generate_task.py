@@ -2,6 +2,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import logging
 import os
@@ -29,6 +30,8 @@ from env_factory.task_routing import (
     parse_training_mix,
     select_training_intent,
 )
+from env_factory.data_governance import provider_identity
+from env_factory.llm import capture_llm_trace, summarize_llm_trace
 
 
 _TASK_DIR_PATTERN = re.compile(r"task-(\d+)")
@@ -228,11 +231,12 @@ def main() -> int:
             )
         )
         sample_seeds = [run_rng.randrange(0, 2**63) for _ in reserved_tasks]
+        generation_provider = provider_identity(llm.base_url, llm.model)
         for batch_index, ((task_number, task_dir), training_category, sample_seed) in enumerate(
             zip(reserved_tasks, routes, sample_seeds), start=1
         ):
             _write_json(task_dir / "sample_manifest.json", {
-                "version": "1.0",
+                "version": "2.0",
                 "task_id": f"task-{task_number}",
                 "batch_index": batch_index,
                 "run_seed": run_seed,
@@ -243,6 +247,12 @@ def main() -> int:
                 "requested_task_type": args.task_type,
                 "hops": args.hops,
                 "available_environment_modes": list(available_environment_modes),
+                "generator_provider": generation_provider,
+                "generation_settings": {
+                    "route_attempt_limit": args.route_attempts,
+                    "timeout_seconds": llm.timeout,
+                    "network_retries": llm.network_retries,
+                },
                 "status": "reserved",
                 "attempts": [],
             })
@@ -264,17 +274,25 @@ def main() -> int:
                     manifest_path = task_dir / "sample_manifest.json"
                     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                     attempt_seed = sample_seed + route_attempt - 1
+                    llm_trace = []
                     try:
-                        task = generator.generate(
-                            args.hops,
-                            args.task_type,
-                            args.task_style,
-                            artifact_dir=task_dir,
-                            task_intent=args.task_intent,
-                            training_category=training_category,
-                            seed=attempt_seed,
-                        )
-                        manifest["attempts"].append({"attempt": route_attempt, "seed": attempt_seed, "status": "completed"})
+                        with capture_llm_trace() as llm_trace:
+                            task = generator.generate(
+                                args.hops,
+                                args.task_type,
+                                args.task_style,
+                                artifact_dir=task_dir,
+                                task_intent=args.task_intent,
+                                training_category=training_category,
+                                seed=attempt_seed,
+                            )
+                        manifest["attempts"].append({
+                            "attempt": route_attempt,
+                            "seed": attempt_seed,
+                            "status": "completed",
+                            "llm_trace": summarize_llm_trace(llm_trace),
+                        })
+                        manifest["successful_attempt"] = route_attempt
                         manifest["status"] = "generated"
                         _write_json(manifest_path, manifest)
                         return task
@@ -287,6 +305,7 @@ def main() -> int:
                             "failure_class": _generation_failure_class(exc),
                             "error_type": type(exc).__name__,
                             "message": str(exc)[:2000],
+                            "llm_trace": summarize_llm_trace(llm_trace),
                         })
                         manifest["status"] = "retrying" if route_attempt < args.route_attempts else "failed"
                         _write_json(manifest_path, manifest)
@@ -411,6 +430,7 @@ def main() -> int:
                     "status": "completed",
                     "resolved_task_intent": task.task_intent,
                     "complexity": task.complexity,
+                    "task_sha256": hashlib.sha256(task_path.read_bytes()).hexdigest(),
                     "completed_at": datetime.now(timezone.utc).isoformat(),
                 })
                 _write_json(manifest_path, manifest)

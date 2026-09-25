@@ -35,6 +35,7 @@ from env_factory.data_governance import (
 from env_factory.container_provenance import verify_container_provenance
 from env_factory.execution_provenance import verify_execution_provenance
 from env_factory.task_similarity import near_duplicate_rate
+from env_factory.generation_provenance import generation_provenance_snapshot
 
 
 Z_95 = 1.959963984540054
@@ -338,6 +339,32 @@ def certify(
         (len(task_digests) - len(set(task_digests))) / len(task_digests)
         if task_digests else 1.0
     )
+    expected_generation_provider = history.get("config", {}).get(
+        "generation_provider"
+    )
+    if not isinstance(expected_generation_provider, Mapping):
+        expected_generation_provider = {}
+    generation_provenance: dict[str, dict[str, Any]] = {}
+    generation_failures = []
+    for item in generated:
+        task_path = Path(str(item.get("task_path", "")))
+        manifest_path = Path(str(item.get("sample_manifest", "")))
+        try:
+            task_document = load(task_path)
+            sample_manifest = load(manifest_path)
+            snapshot = generation_provenance_snapshot(
+                sample_manifest,
+                task_document,
+                expected_provider=expected_generation_provider,
+                expected_task_sha256=hashlib.sha256(task_path.read_bytes()).hexdigest(),
+            )
+            if snapshot["sample_seed"] != item.get("sample_seed"):
+                raise ValueError("result sample seed does not match generation manifest")
+            generation_provenance[str(task_path.resolve())] = snapshot
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            generation_failures.append({
+                "task_path": str(task_path), "error_type": type(exc).__name__,
+            })
 
     live_reports = [
         item.get("live_rollout") for item in built
@@ -525,12 +552,15 @@ def certify(
                 episode.get("agent_success") is True
                 for episode in item_episodes if isinstance(episode, Mapping)
             ) if isinstance(item_episodes, list) else 0,
+            "generation_provenance": generation_provenance.get(
+                str(task_path.resolve())
+            ),
         })
     material_fingerprints = [
         item["sandbox_evidence_fingerprint"] for item in material_items
     ]
     material_manifest = {
-        "version": "3.0",
+        "version": "4.0",
         "kind": "agentic_rl_pretraining_materials",
         "evaluator_source_digest": history.get("config", {}).get("source_digest"),
         "execution_provenance": recorded_execution,
@@ -609,6 +639,11 @@ def certify(
         "fresh_holdout_evidence": holdout_freshness,
         "holdout_batches": batch_measurements,
         "material_manifest_items": len(material_items),
+        "generation_provenance": {
+            "verified": len(generation_provenance),
+            "expected": len(generated),
+            "failures": generation_failures,
+        },
         "execution_environment": execution_verification,
     }
 
@@ -666,6 +701,12 @@ def certify(
         ],
         "trajectory_privacy": measurements["trajectory_privacy"]["all_verified"],
         "execution_environment": execution_verification["verified"],
+        "generation_provenance": (
+            bool(generated)
+            and len(generation_provenance) == len(generated)
+            and not generation_failures
+            and all(item.get("generation_provenance") for item in material_items)
+        ),
         "material_identity": (
             len(material_items) == len(qualified)
             and len(material_fingerprints) == len(set(material_fingerprints))
@@ -683,6 +724,8 @@ def certify(
         "scope": "pre_training_material_readiness",
         "certified": not failed,
         "does_not_certify": [
+            "rl_training_execution",
+            "downstream_training_system_compatibility",
             "rl_training_convergence",
             "post_training_policy_improvement",
             "cross_model_generalization",
@@ -750,6 +793,7 @@ def attach_bundle_verification(
         and verification.get("trusted_attestation") is True
         and verification.get("dataset_split_ready") is True
         and verification.get("task_family_split_ready") is True
+        and verification.get("generation_provenance_ready") is True
         and verification.get("source_dataset_sha256")
         == report.get("materials_manifest", {}).get("dataset_sha256")
     )
