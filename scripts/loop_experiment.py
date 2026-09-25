@@ -210,6 +210,7 @@ def summarize(results, threshold, *, targets=None):
 def summarize_holdout(
     results, threshold, *, expected_count, end_to_end_target,
     rollout_success_target, previous_seeds=(), previous_task_digests=(),
+    minimum_materialized=None,
 ):
     """Apply the stricter, distribution-shifted release gate."""
     summary = summarize(results, threshold)
@@ -227,13 +228,16 @@ def summarize_holdout(
         path = Path(item.get("task_path", ""))
         if path.is_file():
             task_digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    minimum_materialized = (
+        expected_count if minimum_materialized is None else minimum_materialized
+    )
     fresh_tasks_verified = (
         len(results) == expected_count
         and all(isinstance(seed, int) for seed in seeds)
         and len(set(seeds)) == expected_count
         and set(seeds).isdisjoint(previous_seeds)
-        and len(task_digests) == expected_count
-        and len(set(task_digests)) == expected_count
+        and len(task_digests) >= minimum_materialized
+        and len(set(task_digests)) == len(task_digests)
         and set(task_digests).isdisjoint(previous_task_digests)
     )
     qualified_rollout_floor_met = bool(qualified_results) and all(
@@ -251,6 +255,7 @@ def summarize_holdout(
     )
     summary.update({
         "holdout_expected": expected_count,
+        "holdout_minimum_materialized": minimum_materialized,
         "fresh_tasks_verified": fresh_tasks_verified,
         "rollout_success_target": rollout_success_target,
         "qualified_rollout_floor_met": qualified_rollout_floor_met,
@@ -281,6 +286,7 @@ def run_holdout(project, root, config, previous_reports):
         task_paths=[],
         build_mode="clean",
         experiment_seed=config["experiment_seed"] + config["holdout_seed_offset"],
+        rollout_episodes=config["holdout_rollout_episodes"],
         rollout_min_success_rate=config["holdout_rollout_success_rate"],
     )
     report_path = holdout_root / "round-01" / "round_report.json"
@@ -311,6 +317,10 @@ def run_holdout(project, root, config, previous_reports):
         rollout_success_target=config["holdout_rollout_success_rate"],
         previous_seeds=previous_seeds,
         previous_task_digests=previous_task_digests,
+        minimum_materialized=(
+            300 if config.get("certification_profile") == "production"
+            else config["holdout_count"]
+        ),
     )
     report["phase"] = "holdout"
     write_json(report_path, report)
@@ -582,7 +592,7 @@ def main():
     parser.add_argument(
         "--max-total-seconds",
         type=int,
-        default=21600,
+        default=172800,
         help="实验的累计活跃运行时间预算；暂停期间不计时",
     )
     parser.add_argument("--validation", choices=("offline", "live"), default="live")
@@ -593,8 +603,13 @@ def main():
         "--rollout-min-success-rate", type=float, default=0.0,
         help="第一阶段每个沙箱的最低 rollout 成功率；0 保留至少一次成功语义",
     )
-    parser.add_argument("--holdout-count", type=int, default=30)
-    parser.add_argument("--holdout-end-to-end-rate", type=float, default=0.70)
+    parser.add_argument(
+        "--certification-profile", choices=("pilot", "production"), default="production",
+        help="pilot 仅执行候选门禁；production 追加生产级训练素材准备认证",
+    )
+    parser.add_argument("--holdout-count", type=int, default=400)
+    parser.add_argument("--holdout-end-to-end-rate", type=float, default=0.85)
+    parser.add_argument("--holdout-rollout-episodes", type=int, default=10)
     parser.add_argument("--holdout-rollout-success-rate", type=float, default=2 / 3)
     parser.add_argument(
         "--holdout-seed-offset", type=int, default=1_000_000,
@@ -614,7 +629,7 @@ def main():
     if not 0 <= args.infrastructure_retries <= 3:
         parser.error("infrastructure retries must be between 0 and 3")
     for key in ("max_concurrency", "max_attempts", "route_attempts", "consecutive_rounds",
-                "build_timeout", "score_timeout", "generation_timeout", "rollout_episodes", "rollout_steps", "rollout_timeout", "max_total_seconds", "holdout_count", "holdout_seed_offset"):
+                "build_timeout", "score_timeout", "generation_timeout", "rollout_episodes", "rollout_steps", "rollout_timeout", "max_total_seconds", "holdout_count", "holdout_rollout_episodes", "holdout_seed_offset"):
         if getattr(args, key) <= 0:
             parser.error(f"{key} must be positive")
     for key in ("target_task_yield", "target_build_yield", "target_end_to_end_rate", "target_category_rate",
@@ -623,6 +638,10 @@ def main():
             parser.error(f"{key} must be between 0 and 1")
     if not args.threshold <= args.target_qualified_mean <= 10:
         parser.error("target_qualified_mean must be between threshold and 10")
+    if args.certification_profile == "production" and (
+        args.holdout_count < 300 or args.holdout_rollout_episodes < 10
+    ):
+        parser.error("production certification requires at least 300 holdout requests and 10 episodes per sandbox")
     project = args.project.resolve()
     from dotenv import load_dotenv
     load_dotenv(project / ".env")
@@ -725,10 +744,8 @@ def main():
                     finish_active_budget("active_time_budget")
                     return 1
                 holdout = run_holdout(project, root, config, reports)
-                holdout_passed = holdout["summary"]["target_met"]
-                holdout_reason = "holdout_target_met" if holdout_passed else "holdout_failed"
-                write_json(root / "history.json", {
-                    "config": config, "stop_reason": holdout_reason,
+                history = {
+                    "config": config, "stop_reason": "certification_pending",
                     "consecutive_passes": streak,
                     "live_rollout_verified": (
                         summary["live_rollout_verified"]
@@ -736,10 +753,27 @@ def main():
                         and holdout["summary"]["all_episodes_fallback_free"]
                     ),
                     "rounds": reports, "holdout": holdout,
-                })
-                print(json.dumps({"stop_reason": holdout_reason, **holdout["summary"]}, ensure_ascii=False))
-                finish_active_budget(holdout_reason)
-                return 0 if holdout_passed else 1
+                }
+                if args.certification_profile == "production":
+                    from certify_training_materials import certify, default_policy
+                    policy = default_policy()
+                    policy["score_threshold"] = args.threshold
+                    certification = certify(history, policy)
+                    write_json(root / "production_readiness.json", certification)
+                    passed = certification["certified"]
+                    reason = (
+                        "production_prepared_for_agentic_rl"
+                        if passed else "production_readiness_failed"
+                    )
+                    history["production_readiness"] = certification
+                else:
+                    passed = holdout["summary"]["target_met"]
+                    reason = "holdout_target_met" if passed else "holdout_failed"
+                history["stop_reason"] = reason
+                write_json(root / "history.json", history)
+                print(json.dumps({"stop_reason": reason, **holdout["summary"]}, ensure_ascii=False))
+                finish_active_budget(reason)
+                return 0 if passed else 1
             if reason == "round_budget":
                 print(json.dumps({"stop_reason": reason, "round": number, **summary}, ensure_ascii=False))
                 finish_active_budget(reason)

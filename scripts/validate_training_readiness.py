@@ -162,6 +162,83 @@ def validate(root: Path) -> dict[str, Any]:
                     failures.append({"gate": "state_causality", "message": "success rollout did not satisfy business postconditions"})
         except Exception as exc:
             failures.append({"gate": "determinism", "message": str(exc)})
+    # Exercise the public episode protocol and the shared state layer directly.
+    # These checks produce machine-readable evidence for factory-level
+    # production-prepared certification instead of inferring isolation from
+    # source code or a successful acceptance run.
+    try:
+        episode_a, episode_b = "readiness-episode-a", "readiness-episode-b"
+        headers_a = {**auth, "X-Episode-ID": episode_a}
+        headers_b = {**auth, "X-Episode-ID": episode_b}
+        status_a, _, _ = app.handle(
+            "POST", "/v1/reset", {"episode_id": episode_a, "seed": 1701}, headers_a
+        )
+        baseline_a = canonical(app.business_snapshot())
+        marker = "envfactory episode isolation marker"
+        marker_status, _, _ = app.handle(
+            "POST", "/v1/agent_response", {"content": marker}, headers_a
+        )
+        replay_status_a, replay_a, _ = app.handle("GET", "/v1/replay", headers=headers_a)
+        repeated_status_a, repeated_a, _ = app.handle("GET", "/v1/replay", headers=headers_a)
+
+        status_b, _, _ = app.handle(
+            "POST", "/v1/reset", {"episode_id": episode_b, "seed": 1701}, headers_b
+        )
+        baseline_b = canonical(app.business_snapshot())
+        replay_status_b, replay_b, _ = app.handle("GET", "/v1/replay", headers=headers_b)
+        _, replay_a_after_b, _ = app.handle("GET", "/v1/replay", headers=headers_a)
+
+        reset_status, _, _ = app.handle(
+            "POST", "/v1/reset", {"episode_id": episode_a, "seed": 1701}, headers_a
+        )
+        reset_a = canonical(app.business_snapshot())
+        _, replay_a_after_reset, _ = app.handle("GET", "/v1/replay", headers=headers_a)
+        reset_reproducible = (
+            status_a == status_b == reset_status == 200
+            and baseline_a == baseline_b == reset_a
+            and replay_a_after_reset.get("events") == []
+        )
+        episode_isolation = (
+            marker_status == replay_status_a == replay_status_b == 200
+            and replay_a.get("episode_id") == episode_a
+            and replay_b.get("episode_id") == episode_b
+            and replay_b.get("events") == []
+            and any(
+                event.get("event") == "agent_response"
+                and event.get("payload", {}).get("content") == marker
+                for event in replay_a_after_b.get("events", [])
+            )
+        )
+        replay_consistent = (
+            repeated_status_a == 200
+            and canonical(replay_a) == canonical(repeated_a)
+            and replay_a.get("trace_hash") == replay_a_after_b.get("trace_hash")
+        )
+        evidence["runtime_state"] = {
+            "reset_reproducible": reset_reproducible,
+            "episode_isolation": episode_isolation,
+            "replay_consistent": replay_consistent,
+            "episode_a_event_count": len(replay_a.get("events", [])),
+            "episode_b_event_count": len(replay_b.get("events", [])),
+        }
+        for gate, passed, message in (
+            ("reset_reproducibility", reset_reproducible, "same seed reset did not restore the baseline"),
+            ("episode_isolation", episode_isolation, "episode state or replay crossed episode boundaries"),
+            ("replay_consistency", replay_consistent, "repeated replay was not stable"),
+        ):
+            if not passed:
+                failures.append({"gate": gate, "message": message})
+    except Exception as exc:
+        evidence["runtime_state"] = {
+            "reset_reproducible": False,
+            "episode_isolation": False,
+            "replay_consistent": False,
+            "error_type": type(exc).__name__,
+        }
+        failures.append({
+            "gate": "runtime_state_integrity",
+            "message": f"{type(exc).__name__}: {exc}",
+        })
     hard_gates = sorted({failure["gate"] for failure in failures})
     return {
         "training_ready": not failures,
