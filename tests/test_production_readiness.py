@@ -8,15 +8,16 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_script():
-    path = ROOT / "scripts/certify_training_materials.py"
-    spec = importlib.util.spec_from_file_location("certify_training_materials", path)
+def load_script(name="certify_training_materials"):
+    path = ROOT / f"scripts/{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 certifier = load_script()
+verifier = load_script("verify_training_materials")
 
 
 class ProductionReadinessTest(unittest.TestCase):
@@ -77,7 +78,10 @@ class ProductionReadinessTest(unittest.TestCase):
                 "task_path": str(task), "output": str(evidence),
                 "category": ("simple_agentic" if index % 2 else "multi_step_agentic"),
                 "task_score": {"eligible": True, "score": 9},
-                "sandbox_score": {"passed": True, "score": 9},
+                "sandbox_score": {
+                    "passed": True, "score": 9,
+                    "evidence_fingerprint": f"sandbox-{index}",
+                },
                 "score": 9, "passed": True,
                 "live_rollout": {"episodes": episodes},
             }
@@ -96,6 +100,8 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertEqual(report["scope"], "pre_training_material_readiness")
             self.assertIn("rl_training_convergence", report["does_not_certify"])
             self.assertEqual(report["measurements"]["episodes"], 3000)
+            self.assertEqual(len(report["materials_manifest"]["items"]), 300)
+            self.assertEqual(len(report["materials_manifest"]["dataset_sha256"]), 64)
 
     def test_pilot_sized_holdout_cannot_claim_production_certification(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -123,6 +129,40 @@ class ProductionReadinessTest(unittest.TestCase):
                 turns[1]["result"].pop("outcome_category")
             report = certifier.certify(history, certifier.default_policy())
             self.assertFalse(report["gates"]["user_simulator_protocol"])
+
+    def test_material_manifest_detects_post_certification_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sandbox = root / "sandbox"
+            sandbox.mkdir()
+            task = sandbox / "task.json"
+            task.write_text('{"task":"immutable"}')
+            rollout = {"episodes": [{"agent_success": True}]}
+            (sandbox / "live_rollout.json").write_text(json.dumps(rollout))
+            item = {
+                "task_path": str(task),
+                "task_sha256": __import__("hashlib").sha256(task.read_bytes()).hexdigest(),
+                "sandbox_root": str(sandbox),
+                "sandbox_evidence_fingerprint": "sandbox-proof",
+                "rollout_sha256": verifier.digest_json(rollout),
+                "episode_count": 1,
+            }
+            manifest = {"version": "1.0", "kind": "agentic_rl_pretraining_materials", "items": [item]}
+            manifest["dataset_sha256"] = verifier.digest_json(manifest)
+            fingerprint = lambda sandbox_root, project: "sandbox-proof"
+            self.assertTrue(verifier.verify(manifest, ROOT, fingerprint=fingerprint)["verified"])
+            task.write_text('{"task":"tampered"}')
+            report = verifier.verify(manifest, ROOT, fingerprint=fingerprint)
+            self.assertFalse(report["verified"])
+            self.assertIn("task_digest", report["failed_gates"])
+
+    def test_failed_artifact_verification_revokes_certification(self):
+        report = {"certified": True, "gates": {}, "failed_gates": []}
+        certifier.attach_artifact_verification(report, {
+            "verified": False, "failed_gates": ["task_digest"],
+        })
+        self.assertFalse(report["certified"])
+        self.assertIn("material_artifacts_immutable", report["failed_gates"])
 
 
 if __name__ == "__main__":

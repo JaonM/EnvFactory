@@ -47,3 +47,18 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - `offline_target_met`：只证明离线契约可执行，不能证明真实模型轨迹可采集。
 
 认证报告会显式保存 `does_not_certify`，防止将训练前环境质量误表述为训练效果。
+
+通过或失败时都会生成 `training_materials_manifest.json`，列出当前合格候选的任务 SHA-256、沙箱
+证据指纹、rollout 摘要哈希、类别、分数和 episode 数量，并为整批清单生成 `dataset_sha256`。
+认证要求每个合格样本都有唯一证据指纹；后续导入训练系统时应重新计算这些摘要，拒绝认证后被修改、
+替换或额外混入的任务、沙箱和轨迹。只有认证报告 `certified=true` 时，这份清单才能作为正式输入。
+
+导入前执行：
+
+```bash
+uv run python scripts/verify_training_materials.py \
+  output/loop_experiment_v1/training_materials_manifest.json
+```
+
+验证器会重新计算任务文件、沙箱实现与评测代码联合指纹、rollout JSON 和整批清单摘要；任何文件变化、
+轨迹数量变化或重复沙箱身份都会返回非零退出码。

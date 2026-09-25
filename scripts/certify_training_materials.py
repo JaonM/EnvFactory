@@ -32,6 +32,13 @@ def load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def digest_json(value: Any) -> str:
+    rendered = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(rendered).hexdigest()
+
+
 def wilson_lower(successes: int, total: int, *, z: float = Z_95) -> float:
     """Return the lower bound of a two-sided Wilson score interval."""
     if total <= 0:
@@ -259,6 +266,40 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         counterfactuals["positive_errors"] / counterfactuals["positive_total"]
         if counterfactuals["positive_total"] else 1.0
     )
+    material_items = []
+    for item in qualified:
+        task_path = Path(str(item.get("task_path", "")))
+        sandbox_score = item.get("sandbox_score", {})
+        fingerprint = sandbox_score.get("evidence_fingerprint")
+        live = item.get("live_rollout")
+        if not task_path.is_file() or not isinstance(fingerprint, str) or not fingerprint:
+            continue
+        if not isinstance(live, Mapping):
+            continue
+        item_episodes = live.get("episodes", [])
+        material_items.append({
+            "task_path": str(task_path.resolve()),
+            "task_sha256": hashlib.sha256(task_path.read_bytes()).hexdigest(),
+            "sandbox_root": str(Path(str(item.get("output", ""))).resolve()),
+            "sandbox_evidence_fingerprint": fingerprint,
+            "category": str(item.get("category", "unknown")),
+            "score": item.get("score"),
+            "rollout_sha256": digest_json(live),
+            "episode_count": len(item_episodes) if isinstance(item_episodes, list) else 0,
+            "successful_episodes": sum(
+                episode.get("agent_success") is True
+                for episode in item_episodes if isinstance(episode, Mapping)
+            ) if isinstance(item_episodes, list) else 0,
+        })
+    material_fingerprints = [
+        item["sandbox_evidence_fingerprint"] for item in material_items
+    ]
+    material_manifest = {
+        "version": "1.0",
+        "kind": "agentic_rl_pretraining_materials",
+        "items": material_items,
+    }
+    material_manifest["dataset_sha256"] = digest_json(material_manifest)
 
     measurements = {
         "requested_tasks": total,
@@ -296,6 +337,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
             holdout.get("summary", {}).get("fresh_tasks_verified") is True
             if isinstance(holdout, Mapping) else False
         ),
+        "material_manifest_items": len(material_items),
     }
 
     gates = {
@@ -335,6 +377,10 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         ),
         "runtime_state_integrity": runtime_integrity,
         "tool_and_reward_integrity": tool_and_reward_integrity,
+        "material_identity": (
+            len(material_items) == len(qualified)
+            and len(material_fingerprints) == len(set(material_fingerprints))
+        ),
         "reward_false_positive_rate": false_positive_rate <= policy["max_reward_false_positive_rate"],
         "reward_false_negative_rate": false_negative_rate <= policy["max_reward_false_negative_rate"],
     }
@@ -350,6 +396,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "measurements": measurements,
         "gates": gates,
         "failed_gates": failed,
+        "materials_manifest": material_manifest,
     }
 
 
@@ -374,15 +421,38 @@ def default_policy() -> dict[str, Any]:
     }
 
 
+def attach_artifact_verification(
+    report: dict[str, Any], verification: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Make post-score artifact immutability part of the certification claim."""
+    report["material_verification"] = dict(verification)
+    report["gates"]["material_artifacts_immutable"] = verification.get("verified") is True
+    report["failed_gates"] = [
+        name for name, passed in report["gates"].items() if not passed
+    ]
+    report["certified"] = not report["failed_gates"]
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("history", type=Path, help="loop experiment history.json")
+    parser.add_argument("--project", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     report = certify(load(args.history.resolve()), default_policy())
+    from verify_training_materials import verify
+    report = attach_artifact_verification(
+        report, verify(report["materials_manifest"], args.project.resolve())
+    )
     rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     output = args.output or args.history.with_name("production_readiness.json")
     output.write_text(rendered, encoding="utf-8")
+    manifest_path = output.with_name("training_materials_manifest.json")
+    manifest_path.write_text(
+        json.dumps(report["materials_manifest"], ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(rendered, end="")
     return 0 if report["certified"] else 1
 

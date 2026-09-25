@@ -755,11 +755,22 @@ def main():
                     "rounds": reports, "holdout": holdout,
                 }
                 if args.certification_profile == "production":
-                    from certify_training_materials import certify, default_policy
+                    from certify_training_materials import (
+                        attach_artifact_verification, certify, default_policy,
+                    )
                     policy = default_policy()
                     policy["score_threshold"] = args.threshold
                     certification = certify(history, policy)
+                    from verify_training_materials import verify
+                    certification = attach_artifact_verification(
+                        certification,
+                        verify(certification["materials_manifest"], project),
+                    )
                     write_json(root / "production_readiness.json", certification)
+                    write_json(
+                        root / "training_materials_manifest.json",
+                        certification["materials_manifest"],
+                    )
                     passed = certification["certified"]
                     reason = (
                         "production_prepared_for_agentic_rl"
