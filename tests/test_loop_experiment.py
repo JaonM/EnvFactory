@@ -1,4 +1,5 @@
 import importlib.util
+import itertools
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,10 @@ rollout = load("run_live_rollout")
 
 
 class ExperimentTest(unittest.TestCase):
+    def test_zero_round_limit_is_unbounded(self):
+        self.assertEqual(list(itertools.islice(loop.round_numbers(0), 25))[-1], 25)
+        self.assertEqual(list(loop.round_numbers(3)), [1, 2, 3])
+
     def test_denominator_includes_generation_failure_and_threshold_is_inclusive(self):
         report = loop.summarize([
             {"task_path": "a", "score": 9, "passed": True, "category": "direct_response"},
@@ -222,6 +227,40 @@ class ExperimentTest(unittest.TestCase):
             self.assertEqual(result["failure_class"], "task_quality")
             self.assertEqual(result["failure_code"], "EXTERNAL_CAPABILITY_UNAVAILABLE")
 
+    def test_holdout_requires_fresh_tasks_and_two_of_three_successes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = []
+            for index in range(30):
+                task = root / f"task-{index}.json"
+                task.write_text(json.dumps({"task": index}))
+                results.append({
+                    "task_path": str(task), "sample_seed": 10_000 + index,
+                    "score": 9, "passed": True, "category": "multi_step_agentic",
+                    "task_score": {"eligible": True, "score": 9},
+                    "sandbox_score": {"passed": True, "score": 9},
+                    "live_rollout": {
+                        "agent_success_rate": 2 / 3,
+                        "all_episodes_environment_clean": True,
+                        "all_episodes_fallback_free": True,
+                    },
+                })
+            summary = loop.summarize_holdout(
+                results, 8, expected_count=30, end_to_end_target=.7,
+                rollout_success_target=2 / 3, previous_seeds={1, 2, 3},
+            )
+            self.assertTrue(summary["target_met"])
+            results[0]["live_rollout"]["agent_success_rate"] = 1 / 3
+            self.assertFalse(loop.summarize_holdout(
+                results, 8, expected_count=30, end_to_end_target=.7,
+                rollout_success_target=2 / 3,
+            )["qualified_rollout_floor_met"])
+            results[0]["sample_seed"] = 1
+            self.assertFalse(loop.summarize_holdout(
+                results, 8, expected_count=30, end_to_end_target=.7,
+                rollout_success_target=2 / 3, previous_seeds={1},
+            )["fresh_tasks_verified"])
+
 
 class FakeApp:
     def __init__(self, *, correct=True, fallback=False):
@@ -255,6 +294,24 @@ class FakeApp:
 
 
 class RolloutTest(unittest.TestCase):
+    def test_release_gate_requires_two_of_three_clean_successes(self):
+        episodes = [
+            {"agent_success": True, "issues": []},
+            {"agent_success": True, "issues": []},
+            {"agent_success": False, "issues": []},
+        ]
+        report = rollout.summarize_episodes(episodes, 2 / 3)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["quality_score"], 1.0)
+        episodes[1]["agent_success"] = False
+        report = rollout.summarize_episodes(episodes, 2 / 3)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failure_owner"], "agent")
+        episodes[1]["issues"] = ["runtime_llm_fallback"]
+        report = rollout.summarize_episodes(episodes, 0)
+        self.assertFalse(report["all_episodes_fallback_free"])
+        self.assertEqual(report["failure_owner"], "environment")
+
     def run_episode(self, app):
         task = {"task": "finish item", "acceptance_contract": {"secret": "do not show"},
                 "public_input": {"initial_user_message": "finish the supplied item", "materials": [{

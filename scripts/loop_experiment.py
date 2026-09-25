@@ -6,6 +6,7 @@ from collections import Counter
 import concurrent.futures
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -206,6 +207,116 @@ def summarize(results, threshold, *, targets=None):
     return summary
 
 
+def summarize_holdout(
+    results, threshold, *, expected_count, end_to_end_target,
+    rollout_success_target, previous_seeds=(), previous_task_digests=(),
+):
+    """Apply the stricter, distribution-shifted release gate."""
+    summary = summarize(results, threshold)
+    live_results = [
+        item["live_rollout"] for item in results
+        if isinstance(item.get("live_rollout"), dict)
+    ]
+    qualified_results = [
+        item for item in results
+        if item.get("passed") is True and item.get("score", 0) >= threshold
+    ]
+    seeds = [item.get("sample_seed") for item in results]
+    task_digests = []
+    for item in results:
+        path = Path(item.get("task_path", ""))
+        if path.is_file():
+            task_digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    fresh_tasks_verified = (
+        len(results) == expected_count
+        and all(isinstance(seed, int) for seed in seeds)
+        and len(set(seeds)) == expected_count
+        and set(seeds).isdisjoint(previous_seeds)
+        and len(task_digests) == expected_count
+        and len(set(task_digests)) == expected_count
+        and set(task_digests).isdisjoint(previous_task_digests)
+    )
+    qualified_rollout_floor_met = bool(qualified_results) and all(
+        isinstance(item.get("live_rollout"), dict)
+        and item["live_rollout"].get("agent_success_rate", 0) >= rollout_success_target
+        for item in qualified_results
+    )
+    all_episodes_environment_clean = bool(live_results) and all(
+        report.get("all_episodes_environment_clean") is True
+        for report in live_results
+    )
+    all_episodes_fallback_free = bool(live_results) and all(
+        report.get("all_episodes_fallback_free") is True
+        for report in live_results
+    )
+    summary.update({
+        "holdout_expected": expected_count,
+        "fresh_tasks_verified": fresh_tasks_verified,
+        "rollout_success_target": rollout_success_target,
+        "qualified_rollout_floor_met": qualified_rollout_floor_met,
+        "all_episodes_environment_clean": all_episodes_environment_clean,
+        "all_episodes_fallback_free": all_episodes_fallback_free,
+    })
+    summary["target_met"] = (
+        fresh_tasks_verified
+        and summary["end_to_end_rate"] >= end_to_end_target
+        and qualified_rollout_floor_met
+        and all_episodes_environment_clean
+        and all_episodes_fallback_free
+    )
+    return summary
+
+
+def round_numbers(max_rounds):
+    """Yield finite round numbers, or an unbounded sequence when configured as zero."""
+    return itertools.count(1) if max_rounds == 0 else range(1, max_rounds + 1)
+
+
+def run_holdout(project, root, config, previous_reports):
+    """Run one fresh, stricter release set after development targets converge."""
+    holdout_root = root / "holdout"
+    holdout_config = dict(config)
+    holdout_config.update(
+        generate_count=config["holdout_count"],
+        task_paths=[],
+        build_mode="clean",
+        experiment_seed=config["experiment_seed"] + config["holdout_seed_offset"],
+        rollout_min_success_rate=config["holdout_rollout_success_rate"],
+    )
+    report_path = holdout_root / "round-01" / "round_report.json"
+    report = (
+        json.loads(report_path.read_text())
+        if report_path.exists()
+        else {"round": 1, "state": "running"}
+    )
+    if report.get("state") != "complete":
+        report = run_round(project, holdout_root, holdout_config, report)
+    previous_seeds = {
+        job.get("result", {}).get("sample_seed")
+        for previous in previous_reports
+        for job in previous.get("jobs", [])
+        if isinstance(job.get("result", {}).get("sample_seed"), int)
+    }
+    previous_task_digests = set()
+    for previous in previous_reports:
+        for job in previous.get("jobs", []):
+            task_path = Path(job.get("result", {}).get("task_path", ""))
+            if task_path.is_file():
+                previous_task_digests.add(hashlib.sha256(task_path.read_bytes()).hexdigest())
+    report["summary"] = summarize_holdout(
+        [job["result"] for job in report.get("jobs", [])],
+        config["threshold"],
+        expected_count=config["holdout_count"],
+        end_to_end_target=config["holdout_end_to_end_rate"],
+        rollout_success_target=config["holdout_rollout_success_rate"],
+        previous_seeds=previous_seeds,
+        previous_task_digests=previous_task_digests,
+    )
+    report["phase"] = "holdout"
+    write_json(report_path, report)
+    return report
+
+
 def build_one(project, task_path, output, config, seed=None):
     from env_factory.task_quality import score_file
     output.mkdir(parents=True, exist_ok=True)
@@ -286,7 +397,8 @@ def build_one(project, task_path, output, config, seed=None):
         live_path = output / "live_rollout.json"
         live_run = run_process([sys.executable, str(project / "scripts/run_live_rollout.py"), str(output),
                                "--output", str(live_path), "--episodes", str(config["rollout_episodes"]),
-                               "--max-steps", str(config["rollout_steps"])], project,
+                               "--max-steps", str(config["rollout_steps"]),
+                               "--min-success-rate", str(config.get("rollout_min_success_rate", 0.0))], project,
                               output / "rollout.log", config["rollout_timeout"])
         live = json.loads(live_path.read_text()) if live_path.exists() else {}
         result.update(live_rollout=live, live_process=live_run,
@@ -451,7 +563,10 @@ def main():
         default="direct_response=0.20,simple_agentic=0.30,multi_step_agentic=0.50",
     )
     parser.add_argument("--task-root", type=Path, default=Path("output/task_artifacts"))
-    parser.add_argument("--max-rounds", type=int, default=20)
+    parser.add_argument(
+        "--max-rounds", type=int, default=0,
+        help="第一阶段最大质量轮数；0 表示不设置轮数上限",
+    )
     parser.add_argument("--max-concurrency", type=int, default=2)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument(
@@ -474,6 +589,17 @@ def main():
     parser.add_argument("--rollout-episodes", type=int, default=3)
     parser.add_argument("--rollout-steps", type=int, default=20)
     parser.add_argument("--rollout-timeout", type=int, default=1800)
+    parser.add_argument(
+        "--rollout-min-success-rate", type=float, default=0.0,
+        help="第一阶段每个沙箱的最低 rollout 成功率；0 保留至少一次成功语义",
+    )
+    parser.add_argument("--holdout-count", type=int, default=30)
+    parser.add_argument("--holdout-end-to-end-rate", type=float, default=0.70)
+    parser.add_argument("--holdout-rollout-success-rate", type=float, default=2 / 3)
+    parser.add_argument(
+        "--holdout-seed-offset", type=int, default=1_000_000,
+        help="留出集相对开发轮 seed 的固定偏移，保证独立抽样",
+    )
     parser.add_argument("--hypothesis", default="baseline", help="本实验要验证的改进假设")
     parser.add_argument("--experiment-seed", type=int, default=20260925, help="跨版本配对实验种子")
     parser.add_argument("--target-task-yield", type=float, default=0.85)
@@ -482,16 +608,17 @@ def main():
     parser.add_argument("--target-qualified-mean", type=float, default=8.5)
     parser.add_argument("--target-category-rate", type=float, default=0.60)
     args = parser.parse_args()
-    if (not 1 <= args.max_rounds <= 50 or not 0 <= args.threshold < 10
+    if (args.max_rounds < 0 or not 0 <= args.threshold < 10
             or args.generate_count < 0 or not 0 <= args.generation_hops <= 20):
         parser.error("invalid rounds, threshold or generation count")
     if not 0 <= args.infrastructure_retries <= 3:
         parser.error("infrastructure retries must be between 0 and 3")
     for key in ("max_concurrency", "max_attempts", "route_attempts", "consecutive_rounds",
-                "build_timeout", "score_timeout", "generation_timeout", "rollout_episodes", "rollout_steps", "rollout_timeout", "max_total_seconds"):
+                "build_timeout", "score_timeout", "generation_timeout", "rollout_episodes", "rollout_steps", "rollout_timeout", "max_total_seconds", "holdout_count", "holdout_seed_offset"):
         if getattr(args, key) <= 0:
             parser.error(f"{key} must be positive")
-    for key in ("target_task_yield", "target_build_yield", "target_end_to_end_rate", "target_category_rate"):
+    for key in ("target_task_yield", "target_build_yield", "target_end_to_end_rate", "target_category_rate",
+                "rollout_min_success_rate", "holdout_end_to_end_rate", "holdout_rollout_success_rate"):
         if not 0 <= getattr(args, key) <= 1:
             parser.error(f"{key} must be between 0 and 1")
     if not args.threshold <= args.target_qualified_mean <= 10:
@@ -553,7 +680,7 @@ def main():
         })
         reports = []
         streak = 0
-        for number in range(1, args.max_rounds + 1):
+        for number in round_numbers(args.max_rounds):
             if source_digest(project) != config["source_digest"] or [input_digest(path) for path in paths] != config["input_digests"]:
                 parser.error("code/inputs changed during experiment; start a new --output")
             path = root / f"round-{number:02d}/round_report.json"
@@ -578,15 +705,45 @@ def main():
                 finish_active_budget(reason)
                 return 2
             streak = streak + 1 if summary["target_met"] else 0
-            target = "live_target_met" if args.validation == "live" else "offline_target_met"
+            target = "development_target_met"
             reason = (target if streak >= args.consecutive_rounds else
-                      "round_budget" if number == args.max_rounds else "running")
+                      "round_budget" if args.max_rounds and number == args.max_rounds else "running")
             write_json(root / "history.json", {"config": config, "stop_reason": reason,
                        "consecutive_passes": streak, "live_rollout_verified": summary["live_rollout_verified"], "rounds": reports})
-            if reason != "running":
+            if reason == target:
+                if args.validation != "live":
+                    offline_reason = "offline_target_met"
+                    write_json(root / "history.json", {
+                        "config": config, "stop_reason": offline_reason,
+                        "consecutive_passes": streak,
+                        "live_rollout_verified": False, "rounds": reports,
+                    })
+                    print(json.dumps({"stop_reason": offline_reason, **summary}, ensure_ascii=False))
+                    finish_active_budget(offline_reason)
+                    return 0
+                if time.time() >= PROCESS_DEADLINE:
+                    finish_active_budget("active_time_budget")
+                    return 1
+                holdout = run_holdout(project, root, config, reports)
+                holdout_passed = holdout["summary"]["target_met"]
+                holdout_reason = "holdout_target_met" if holdout_passed else "holdout_failed"
+                write_json(root / "history.json", {
+                    "config": config, "stop_reason": holdout_reason,
+                    "consecutive_passes": streak,
+                    "live_rollout_verified": (
+                        summary["live_rollout_verified"]
+                        and holdout["summary"]["all_episodes_environment_clean"]
+                        and holdout["summary"]["all_episodes_fallback_free"]
+                    ),
+                    "rounds": reports, "holdout": holdout,
+                })
+                print(json.dumps({"stop_reason": holdout_reason, **holdout["summary"]}, ensure_ascii=False))
+                finish_active_budget(holdout_reason)
+                return 0 if holdout_passed else 1
+            if reason == "round_budget":
                 print(json.dumps({"stop_reason": reason, "round": number, **summary}, ensure_ascii=False))
                 finish_active_budget(reason)
-                return 0 if reason == target else 1
+                return 1
         finish_active_budget("round_budget")
     return 1
 

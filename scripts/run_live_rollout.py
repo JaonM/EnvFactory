@@ -108,14 +108,76 @@ def episode(app, task, client, seed, max_steps):
             "initial_state": baseline, "final_state": state}
 
 
+def summarize_episodes(episodes, minimum_success_rate):
+    """Turn trajectory evidence into a strict, reusable rollout gate."""
+    count = len(episodes)
+    agent_success_rate = (
+        sum(item.get("agent_success") is True for item in episodes) / count if count else 0
+    )
+    all_episodes_fallback_free = bool(episodes) and not any(
+        "runtime_llm_fallback" in item.get("issues", []) for item in episodes
+    )
+    all_episodes_environment_clean = bool(episodes) and not any(
+        item.get("issues") for item in episodes
+    )
+    live_rollout_verified = bool(episodes) and all(
+        "execution_error" not in item.get("issues", [])
+        and "runtime_llm_fallback" not in item.get("issues", [])
+        for item in episodes
+    )
+    success_rate_gate_passed = (
+        agent_success_rate > 0
+        if minimum_success_rate == 0
+        else agent_success_rate >= minimum_success_rate
+    )
+    passed = (
+        live_rollout_verified
+        and all_episodes_environment_clean
+        and all_episodes_fallback_free
+        and success_rate_gate_passed
+    )
+    if any("execution_error" in item.get("issues", []) for item in episodes):
+        failure_owner = "infrastructure"
+    elif not all_episodes_environment_clean or not live_rollout_verified:
+        failure_owner = "environment"
+    elif not success_rate_gate_passed:
+        failure_owner = "agent"
+    else:
+        failure_owner = None
+    return {
+        "live_rollout_verified": live_rollout_verified,
+        "agent_success_rate": agent_success_rate,
+        "environment_checks_passed": all_episodes_environment_clean,
+        "all_episodes_fallback_free": all_episodes_fallback_free,
+        "all_episodes_environment_clean": all_episodes_environment_clean,
+        "minimum_success_rate": minimum_success_rate,
+        "success_rate_gate_passed": success_rate_gate_passed,
+        "quality_score": round(
+            (0.3 if live_rollout_verified else 0.0)
+            + (0.3 if all_episodes_environment_clean else 0.0)
+            + (0.4 if success_rate_gate_passed else 0.0),
+            2,
+        ),
+        "passed": passed,
+        "failure_owner": failure_owner,
+        "conclusion": (
+            "live_success_witness" if passed else "issues_or_insufficient_success_evidence"
+        ),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument(
+        "--min-success-rate", type=float, default=0.0,
+        help="minimum successful episode ratio; 0 preserves the one-success witness gate",
+    )
     args = parser.parse_args()
-    if args.episodes <= 0 or args.max_steps <= 0:
+    if args.episodes <= 0 or args.max_steps <= 0 or not 0 <= args.min_success_rate <= 1:
         parser.error("episodes and steps must be positive")
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -145,25 +207,7 @@ def main():
                 result = {"seed": seed, "agent_success": False, "issues": ["execution_error"], "error_type": type(exc).__name__}
             report["episodes"].append(result)
             write_json(args.output, report)
-    report["live_rollout_verified"] = all("execution_error" not in item["issues"] and "runtime_llm_fallback" not in item["issues"] for item in report["episodes"])
-    report["agent_success_rate"] = sum(item["agent_success"] for item in report["episodes"]) / args.episodes
-    report["environment_checks_passed"] = not any(item["issues"] for item in report["episodes"])
-    report["quality_score"] = round(
-        (0.3 if report["live_rollout_verified"] else 0.0)
-        + (0.3 if report["environment_checks_passed"] else 0.0)
-        + (0.4 if report["agent_success_rate"] > 0 else 0.0),
-        2,
-    )
-    report["passed"] = report["live_rollout_verified"] and report["environment_checks_passed"] and report["agent_success_rate"] > 0
-    if any("execution_error" in item["issues"] for item in report["episodes"]):
-        report["failure_owner"] = "infrastructure"
-    elif not report["environment_checks_passed"] or not report["live_rollout_verified"]:
-        report["failure_owner"] = "environment"
-    elif report["agent_success_rate"] == 0:
-        report["failure_owner"] = "agent"
-    else:
-        report["failure_owner"] = None
-    report["conclusion"] = "live_success_witness" if report["passed"] else "issues_or_insufficient_success_evidence"
+    report.update(summarize_episodes(report["episodes"], args.min_success_rate))
     write_json(args.output, report)
     return 0 if report["passed"] else 1
 
