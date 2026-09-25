@@ -26,6 +26,7 @@ from env_factory.material_consumer import (
     TRANSITIONS_FILE,
     assign_dataset_splits,
     consumer_contract,
+    consumer_record_errors,
     supports_bundle_feature,
 )
 from env_factory.material_attestation import (
@@ -837,6 +838,24 @@ def verify_bundle(
         records = [json.loads(line) for line in transition_path.read_text(encoding="utf-8").splitlines()]
     except (OSError, json.JSONDecodeError):
         failures.append("transition_jsonl")
+    consumer_record_failures = []
+    for index, record in enumerate(records):
+        errors = consumer_record_errors(
+            record, str(manifest.get("version", ""))
+        )
+        if errors:
+            consumer_record_failures.append({"index": index, "errors": errors})
+    consumer_records_ready = (
+        supports_bundle_feature(
+            str(manifest.get("version")), "consumer_record_validation"
+        )
+        and bool(records)
+        and not consumer_record_failures
+    )
+    if supports_bundle_feature(
+        str(manifest.get("version")), "consumer_record_validation"
+    ) and not consumer_records_ready:
+        failures.append("consumer_records")
     items = manifest.get("items")
     if not isinstance(items, list) or not items:
         failures.append("bundle_items")
@@ -1599,6 +1618,8 @@ def verify_bundle(
         "trajectory_purpose_ready": trajectory_purpose_ready,
         "model_response_provenance_ready": model_response_provenance_ready,
         "model_response_authorization_ready": model_response_authorization_ready,
+        "consumer_records_ready": consumer_records_ready,
+        "consumer_record_failures": consumer_record_failures,
         "preflight_provider_bindings": verified_preflight_provider_bindings,
         "metadata_privacy_ready": portable_metadata_privacy["safe"],
         "evaluator_independence_ready": evaluator_independence_ready,

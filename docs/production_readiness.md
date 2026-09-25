@@ -210,6 +210,11 @@ v11 包缺少 production preflight
 更早版本也只能
 验证各自声明的历史契约，不能满足当前受信发布门禁。
 
+Bundle v16 的验证器还会把每一条 `transitions.jsonl` 记录作为独立消费者输入重新校验：顶层字段和
+policy transition 字段必须与契约精确相等，消息只允许 `role` 与 `content`，数值必须有限，内容摘要、
+类别、split、任务家族和生成 provenance 必须符合格式。嵌套额外字段即使未命中已知敏感关键词，也会以
+`consumer_records` 失败，避免通过“看似无害”的键把 trainer-only 信息带入下游策略输入。
+
 v16 验证器还会把 preflight 的 generation、Rollout Agent、User/Judge 三个 provider 分别与每个环境中的
 生成 provenance 和 `data_governance.json` 交叉核对；三个各自格式合法但来自不同实验的身份不能拼成合格包。
 认证阶段生成的 preflight v1.2 还会绑定完整冻结实验配置的 SHA-256 与三类响应模型 allowlist；任务配比、门禁阈值、holdout 参数或

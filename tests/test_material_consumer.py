@@ -4,6 +4,7 @@ from env_factory.material_consumer import (
     DATASET_SPLITS,
     assign_dataset_splits,
     consumer_contract,
+    consumer_record_errors,
 )
 from env_factory.task_similarity import task_family_ids
 
@@ -76,6 +77,64 @@ class MaterialConsumerTest(unittest.TestCase):
             records["json_schema"]["properties"]["split"]["enum"],
             list(DATASET_SPLITS),
         )
+        self.assertFalse(
+            records["json_schema"]["properties"]["transition"]["properties"]
+            ["agent_input"]["items"]["additionalProperties"]
+        )
+
+    @staticmethod
+    def valid_record():
+        return {
+            "schema_version": "2.0",
+            "item_id": "a" * 16 + "-" + "b" * 16,
+            "task_sha256": "c" * 64,
+            "category": "simple_agentic",
+            "episode_index": 0,
+            "episode_seed": 7,
+            "episode_success": True,
+            "episode_termination": "completed",
+            "episode_initial_reward": 0.0,
+            "episode_final_reward": 1.0,
+            "agent_model": "policy-model",
+            "runtime_model": "simulator-model",
+            "agent_usage": {},
+            "trajectory_role": "certification_evidence",
+            "direct_training_status": "not_certified",
+            "split": "train",
+            "task_family_id": "d" * 64,
+            "generation_model": "generator-model",
+            "generation_provider_identity_sha256": "e" * 64,
+            "generation_sample_seed": 9,
+            "transition": {
+                "step": 0,
+                "agent_input": [{"role": "user", "content": "help"}],
+                "assistant_output": '{"kind":"respond","content":"done"}',
+                "observation": {},
+                "action": {"kind": "respond", "content": "done"},
+                "result": {"status": 200},
+                "next_observation": {},
+                "reward": 1.0,
+                "terminated": True,
+                "truncated": False,
+            },
+        }
+
+    def test_consumer_record_validator_rejects_nested_policy_message_fields(self):
+        record = self.valid_record()
+        self.assertEqual(consumer_record_errors(record), [])
+        record["transition"]["agent_input"][0]["trainer_hint"] = "hidden"
+        self.assertIn(
+            "transition:agent_input[0]:fields",
+            consumer_record_errors(record),
+        )
+
+    def test_consumer_record_validator_rejects_invalid_numeric_values(self):
+        record = self.valid_record()
+        record["episode_final_reward"] = float("nan")
+        record["transition"]["step"] = -1
+        errors = consumer_record_errors(record)
+        self.assertIn("record:episode_final_reward", errors)
+        self.assertIn("transition:step", errors)
 
 
 if __name__ == "__main__":

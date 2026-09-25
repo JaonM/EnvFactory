@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import math
+import re
+from collections.abc import Mapping
 from typing import Any
 
-from .trajectory_schema import POLICY_TRANSITION_FIELDS
+from .trajectory_schema import POLICY_TRANSITION_FIELDS, transition_errors
 
 
 BUNDLE_MANIFEST = "bundle_manifest.json"
@@ -28,6 +31,7 @@ FEATURE_VERSIONS = {
     "trajectory_purpose": {"14.0", "15.0", "16.0"},
     "model_response_provenance": {"15.0", "16.0"},
     "model_response_authorization": {"16.0"},
+    "consumer_record_validation": {"16.0"},
 }
 
 
@@ -60,6 +64,101 @@ def assign_dataset_splits(items: list[dict[str, Any]]) -> dict[str, str]:
             for item in family_members:
                 assignments[str(item["item_id"])] = split
     return assignments
+
+
+def _finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def consumer_record_errors(
+    record: Any, bundle_version: str = BUNDLE_VERSION
+) -> list[str]:
+    """Validate one portable record independently of its source rollout."""
+    if not isinstance(record, Mapping):
+        return ["record:not_object"]
+    contract = consumer_contract(bundle_version)["records"]
+    required = set(contract["required_fields"])
+    errors: list[str] = []
+    keys = set(record)
+    if keys != required:
+        errors.append("record:fields")
+
+    def nonempty_string(name: str) -> None:
+        if not isinstance(record.get(name), str) or not record[name]:
+            errors.append(f"record:{name}")
+
+    if record.get("schema_version") != "2.0":
+        errors.append("record:schema_version")
+    for name, pattern in (
+        ("item_id", r"[0-9a-f]{16}-[0-9a-f]{16}"),
+        ("task_sha256", r"[0-9a-f]{64}"),
+    ):
+        value = record.get(name)
+        if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+            errors.append(f"record:{name}")
+    for name in ("category", "episode_termination", "agent_model", "runtime_model"):
+        nonempty_string(name)
+    for name in ("episode_index", "episode_seed"):
+        value = record.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or (
+            name == "episode_index" and value < 0
+        ):
+            errors.append(f"record:{name}")
+    if not isinstance(record.get("episode_success"), bool):
+        errors.append("record:episode_success")
+    for name in ("episode_initial_reward", "episode_final_reward"):
+        if not _finite_number(record.get(name)):
+            errors.append(f"record:{name}")
+    if not isinstance(record.get("agent_usage"), Mapping):
+        errors.append("record:agent_usage")
+    if supports_bundle_feature(bundle_version, "splits") and record.get(
+        "split"
+    ) not in DATASET_SPLITS:
+        errors.append("record:split")
+    if supports_bundle_feature(bundle_version, "families"):
+        value = record.get("task_family_id")
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            errors.append("record:task_family_id")
+    if supports_bundle_feature(bundle_version, "generation"):
+        nonempty_string("generation_model")
+        provider = record.get("generation_provider_identity_sha256")
+        if not isinstance(provider, str) or re.fullmatch(
+            r"[0-9a-f]{64}", provider
+        ) is None:
+            errors.append("record:generation_provider_identity_sha256")
+        seed = record.get("generation_sample_seed")
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            errors.append("record:generation_sample_seed")
+    if supports_bundle_feature(bundle_version, "trajectory_purpose"):
+        if record.get("trajectory_role") != "certification_evidence":
+            errors.append("record:trajectory_role")
+        if record.get("direct_training_status") != "not_certified":
+            errors.append("record:direct_training_status")
+
+    transition = record.get("transition")
+    if not isinstance(transition, Mapping):
+        errors.append("record:transition")
+        return errors
+    if set(transition) != set(POLICY_TRANSITION_FIELDS):
+        errors.append("transition:fields")
+    step = transition.get("step")
+    valid_step = (
+        isinstance(step, int) and not isinstance(step, bool) and step >= 0
+    )
+    if not valid_step:
+        errors.append("transition:step")
+    expected_step = step if valid_step else -1
+    errors.extend(transition_errors(transition, expected_step=expected_step))
+    messages = transition.get("agent_input")
+    if isinstance(messages, list):
+        for index, message in enumerate(messages):
+            if isinstance(message, Mapping) and set(message) != {"role", "content"}:
+                errors.append(f"transition:agent_input[{index}]:fields")
+    return sorted(set(errors))
 
 
 def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
@@ -156,6 +255,7 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
                                         "role": {"enum": ["system", "user", "assistant"]},
                                         "content": {"type": "string"},
                                     },
+                                    "additionalProperties": False,
                                 },
                             },
                             "assistant_output": {"type": "string"},
@@ -221,6 +321,12 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
             "only_final_transition_is_terminal_or_truncated",
             "final_transition_reward_equals_episode_final_reward",
             "trainer_only_fields_are_not_policy_inputs",
+            *(
+                ["every_record_validates_against_consumer_contract"]
+                if supports_bundle_feature(
+                    bundle_version, "consumer_record_validation"
+                ) else []
+            ),
             *(
                 ["acceptance_rollouts_are_not_certified_training_targets"]
                 if supports_trajectory_purpose else []

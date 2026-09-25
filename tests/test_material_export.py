@@ -384,6 +384,7 @@ class MaterialExportTest(unittest.TestCase):
             self.assertEqual(report["items"], 1)
             self.assertEqual(report["transitions"], 1)
             self.assertTrue(report["production_contract_ready"])
+            self.assertTrue(report["consumer_records_ready"])
             self.assertTrue(report["container_rollout_ready"])
             record = json.loads((bundle / "transitions.jsonl").read_text())
             self.assertEqual(record["transition"]["reward"], 1.0)
@@ -604,6 +605,11 @@ class MaterialExportTest(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest))
             report = exporter.verify_bundle(bundle)
             self.assertFalse(report["verified"])
+            self.assertFalse(report["consumer_records_ready"])
+            self.assertIn(
+                "record:direct_training_status",
+                report["consumer_record_failures"][0]["errors"],
+            )
             self.assertFalse(report["trajectory_purpose_ready"])
             self.assertIn("transition_projection", report["failed_gates"])
 

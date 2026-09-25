@@ -1764,6 +1764,7 @@ def attach_bundle_verification(
         and verification.get("trajectory_purpose_ready") is True
         and verification.get("model_response_provenance_ready") is True
         and verification.get("model_response_authorization_ready") is True
+        and verification.get("consumer_records_ready") is True
         and verification.get("metadata_privacy_ready") is True
         and verification.get("evaluator_independence_ready") is True
         and verification.get("source_dataset_sha256")
