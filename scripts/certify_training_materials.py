@@ -702,17 +702,54 @@ def attach_artifact_verification(
     return report
 
 
+def attach_bundle_verification(
+    report: dict[str, Any], verification: Mapping[str, Any]
+) -> dict[str, Any]:
+    report["materials_bundle_verification"] = dict(verification)
+    report["gates"]["portable_materials_bundle"] = (
+        verification.get("verified") is True
+        and verification.get("source_dataset_sha256")
+        == report.get("materials_manifest", {}).get("dataset_sha256")
+    )
+    report["failed_gates"] = [
+        name for name, passed in report["gates"].items() if not passed
+    ]
+    report["certified"] = not report["failed_gates"]
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("history", type=Path, help="loop experiment history.json")
     parser.add_argument("--project", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--bundle-output", type=Path)
     args = parser.parse_args()
     report = certify(load(args.history.resolve()), default_policy())
     from verify_training_materials import verify
     report = attach_artifact_verification(
         report, verify(report["materials_manifest"], args.project.resolve())
     )
+    if report["certified"]:
+        from export_training_materials import export_bundle, verify_bundle
+        bundle_root = (
+            args.bundle_output.resolve() if args.bundle_output
+            else args.history.resolve().parent / "training_materials_bundle"
+        )
+        try:
+            if bundle_root.is_dir() and any(bundle_root.iterdir()):
+                bundle_verification = verify_bundle(bundle_root)
+            else:
+                bundle_verification = export_bundle(
+                    report, bundle_root, args.project.resolve()
+                )
+        except Exception as exc:
+            bundle_verification = {
+                "verified": False,
+                "failed_gates": ["bundle_export"],
+                "error_type": type(exc).__name__,
+            }
+        report = attach_bundle_verification(report, bundle_verification)
     rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     output = args.output or args.history.with_name("production_readiness.json")
     output.write_text(rendered, encoding="utf-8")

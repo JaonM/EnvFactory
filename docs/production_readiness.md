@@ -64,6 +64,12 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 认证要求每个合格样本都有唯一证据指纹；后续导入训练系统时应重新计算这些摘要，拒绝认证后被修改、
 替换或额外混入的任务、沙箱和轨迹。只有认证报告 `certified=true` 时，这份清单才能作为正式输入。
 
+生产认证还会原子生成 `training_materials_bundle/`。该目录不保留本机绝对路径，按内容身份保存每个
+环境的任务、运行时代码、业务数据、验收证据和 `live_rollout.json`，并生成 `transitions.jsonl` 与
+`bundle_manifest.json`。JSONL 每行是一条可重建的 schema v2 transition，并携带任务、类别、episode、
+Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bundle_sha256` 再次校验；导出失败或包校验
+失败时，即使此前统计门禁通过，也不会产生 `production_prepared_for_agentic_rl`。
+
 导入前执行：
 
 ```bash
@@ -74,3 +80,12 @@ uv run python scripts/verify_training_materials.py \
 验证器会分别重新计算任务文件、沙箱可移植文件树、rollout JSON 和整批清单摘要；任何文件变化、
 轨迹数量变化或重复沙箱身份都会返回非零退出码。评估器版本作为 provenance 固化，但后续评估器升级
 不会被误判成已认证沙箱遭到篡改。v1 清单仍可验证，但应重新认证并升级为 v2 后再导入训练系统。
+
+迁移或导入训练平台后可独立验证便携包：
+
+```bash
+uv run python scripts/export_training_materials.py \
+  output/loop_experiment_v1/production_readiness.json \
+  --output output/loop_experiment_v1/training_materials_bundle \
+  --verify-only
+```

@@ -822,6 +822,26 @@ def main():
                         certification,
                         verify(certification["materials_manifest"], project),
                     )
+                    if certification["certified"]:
+                        from certify_training_materials import attach_bundle_verification
+                        from export_training_materials import export_bundle, verify_bundle
+                        bundle_root = root / "training_materials_bundle"
+                        try:
+                            if bundle_root.is_dir() and any(bundle_root.iterdir()):
+                                bundle_verification = verify_bundle(bundle_root)
+                            else:
+                                bundle_verification = export_bundle(
+                                    certification, bundle_root, project
+                                )
+                        except Exception as exc:
+                            bundle_verification = {
+                                "verified": False,
+                                "failed_gates": ["bundle_export"],
+                                "error_type": type(exc).__name__,
+                            }
+                        certification = attach_bundle_verification(
+                            certification, bundle_verification
+                        )
                     write_json(root / "production_readiness.json", certification)
                     write_json(
                         root / "training_materials_manifest.json",

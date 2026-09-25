@@ -83,3 +83,7 @@ Agent 只获得题面、公开工具及观测，使用 JSON 动作协议自主�
 不允许在运行中的实验目录对应源码上继续修改。最终候选冻结后由调度器自动运行生产留出集，
 `history.json` 的最终停止原因只有 `production_prepared_for_agentic_rl` 才表示生产准备认证通过；
 `holdout_target_met` 仅属于 pilot 门禁。
+
+生产认证通过统计、真实性和不可变性门禁后，还必须成功导出并复验
+`training_materials_bundle/`。该包使用相对路径和内容摘要，可直接迁移到后续 RL 数据转换/训练系统；
+仅存在指向本机输出目录的清单不再足以触发生产准备停止原因。
