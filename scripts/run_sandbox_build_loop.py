@@ -126,71 +126,9 @@ def latest_seed(history: dict[str, Any], task_id: int) -> Path | None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="循环构建并按 Agentic 训练价值评分沙箱")
-    parser.add_argument("--project", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--output", type=Path, default=Path("output/sandbox_loop"))
-    parser.add_argument("--max-rounds", type=int, default=50)
-    parser.add_argument("--max-concurrency", type=int, default=2)
-    parser.add_argument("--max-attempts", type=int, default=3)
-    parser.add_argument("--task-ids", default=",".join(map(str, DEFAULT_TASK_IDS)))
-    args = parser.parse_args()
-    if not 1 <= args.max_rounds <= 50:
-        parser.error("--max-rounds 必须位于 [1, 50]")
-    task_ids = tuple(int(item) for item in args.task_ids.split(",") if item.strip())
-    if not task_ids:
-        parser.error("--task-ids 至少需要一个任务 ID")
-    project = args.project.resolve()
-    root = args.output if args.output.is_absolute() else project / args.output
-    root.mkdir(parents=True, exist_ok=True)
-    start = next_round(root)
-    history_path = root / "history.json"
-    try:
-        history = json.loads(history_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        history = {"model": REQUIRED_MODEL, "task_ids": [f"task-{item}" for item in task_ids], "rounds": []}
-
-    completed_rounds = len(history.get("rounds", []))
-    remaining_rounds = max(0, 50 - completed_rounds)
-    if remaining_rounds == 0:
-        print("sandbox loop already reached the global 50-round limit", file=sys.stderr)
-        return 1
-    rounds_to_run = min(args.max_rounds, remaining_rounds)
-
-    for offset in range(rounds_to_run):
-        round_number = start + offset
-        round_root = root / f"round-{round_number:02d}"
-        round_root.mkdir(parents=True, exist_ok=False)
-        reused = {task_id: reusable_result(history, task_id) for task_id in task_ids}
-        pending = [task_id for task_id in task_ids if reused[task_id] is None]
-        seeds = {task_id: latest_seed(history, task_id) for task_id in pending}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_concurrency) as executor:
-            futures = {
-                task_id: executor.submit(
-                    run_one, project, round_root, task_id, args.max_attempts, seeds[task_id]
-                )
-                for task_id in pending
-            }
-            built = {task_id: future.result() for task_id, future in futures.items()}
-        results = [reused[task_id] or built[task_id] for task_id in task_ids]
-        passed = all(
-            item["score"].get("score", 0) >= 8
-            and item["score"].get("passed") is True
-            and item["score"].get("model") == REQUIRED_MODEL
-            and item["score"].get("review_model") == REQUIRED_MODEL
-            for item in results
-        )
-        report = {
-            "round": round_number, "model": REQUIRED_MODEL,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "passed": passed, "tasks": results,
-        }
-        (round_root / "round_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        history["rounds"].append(report)
-        history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps({"round": round_number, "passed": passed, "scores": {item["task_id"]: item["score"].get("score", 0) for item in results}}, ensure_ascii=False))
-        if passed:
-            return 0
-    return 1
+    # Preserve helper imports for older callers; CLI experiments use durable state.
+    from loop_experiment import main as experiment_main
+    return experiment_main()
 
 
 if __name__ == "__main__":
