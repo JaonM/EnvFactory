@@ -1151,6 +1151,25 @@ def main():
     paths = [] if args.generate_count else [(task_root / f"task-{value}/task.json").resolve() for value in ids]
     if any(not path.is_file() for path in paths):
         parser.error("task input is missing")
+    production_preflight = None
+    if args.certification_profile == "production":
+        try:
+            minimum_free_gib = float(
+                os.getenv("ENVFACTORY_MIN_FREE_GIB", "10")
+            )
+        except ValueError:
+            parser.error("ENVFACTORY_MIN_FREE_GIB must be a positive number")
+        if minimum_free_gib <= 0:
+            parser.error("ENVFACTORY_MIN_FREE_GIB must be a positive number")
+        from env_factory.production_preflight import run_production_preflight
+        production_preflight = run_production_preflight(
+            project,
+            root.parent,
+            signing_private_key=bundle_private_key,
+            trusted_public_key=bundle_public_key,
+            environment=os.environ,
+            minimum_free_bytes=int(minimum_free_gib * 1024**3),
+        )
     config = {key: value for key, value in vars(args).items() if key not in {
         "project", "output", "task_root", "task_ids",
         "bundle_signing_private_key", "bundle_trusted_public_key",
@@ -1174,6 +1193,14 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             parser.error("experiment already running")
+        if production_preflight is not None:
+            write_json(root / "production_preflight.json", production_preflight)
+            if not production_preflight["ready"]:
+                parser.error(
+                    "production preflight failed: "
+                    + ", ".join(production_preflight["failed_checks"])
+                    + f"; see {root / 'production_preflight.json'}"
+                )
         manifest = root / "experiment.json"
         if manifest.exists():
             if json.loads(manifest.read_text()) != config:

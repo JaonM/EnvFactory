@@ -119,6 +119,9 @@ transition JSON Schema、记录顺序、任务生成来源、环境重建入口�
 生产 profile 还必须传入 `--bundle-signing-private-key` 与 `--bundle-trusted-public-key`（或在 `.env` 中设置
 `ENVFACTORY_BUNDLE_SIGNING_PRIVATE_KEY`、`ENVFACTORY_BUNDLE_TRUSTED_PUBLIC_KEY`）。私钥应由组织密钥管理
 系统保管且不得提交到仓库；实验清单只冻结公钥身份。未签名包和只携带自声明公钥的包均不能通过生产门禁。
+正式实验获得输出锁后、启动任务前会写入 `production_preflight.json`，以非敏感方式检查 Codex、Docker daemon、
+OpenSSL、模型/runtime 配置、签名密钥配对及工作区余量；默认至少需要 10 GiB，可通过
+`ENVFACTORY_MIN_FREE_GIB` 提高。preflight 不向模型 provider 发请求，联网授权与可用性仍由运行方负责。
 任务会在每个训练类别内按近重复任务家族确定性分层为 80% train、10% validation、10% test；同一家族及
 一个任务的所有 episode/transition 共享同一 split。生产包要求每个类别覆盖三个 split，且任务家族不得
 跨类别或跨 split，防止模板变体泄漏到下游评估集。
