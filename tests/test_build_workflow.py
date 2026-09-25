@@ -281,7 +281,9 @@ def handler(data, arguments):
             self.assertIn("class TaskHooks", implementation)
             self.assertEqual(json.loads((root / "tools.json").read_text()), tools)
             self.assertIn("USER sandbox", (root / "Dockerfile").read_text())
-            self.assertIn("pytest", (root / "requirements-dev.txt").read_text())
+            requirements = (root / "requirements-dev.txt").read_text().splitlines()
+            self.assertIn("pytest==9.1.1", requirements)
+            self.assertTrue(all("==" in item for item in requirements))
             self.assertTrue((root / "docker_build.sh").stat().st_mode & 0o111)
             completed = subprocess.run(
                 [sys.executable, "-m", "pytest", "-q"], cwd=root,

@@ -277,7 +277,14 @@ def generate(root: Path, *, preserve_implementation: bool = False) -> None:
     (root / "sandbox_profile.json").write_text(
         json.dumps(training, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    (root / "requirements-dev.txt").write_text("pytest>=8,<10\n", encoding="utf-8")
+    (root / "requirements-dev.txt").write_text(
+        "iniconfig==2.3.0\n"
+        "packaging==26.3\n"
+        "pluggy==1.6.0\n"
+        "Pygments==2.21.0\n"
+        "pytest==9.1.1\n",
+        encoding="utf-8",
+    )
     (root / "acceptance_runner.py").write_text(ACCEPTANCE_RUNNER_SOURCE, encoding="utf-8")
     (root / "acceptance.sh").write_text(ACCEPTANCE_SH_SOURCE, encoding="utf-8")
     (root / "acceptance.sh").chmod(0o755)

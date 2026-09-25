@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 context=""
 tag="env-factory-agent-sandbox"
 start="false"
@@ -114,48 +116,96 @@ fi
 candidates=("$base_image" "${mirrors[@]}")
 
 selected=""
+manifest_file="$(mktemp "${TMPDIR:-/tmp}/env-factory-manifest.XXXXXX")"
+resolved_dockerfile="$(mktemp "${TMPDIR:-/tmp}/env-factory-dockerfile.XXXXXX")"
+cleanup() { rm -f "$manifest_file" "$resolved_dockerfile"; }
+trap cleanup EXIT
+read -r docker_os docker_arch < <(docker info --format '{{.OSType}} {{.Architecture}}')
 for candidate in "${candidates[@]}"; do
   [[ -n "$candidate" ]] || continue
   echo "验证基础镜像可达性：$candidate" >&2
-  if docker manifest inspect "$candidate" >/dev/null 2>&1; then
-    selected="$candidate"
-    break
+  if docker manifest inspect --verbose "$candidate" >"$manifest_file" 2>/dev/null; then
+    resolved="$(python3 "$script_dir/resolve_container_image.py" \
+      "$manifest_file" "$candidate" "$docker_os" "$docker_arch" || true)"
+    if [[ -n "$resolved" ]]; then
+      selected="$resolved"
+      break
+    fi
   fi
 done
 if [[ -z "$selected" ]]; then
-  echo "原始基础镜像及平替镜像均不可达：$base_image" >&2
+  echo "原始基础镜像及平替镜像无法解析为当前平台的内容摘要：$base_image" >&2
   exit 6
 fi
 echo "使用基础镜像：$selected" >&2
 
-resolved_dockerfile="$(mktemp "${TMPDIR:-/tmp}/env-factory-dockerfile.XXXXXX")"
-cleanup() { rm -f "$resolved_dockerfile"; }
-trap cleanup EXIT
 awk -v image="$selected" '
-  BEGIN { replaced = 0 }
-  !replaced && toupper($1) == "FROM" {
+  toupper($1) == "FROM" {
     line = $0
     sub(/^[[:space:]]*FROM[[:space:]]+[^[:space:]]+/, "FROM " image, line)
     print line
-    replaced = 1
     next
   }
   { print }
 ' "$dockerfile" > "$resolved_dockerfile"
 
-docker build --pull=missing --file "$resolved_dockerfile" --tag "$tag" "$context"
+docker build --pull --file "$resolved_dockerfile" --tag "$tag" "$context"
 # Keep a machine-readable image provenance record beside the sandbox.
 image_id="$(docker image inspect --format '{{.Id}}' "$tag")"
-python3 - "$context/docker_image_metadata.json" "$tag" "$selected" "$image_id" <<'PY'
+image_user="$(docker image inspect --format '{{.Config.User}}' "$tag")"
+image_os="$(docker image inspect --format '{{.Os}}' "$tag")"
+image_arch="$(docker image inspect --format '{{.Architecture}}' "$tag")"
+case "$docker_arch" in aarch64) docker_arch="arm64" ;; x86_64) docker_arch="amd64" ;; esac
+case "$image_arch" in aarch64) image_arch="arm64" ;; x86_64) image_arch="amd64" ;; esac
+if [[ "$image_os" != "$docker_os" || "$image_arch" != "$docker_arch" ]]; then
+  echo "构建镜像平台不匹配：期望 $docker_os/$docker_arch，实际 $image_os/$image_arch" >&2
+  exit 7
+fi
+if [[ -z "$image_user" || "$image_user" == "root" || "$image_user" == "0" ]]; then
+  echo "构建后的镜像不是非 root 用户：$image_user" >&2
+  exit 7
+fi
+echo "在生产安全边界内执行容器 pytest smoke test" >&2
+docker run --rm --network none --read-only \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --pids-limit 128 --memory 512m --cpus 1.0 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --tmpfs /app/.runtime:rw,nosuid,size=64m \
+  -e SANDBOX_TRAINER_API_KEY=container-smoke-test \
+  -e SANDBOX_EVALUATOR_MOCK=1 \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  "$tag" python3 -m pytest -q -p no:cacheprovider
+# Publish the exact image identity used by this build into the portable source.
+cp "$resolved_dockerfile" "$dockerfile"
+python3 - "$context/docker_image_metadata.json" "$tag" "$selected" "$image_id" \
+  "$image_os" "$image_arch" "$image_user" "$dockerfile" "$context/requirements-dev.txt" <<'PY'
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
 Path(sys.argv[1]).write_text(json.dumps({
+    "version": "2.0",
     "tag": sys.argv[2],
     "base_image": sys.argv[3],
     "image_id": sys.argv[4],
+    "platform": {"os": sys.argv[5], "architecture": sys.argv[6]},
+    "runtime_user": sys.argv[7],
+    "dockerfile_sha256": digest(sys.argv[8]),
+    "requirements_sha256": digest(sys.argv[9]),
+    "smoke_test": {
+        "passed": True,
+        "command": "python3 -m pytest -q -p no:cacheprovider",
+        "network": "none",
+        "read_only_root": True,
+        "cap_drop": "ALL",
+        "no_new_privileges": True,
+        "non_root_user": True,
+    },
     "built_at": datetime.now(timezone.utc).isoformat(),
 }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
