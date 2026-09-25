@@ -83,3 +83,59 @@ def task_family_ids(
         for index in members:
             result[identities[index]] = family_id
     return result
+
+
+def task_partition_isolation(
+    partitions: Mapping[str, Iterable[Mapping[str, Any]]], threshold: float = 0.9
+) -> dict[str, Any]:
+    """Prove that no semantic near-duplicate family crosses dataset partitions.
+
+    A partition may be a development corpus or an independent holdout batch.
+    The report contains content-derived family IDs, never task text.
+    """
+    flattened: list[dict[str, Any]] = []
+    item_partitions: dict[str, str] = {}
+    partition_counts: dict[str, int] = {}
+    for partition, tasks in partitions.items():
+        name = str(partition)
+        values = list(tasks)
+        partition_counts[name] = len(values)
+        for index, task in enumerate(values):
+            item_id = f"{len(flattened):08d}:{index:08d}"
+            flattened.append({"item_id": item_id, "task": task.get("task")})
+            item_partitions[item_id] = name
+    if not flattened:
+        return {
+            "version": "1.0",
+            "threshold": threshold,
+            "isolated": False,
+            "partition_counts": partition_counts,
+            "family_count": 0,
+            "cross_partition_family_count": 0,
+            "cross_partition_families": [],
+        }
+    families = task_family_ids(flattened, threshold=threshold)
+    memberships: dict[str, dict[str, int]] = {}
+    for item_id, family_id in families.items():
+        partition = item_partitions[item_id]
+        counts = memberships.setdefault(family_id, {})
+        counts[partition] = counts.get(partition, 0) + 1
+    overlaps = [
+        {
+            "family_id": family_id,
+            "partitions": sorted(counts),
+            "items": sum(counts.values()),
+            "partition_items": dict(sorted(counts.items())),
+        }
+        for family_id, counts in sorted(memberships.items())
+        if len(counts) > 1
+    ]
+    return {
+        "version": "1.0",
+        "threshold": threshold,
+        "isolated": not overlaps,
+        "partition_counts": dict(sorted(partition_counts.items())),
+        "family_count": len(memberships),
+        "cross_partition_family_count": len(overlaps),
+        "cross_partition_families": overlaps,
+    }

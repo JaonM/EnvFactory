@@ -23,7 +23,8 @@ uv run python scripts/run_sandbox_build_loop.py \
 默认 `--certification-profile production` 连续执行 3 个独立批次，每批使用 400 个留出请求并要求
 至少形成 300 个全新任务；每个合格沙箱执行至少 10 次 rollout。各批次采用独立 seed、从零构建，
 内容和 seed 不得与开发轮或其他留出批次
-重复。完成后由 `scripts/certify_training_materials.py` 根据置信区间、类别覆盖、重复率、运行时隔离、
+重复；数字、标点或轻微措辞改写形成的近重复任务家族同样不得跨越开发集和任何留出批次。
+完成后由 `scripts/certify_training_materials.py` 根据置信区间、类别覆盖、重复率、跨分区家族隔离、运行时隔离、
 奖励反事实和轨迹完整性生成 `production_readiness.json`。只有停止原因
 `production_prepared_for_agentic_rl` 表示生产级训练素材准备认证通过。
 

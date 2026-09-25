@@ -34,7 +34,7 @@ from env_factory.data_governance import (
 )
 from env_factory.container_provenance import verify_container_provenance
 from env_factory.execution_provenance import verify_execution_provenance
-from env_factory.task_similarity import near_duplicate_rate
+from env_factory.task_similarity import near_duplicate_rate, task_partition_isolation
 from env_factory.generation_provenance import generation_provenance_snapshot
 
 
@@ -272,6 +272,43 @@ def fresh_holdout_evidence(
     }
 
 
+def _report_task_documents(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    documents = []
+    for job in report.get("jobs", []):
+        if not isinstance(job, Mapping):
+            continue
+        result = job.get("result", {})
+        path = Path(str(result.get("task_path", ""))) if isinstance(
+            result, Mapping
+        ) else Path("")
+        try:
+            value = load(path)
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            documents.append(value)
+    return documents
+
+
+def partition_isolation_evidence(
+    history: Mapping[str, Any], holdouts: Iterable[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Check development/holdout and cross-holdout near-duplicate leakage."""
+    partitions: dict[str, list[dict[str, Any]]] = {}
+    development = [
+        task
+        for report in history.get("rounds", [])
+        if isinstance(report, Mapping)
+        for task in _report_task_documents(report)
+    ]
+    if development:
+        partitions["development"] = development
+    for index, holdout in enumerate(holdouts, start=1):
+        batch = holdout.get("holdout_batch", index)
+        partitions[f"holdout:{index}:batch-{batch}"] = _report_task_documents(holdout)
+    return task_partition_isolation(partitions)
+
+
 def certify(
     history: Mapping[str, Any], policy: Mapping[str, Any], *, project: Path | None = None
 ) -> dict[str, Any]:
@@ -288,6 +325,7 @@ def certify(
     results = [job.get("result", {}) for job in jobs if isinstance(job, Mapping)]
     total = len(results)
     holdout_freshness = fresh_holdout_evidence(holdouts, policy)
+    partition_isolation = partition_isolation_evidence(history, holdouts)
     generated = [item for item in results if Path(str(item.get("task_path", ""))).is_file()]
     task_good = [
         item for item in results
@@ -637,6 +675,7 @@ def certify(
         "reward_false_negative_rate": false_negative_rate,
         "fresh_holdout_verified": holdout_freshness["verified"],
         "fresh_holdout_evidence": holdout_freshness,
+        "partition_isolation": partition_isolation,
         "holdout_batches": batch_measurements,
         "material_manifest_items": len(material_items),
         "generation_provenance": {
@@ -657,6 +696,7 @@ def certify(
             and all(item["passed"] for item in batch_measurements)
         ),
         "fresh_holdout": measurements["fresh_holdout_verified"],
+        "holdout_partition_isolation": partition_isolation["isolated"],
         "task_good_yield": (
             rates["task_good_yield"] >= policy["min_task_yield"]
             and rates["task_good_yield_ci95_lower"] >= policy["min_task_yield_ci95_lower"]

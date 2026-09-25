@@ -21,6 +21,7 @@ from env_factory.execution_provenance import (
     collect_execution_provenance,
     verify_execution_provenance,
 )
+from env_factory.task_similarity import task_partition_isolation
 
 MODEL = "gpt-5.6-luna"
 ACTIVE_PROCESSES = set()
@@ -125,6 +126,20 @@ def input_digest(path):
             digest.update(str(item.relative_to(path.parent)).encode())
             digest.update(item.read_bytes())
     return digest.hexdigest()
+
+
+def report_task_documents(report):
+    documents = []
+    for job in report.get("jobs", []):
+        result = job.get("result", {}) if isinstance(job, dict) else {}
+        path = Path(str(result.get("task_path", "")))
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            documents.append(value)
+    return documents
 
 
 def sandbox_image_tag(output: Path) -> str:
@@ -338,6 +353,22 @@ def run_holdout(project, root, config, previous_reports, *, batch_number=1):
             300 if config.get("certification_profile") == "production"
             else config["holdout_count"]
         ),
+    )
+    isolation = task_partition_isolation({
+        "previous": [
+            task for previous in previous_reports
+            for task in report_task_documents(previous)
+        ],
+        "candidate": report_task_documents(report),
+    })
+    report["summary"]["partition_isolation"] = isolation
+    report["summary"]["fresh_tasks_verified"] = (
+        report["summary"]["fresh_tasks_verified"]
+        and isolation["isolated"]
+    )
+    report["summary"]["target_met"] = (
+        report["summary"]["target_met"]
+        and isolation["isolated"]
     )
     report["phase"] = "holdout"
     report["holdout_batch"] = batch_number

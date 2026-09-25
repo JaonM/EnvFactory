@@ -335,6 +335,33 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertIn("materialized_sample_size", report["failed_gates"])
             self.assertIn("rollout_coverage", report["failed_gates"])
 
+    def test_near_duplicate_task_family_cannot_cross_holdout_batches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            first = history["holdouts"][0]["jobs"][0]["result"]
+            second = history["holdouts"][1]["jobs"][0]["result"]
+            first_task = json.loads(Path(first["task_path"]).read_text())
+            second_path = Path(second["task_path"])
+            second_task = json.loads(second_path.read_text())
+            second_task["task"] = first_task["task"] + " 2026!"
+            second_path.write_text(json.dumps(second_task))
+            changed_digest = __import__("hashlib").sha256(
+                second_path.read_bytes()
+            ).hexdigest()
+            second["live_rollout"]["task_sha256"] = changed_digest
+            sample_path = Path(second["sample_manifest"])
+            sample = json.loads(sample_path.read_text())
+            sample["task_sha256"] = changed_digest
+            sample_path.write_text(json.dumps(sample))
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["holdout_partition_isolation"])
+            self.assertEqual(
+                report["measurements"]["partition_isolation"]
+                ["cross_partition_family_count"],
+                1,
+            )
+
     def test_any_fallback_breaks_environment_integrity(self):
         with tempfile.TemporaryDirectory() as directory:
             history = self.make_history(Path(directory))

@@ -18,6 +18,9 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 三个留出批次分别保持训练构成骨架：`direct_response` 不少于 10% 且不高于 30%，
   `simple_agentic` 不少于 20%，`multi_step_agentic` 不少于 35%；未知或失败路由仍进入分母。
 - 精确重复率为 0，近似重复率不高于 5%。
+- 开发阶段与任何留出批次、以及任意两个留出批次之间不得共享近重复任务家族。隔离器使用与最终
+  train/validation/test 分组相同的标准化、3-shingle Jaccard 阈值和传递闭包；数字及标点改写不能绕过。
+  审计报告只保存内容派生的家族摘要和分区计数，不复制任务正文。
 - 每个合格沙箱至少 10 个真实 rollout，三个批次累计至少 7500 个 episode；轨迹池同时包含成功和失败。
 - 每个 episode 必须使用 transition schema v2，逐步保存模型输入、原始输出、解析动作、公开观察、
   工具或 User Simulator 结果、下一观察、奖励以及 terminated/truncated 标记；仅有 HTTP trace 不合格。
