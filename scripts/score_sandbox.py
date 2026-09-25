@@ -125,7 +125,7 @@ def evaluate(root: Path, *, project: Path, execute: bool, threshold: float, offl
         env = os.environ.copy()
         if offline:
             env["SANDBOX_EVALUATOR_MOCK"] = "1"
-            for key in ("SANDBOX_LLM_API_KEY", "SANDBOX_LLM_BASE_URL", "SANDBOX_EXTERNAL_CAPABILITY_URL"):
+            for key in ("SANDBOX_LLM_API_KEY", "SANDBOX_LLM_BASE_URL", "SANDBOX_EXTERNAL_CAPABILITY_URL", "LLM_API_KEY", "LLM_BASE_URL"):
                 env.pop(key, None)
         env.setdefault("SANDBOX_TRAINER_API_KEY", "envfactory-score-key")
         env.setdefault("SANDBOX_EVALUATOR_MOCK", "true")

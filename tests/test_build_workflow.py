@@ -50,6 +50,18 @@ class BuildWorkflowTest(unittest.TestCase):
             profile = json.loads((root / "sandbox_profile.json").read_text(encoding="utf-8"))
             self.assertEqual(profile["sandbox_profile"], "direct_response")
             self.assertIn("test_sandbox_profile_matches_training_contract", (root / "tests/test_scaffold_contract.py").read_text(encoding="utf-8"))
+            self.assertIn(
+                '"task_input": self.contract.get("public_input", {})',
+                (root / "task_impl.py").read_text(encoding="utf-8"),
+            )
+            self.assertTrue((root / "acceptance.sh").stat().st_mode & 0o111)
+            self.assertTrue((root / "acceptance_runner.py").is_file())
+            self.assertTrue((root / "IMPLEMENTATION_REPORT.md").is_file())
+            docker_run = (root / "docker_run.sh").read_text(encoding="utf-8")
+            self.assertIn("--read-only", docker_run)
+            self.assertIn("--cap-drop ALL", docker_run)
+            self.assertIn("no-new-privileges:true", docker_run)
+            self.assertIn("--pids-limit", docker_run)
 
     def test_sandbox_score_uses_ten_point_critical_gate_rubric(self):
         scorer = load_script("score_sandbox.py")
@@ -93,9 +105,16 @@ class BuildWorkflowTest(unittest.TestCase):
 
     def test_build_workflow_always_captures_terminal_status(self):
         workflow = (ROOT / "scripts" / "develop_sandbox_with_agent.sh").read_text(encoding="utf-8")
+        self.assertIn('export PYTHONPATH="$project_dir/src', workflow)
+        self.assertIn('export PATH="$project_dir/.venv/bin:$PATH"', workflow)
         self.assertIn("if run_agent_and_finalize_impl; then", workflow)
         self.assertIn('write_status "failed" "$exit_code"', workflow)
         self.assertNotIn("set +e\n  run_agent_and_finalize_impl", workflow)
+        self.assertIn(
+            "validate_agentic_training_value\n  # Mutation runs execute acceptance.sh",
+            workflow,
+        )
+        self.assertIn("restore_final_acceptance_evidence\n  validate_dockerfile_security", workflow)
 
     def test_training_readiness_enables_deterministic_evaluator_mock(self):
         validator = (ROOT / "scripts" / "validate_training_readiness.py").read_text(encoding="utf-8")
@@ -168,6 +187,27 @@ class BuildWorkflowTest(unittest.TestCase):
             self.assertTrue(mutation.direct_mutation_probe(task, "http://sandbox", "key", "bypass_trainer_auth"))
         finally:
             mutation.request = original
+
+    def test_outer_conformance_accepts_compiled_process_metric(self):
+        outer = load_script("generate_outer_conformance.py")
+        task = {
+            "actions": [{"name": "lookup"}],
+            "reward_key_steps": [{
+                "step_id": "step-1", "action_name": "lookup",
+                "rationale": "required lookup", "required_for_goal": True,
+            }],
+            "metrics": [{
+                "id": "process_lookup", "category": "process", "type": "rule-based",
+                "target_action": "lookup", "weight": 1.0,
+                "evaluator": {"kind": "trajectory_rule", "source": "runtime_rule",
+                              "score_mapping": {"pass": 1, "fail": 0}},
+            }],
+            "reward_formula": {"score_range": [-1, 1]},
+        }
+        steps, metrics = outer.check_rewards(task)
+        self.assertEqual(steps[0]["step_id"], "step-1")
+        self.assertEqual(metrics[0]["id"], "process_lookup")
+
     def test_sandbox_builder_help_exposes_model_selection(self):
         completed = subprocess.run(
             ["bash", str(ROOT / "scripts" / "develop_sandbox_with_agent.sh"), "--help"],
@@ -233,15 +273,45 @@ class BuildWorkflowTest(unittest.TestCase):
         self.assertEqual(validator.validate(first), [])
         self.assertEqual(first["authority"], "env_factory_outer_workflow")
         self.assertEqual(first["version"], "2.0")
-        self.assertEqual(first["nodes"][-1]["scope"]["tables"], ["items"])
+        self.assertEqual(
+            [node["id"] for node in first["nodes"]],
+            ["task_handlers", "metric_extensions"],
+        )
+        self.assertEqual(first["nodes"][0]["scope"]["tables"], ["items"])
 
     def test_model_judge_is_not_a_custom_development_node(self):
         generator = load_script("generate_development_plan.py")
         plan = generator.build_plan({"tools": [], "metrics": [
-            {"id": "semantic_quality", "evaluator": {"kind": "external_llm_judge"}}
+            {"id": "semantic_quality", "evaluator": {"kind": "external_llm_judge"}},
+            {"id": "hybrid_quality", "evaluator": {"kind": "hybrid_outcome"}},
         ]})
         self.assertNotIn("metric_extensions", [node["id"] for node in plan["nodes"]])
-        self.assertEqual(plan["nodes"][-1]["scope"]["metrics"], [])
+        self.assertEqual(plan["nodes"], [])
+        self.assertEqual(load_script("validate_development_plan.py").validate(plan), [])
+
+    def test_builder_supports_a_fully_declarative_zero_node_plan(self):
+        workflow = (ROOT / "scripts/develop_sandbox_with_agent.sh").read_text(encoding="utf-8")
+        self.assertIn('node_ids=("")', workflow)
+        self.assertIn('[[ -z "$node_id" ]] && continue', workflow)
+
+    def test_builder_restores_platform_assets_changed_by_task_agent(self):
+        workflow = (ROOT / "scripts/develop_sandbox_with_agent.sh").read_text(encoding="utf-8")
+        self.assertIn("platform_owned_files=(", workflow)
+        self.assertIn("sandbox_runtime.py", workflow)
+        self.assertIn("restore_and_reject_platform_changes", workflow)
+        self.assertIn("Code Agent 修改了平台资产，已恢复并拒绝本轮", workflow)
+
+    def test_semantic_reviewer_cannot_read_its_live_transcript(self):
+        workflow = (ROOT / "scripts/develop_sandbox_with_agent.sh").read_text(encoding="utf-8")
+        self.assertIn("envfactory-review-stderr", workflow)
+        self.assertIn('2>"$review_stderr_tmp"', workflow)
+        self.assertIn('cp "$review_stderr_tmp" "$review_stderr"', workflow)
+
+    def test_outer_mutation_evidence_is_authoritative_for_semantic_review(self):
+        workflow = (ROOT / "scripts/develop_sandbox_with_agent.sh").read_text(encoding="utf-8")
+        self.assertIn('mutation_log="$output_path/mutation_report.log"', workflow)
+        self.assertIn('"mutation testing: ok" in mutation_report', workflow)
+        self.assertIn("acceptance.sh is a\nsingle baseline/probe entry point", workflow)
 
     def test_runtime_validator_accepts_modular_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -270,7 +340,7 @@ class BuildWorkflowTest(unittest.TestCase):
             (root / "user_simulator.py").write_text(
                 "class UserSimulator:\n"
                 "    def __init__(self):\n"
-                "        self.profiles = []; self.scripts = []; self.sessions = []\n",
+                "        self.profiles = []; self.scripts = []\n",
                 encoding="utf-8",
             )
             completed = subprocess.run(

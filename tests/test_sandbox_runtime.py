@@ -2,12 +2,15 @@ import json
 import os
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 from env_factory.sandbox_runtime import (
     ContractRewardAggregator,
     ContractRewardGate,
     ContractEvaluatorRuntime,
+    ContractModelMetricEvaluator,
     ContractToolRegistry,
     ContractUserSimulator,
     DeclarativeToolCompiler,
@@ -16,7 +19,6 @@ from env_factory.sandbox_runtime import (
     EpisodeStore,
     ExternalCapabilityClient,
     DataManifestValidator,
-    EvaluatorMock,
     SandboxError,
     SandboxApplication,
     ManifestDataStore,
@@ -26,6 +28,43 @@ from env_factory.sandbox_runtime import (
 
 
 class SandboxRuntimeTest(unittest.TestCase):
+    @staticmethod
+    def _wsgi_request(app, path, raw=b"{broken", authorization=None):
+        environ = {
+            "REQUEST_METHOD": "POST", "PATH_INFO": path,
+            "CONTENT_LENGTH": str(len(raw)), "wsgi.input": BytesIO(raw),
+        }
+        if authorization:
+            environ["HTTP_AUTHORIZATION"] = authorization
+        captured = {}
+        def start_response(status, headers):
+            captured.update(status=status, headers=dict(headers))
+        body = b"".join(app(environ, start_response))
+        captured["body"] = json.loads(body)
+        return captured
+
+    def test_metric_paths_support_literal_row_filters(self):
+        rows = {"entries": [{"name": "固有词", "definition": "new"},
+                            {"name": "other", "definition": "old"}]}
+        resolve = DeclarativeMetricEvaluator._resolve
+        self.assertEqual(resolve(rows, "$.entries[?(@.name=='固有词')].definition"), "new")
+        self.assertEqual(resolve(rows, "$.entries[0].definition"), "new")
+        self.assertEqual(resolve(rows, "$.entries[?(@.name=='missing')]"), [])
+        rows["entries"].append({"name": "固有词", "definition": "conflict"})
+        self.assertEqual(resolve(rows, "$.entries[?(@.name=='固有词')].definition"), ["new", "conflict"])
+
+    def test_metric_paths_reject_unsupported_expressions(self):
+        for path in ("$.entries[?(@.x>1)]", "$.entries[-1]"):
+            with self.subTest(path=path), self.assertRaises(SandboxError):
+                DeclarativeMetricEvaluator.path_tokens(path)
+
+    def test_metric_paths_project_array_wildcards(self):
+        rows = {"entries": [{"id": "a"}, {"id": "b"}]}
+        self.assertEqual(
+            DeclarativeMetricEvaluator._resolve(rows, "$.entries[*].id"),
+            ["a", "b"],
+        )
+
     def test_external_capability_client_uses_training_fixture_or_explicit_gap(self):
         previous = os.environ.get("SANDBOX_EXTERNAL_FIXTURES")
         try:
@@ -43,7 +82,7 @@ class SandboxRuntimeTest(unittest.TestCase):
                 os.environ["SANDBOX_EXTERNAL_FIXTURES"] = previous
 
     def test_contract_evaluator_runtime_caches_and_traces_fallback(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SANDBOX_EVALUATOR_MOCK": "1"}):
             store = EpisodeStore(Path(directory) / "episodes.sqlite3")
             store.reset(episode_id="eval", seed=1)
             evaluator = ContractEvaluatorRuntime(store)
@@ -55,6 +94,61 @@ class SandboxRuntimeTest(unittest.TestCase):
             events = store.replay()["events"]
             self.assertEqual([item["event"] for item in events], ["evaluator_call"])
 
+    def test_model_evaluator_limits_context_and_explains_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite3")
+            store.reset(episode_id="eval", seed=1)
+            contract = {
+                "task": "Compare A and B",
+                "public_input": {"initial_user_message": "Compare A and B for this project"},
+                "metrics": [{
+                "id": "quality", "rubric": "answer is correct",
+                "criteria": ["contains the requested comparison"],
+                "evaluation_inputs": ["final_agent_response"],
+                "score_range": [0, 1],
+                "evaluator": {
+                    "kind": "external_llm_judge", "source": "external_llm",
+                    "score_mapping": {"satisfied": 1, "partial": 0.5, "missing": 0},
+                },
+                }],
+            }
+            captured = {}
+            def fake_chat(client, messages, **kwargs):
+                captured["messages"] = messages
+                return {"label": "satisfied"}
+            with patch("env_factory.sandbox_runtime.RuntimeLLMClient.json_chat", new=fake_chat):
+                scores = ContractModelMetricEvaluator(contract, store).evaluate_all(
+                    {"final_agent_response": "A vs B", "business_state": {"huge": [1] * 1000}}, {}
+                )
+            self.assertEqual(scores, {"quality": 1.0})
+            self.assertIn("label_scores", captured["messages"][0]["content"])
+            self.assertIn("all assistant responses cumulatively", captured["messages"][0]["content"])
+            self.assertIn("Compare A and B for this project", captured["messages"][1]["content"])
+            self.assertNotIn("business_state", captured["messages"][1]["content"])
+
+    def test_wsgi_auth_precedes_malformed_json_and_preserves_request_id(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"SANDBOX_TRAINER_API_KEY": "trainer-key"}
+        ):
+            store = EpisodeStore(Path(directory) / "episodes.sqlite3")
+            app = SandboxApplication(
+                episode_store=store,
+                tool_registry=ContractToolRegistry([], {}),
+                observation=lambda: {}, reward=lambda: {"reward": 0},
+                user_turn=lambda messages: {"user_query": "ok", "should_end": True},
+            )
+            unauthorized = self._wsgi_request(app, "/v1/reset")
+            self.assertEqual(unauthorized["status"], "401 Unauthorized")
+            authorized = self._wsgi_request(
+                app, "/v1/reset", authorization="Bearer trainer-key"
+            )
+            self.assertEqual(authorized["status"], "400 Bad Request")
+            self.assertEqual(authorized["body"]["error"]["code"], "INVALID_JSON")
+            self.assertEqual(
+                authorized["headers"]["X-Request-ID"],
+                authorized["body"]["error"]["request_id"],
+            )
+
     def test_manifest_data_store_supports_stateless_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             store = EpisodeStore(Path(directory) / "episodes.sqlite3")
@@ -64,6 +158,43 @@ class SandboxRuntimeTest(unittest.TestCase):
             data.reset()
             self.assertEqual(data.baseline, {})
             self.assertEqual(data.snapshot_hash(), __import__("hashlib").sha256(b"{}").hexdigest())
+
+    def test_manifest_data_store_enforces_sql_types_indexes_and_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            schema = {
+                "table_name": "samples",
+                "columns": [
+                    {"name": "id", "type": "BIGINT", "nullable": False},
+                    {"name": "code", "type": "VARCHAR(20)", "nullable": False},
+                    {"name": "efficiency", "type": "DECIMAL(5,2)", "nullable": False},
+                ],
+                "primary_key": ["id"],
+                "foreign_keys": [],
+                "indexes": [{"name": "uq_code", "columns": ["code"], "unique": True}],
+                "constraints": [{
+                    "name": "efficiency_range", "type": "CHECK",
+                    "expression": "efficiency >= 0 AND efficiency <= 100",
+                }],
+            }
+            (root / "schema.json").write_text(json.dumps(schema), encoding="utf-8")
+            (root / "rows.jsonl").write_text(
+                json.dumps({"id": 1, "code": "S-1", "efficiency": 22.5}) + "\n",
+                encoding="utf-8",
+            )
+            manifest = {"environment_mode": "stateful", "tables": [{
+                "table_name": "samples", "schema_file": "schema.json",
+                "rows_file": "rows.jsonl",
+            }]}
+            store = EpisodeStore(root / "episodes.sqlite3")
+            data = ManifestDataStore(manifest, root, store)
+            data.reset()
+            with self.assertRaisesRegex(SandboxError, "CHECK constraint failed"):
+                data.update("samples", {"id": 1}, {"efficiency": 101})
+            with self.assertRaisesRegex(SandboxError, "must be number"):
+                data.update("samples", {"id": 1}, {"efficiency": "22.5"})
+            with self.assertRaisesRegex(SandboxError, "duplicate unique index"):
+                data.insert("samples", {"id": 2, "code": "S-1", "efficiency": 20.0})
 
     def test_contract_user_simulator_failure_does_not_accept_completion_claim(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -261,6 +392,48 @@ class SandboxRuntimeTest(unittest.TestCase):
             {"event": "tool_call", "payload": {"tool_name": "weather"}}
         ]}})
         self.assertEqual((clean, noisy), (0.0, -1.0))
+
+    def test_declarative_metric_contains_partial_business_row(self):
+        evaluator = DeclarativeMetricEvaluator()
+        spec = {
+            "metric_id": "updated", "source": "business_state",
+            "path": "$.samples", "operator": "contains",
+            "expected": {"sample_id": "S-1", "efficiency": 22.8},
+            "score_mapping": {"pass": 1, "fail": 0},
+        }
+        context = {"business_state": {"samples": [
+            {"sample_id": "S-1", "material": "silicon", "efficiency": 22.8}
+        ]}}
+        self.assertEqual(evaluator.evaluate(spec, context), 1.0)
+        context["business_state"]["samples"][0]["efficiency"] = 21.5
+        self.assertEqual(evaluator.evaluate(spec, context), 0.0)
+
+    def test_declarative_metric_matches_exact_tool_call_with_capture(self):
+        evaluator = DeclarativeMetricEvaluator()
+        spec = {
+            "metric_id": "write", "source": "trajectory", "path": "$.events",
+            "operator": "contains_tool_call",
+            "expected": {
+                "tool_name": "update_item",
+                "arguments": {"item_id": {"$ref": "selected_id"}, "quantity": 5},
+                "captures": [{
+                    "name": "selected_id", "tool_name": "find_item",
+                    "path": "$.records[0].id",
+                }],
+            },
+            "score_mapping": {"pass": 1, "fail": 0},
+        }
+        events = [
+            {"event": "tool_call", "payload": {
+                "tool_name": "find_item", "arguments": {"name": "tea"},
+            }, "result": {"records": [{"id": 7}]}},
+            {"event": "tool_call", "payload": {
+                "tool_name": "update_item", "arguments": {"item_id": 7, "quantity": 5},
+            }, "result": {"updated_count": 1}},
+        ]
+        self.assertEqual(evaluator.evaluate(spec, {"trajectory": {"events": events}}), 1.0)
+        events[-1]["payload"]["arguments"]["quantity"] = 4
+        self.assertEqual(evaluator.evaluate(spec, {"trajectory": {"events": events}}), 0.0)
     def test_declarative_tool_compiler_filters_projects_and_orders(self):
         class FakeData:
             def table(self, name):
@@ -286,6 +459,26 @@ class SandboxRuntimeTest(unittest.TestCase):
         })
         self.assertEqual(handler({"kind": "cdn", "enabled": True}), {
             "services": [{"id": "1", "kind": "cdn"}], "count": 1
+        })
+
+    def test_declarative_tool_contains_accepts_multi_value_query(self):
+        class FakeData:
+            def table(self, name):
+                return [
+                    {"id": "1", "tags": ["neutral", "linen"]},
+                    {"id": "2", "tags": ["formal"]},
+                ]
+
+        handler = DeclarativeToolCompiler(FakeData()).compile({
+            "tool_name": "query",
+            "operation": "select",
+            "table": "items",
+            "filters": [{"argument": "tags", "column": "tags", "operator": "contains"}],
+            "projection": ["id"],
+            "result_field": "records",
+        })
+        self.assertEqual(handler({"tags": ["neutral", "casual"]}), {
+            "records": [{"id": "1"}], "count": 1,
         })
 
     def test_manifest_store_write_operations(self):
@@ -594,6 +787,14 @@ class SandboxRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(allowed["outcome"], 1.0)
 
+        wrong_arguments = gate.apply(
+            {"process": 0.0, "outcome": 1.0},
+            {"trajectory": {"events": [{
+                "event": "tool_call", "payload": {"tool_name": "lookup", "noise": False},
+            }]}},
+        )
+        self.assertEqual(wrong_arguments["outcome"], 0.0)
+
     def test_reward_gate_enforces_multi_step_dependency_order(self):
         metrics = [{"id": "outcome", "category": "outcome", "score_range": [0, 1]}]
         gate = ContractRewardGate({
@@ -610,6 +811,29 @@ class SandboxRuntimeTest(unittest.TestCase):
             ]}}
         self.assertEqual(gate.apply({"outcome": 1.0}, context(["update", "lookup"]))["outcome"], 0.0)
         self.assertEqual(gate.apply({"outcome": 1.0}, context(["lookup", "update"]))["outcome"], 1.0)
+
+    def test_reward_gate_removes_isolated_process_credit_before_chain_completion(self):
+        metrics = [
+            {"id": "lookup_process", "category": "process", "score_range": [0, 1]},
+            {"id": "update_process", "category": "process", "score_range": [0, 1]},
+            {"id": "outcome", "category": "outcome", "score_range": [0, 1]},
+        ]
+        gate = ContractRewardGate({
+            "training_contract": {"category": "multi_step_agentic"},
+            "capability_dag": {
+                "nodes": ["lookup", "update"],
+                "edges": [{"from_tool": "lookup", "to_tool": "update"}],
+            },
+        }, metrics)
+        blocked = gate.apply(
+            {"lookup_process": 0.0, "update_process": 1.0, "outcome": 0.0},
+            {"trajectory": {"events": [{
+                "event": "tool_call", "payload": {"tool_name": "update", "noise": False},
+            }]}},
+        )
+        self.assertEqual(blocked, {
+            "lookup_process": 0.0, "update_process": 0.0, "outcome": 0.0,
+        })
 
     def test_reward_gate_leaves_unnecessary_tool_cost_to_penalty_metric(self):
         gate = ContractRewardGate({
@@ -672,13 +896,6 @@ class SandboxRuntimeTest(unittest.TestCase):
                 os.environ.pop("SANDBOX_TRAINER_API_KEY", None)
             else:
                 os.environ["SANDBOX_TRAINER_API_KEY"] = previous
-
-    def test_evaluator_mock_records_calls(self):
-        mock = EvaluatorMock(lambda request: {"match": request["actual"] == request["expected"]})
-        self.assertEqual(mock.evaluate({"actual": "a", "expected": "a"}), {"match": True})
-        self.assertEqual(len(mock.calls), 1)
-        self.assertTrue(mock.calls[0]["request_hash"])
-
 
 if __name__ == "__main__":
     unittest.main()

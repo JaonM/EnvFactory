@@ -3,6 +3,13 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The workflow invokes project-owned Python entry points directly.  Make the
+# src-layout package importable even when the caller did not activate the
+# repository's virtual environment or install EnvFactory into site-packages.
+export PYTHONPATH="$project_dir/src${PYTHONPATH:+:$PYTHONPATH}"
+if [[ -x "$project_dir/.venv/bin/python3" ]]; then
+  export PATH="$project_dir/.venv/bin:$PATH"
+fi
 input="examples/clothing_materials_task.json"
 output=""
 output_auto="true"
@@ -330,11 +337,11 @@ write_task_prompt() {
 The complete task input is in ./task.json. The immutable outer-workflow contract is in ./BUILD_CONTRACT.json; it is the task.json projection with the top-level actions field removed. Treat it as authoritative for sandbox implementation. Implement the sandbox directly from BUILD_CONTRACT.json and the referenced artifacts. Do not create or depend on spec.md. EnvFactory generates an outer conformance plan after implementation; do not modify, replace, or treat the sandbox's acceptance.sh as authoritative.
 The project output directory is: $task_output
 
-Reward implementation is contract-driven and must not be simplified. Load every metric.evaluator from BUILD_CONTRACT.json and implement it generically: process metrics call the external OpenAI-compatible LLM for expected tool name and arguments, then compare canonical arguments exactly; rule-based metrics execute their declared assertion against runtime fields; model-based metrics call the external LLM; hybrid outcome metrics execute both branches according to score_mapping. Do not use fixed tool positions, keyword presence, successful-call coverage, or a boolean final-document shortcut as a substitute. Acceptance must test passing and failing cases for every evaluator family, including wrong tool arguments, wrong numeric results, missing business changes, repeated invalid calls, and user-intent deviation. The reward endpoint must use the declared metric scores and reward_formula exactly.
+Reward implementation is contract-driven and must not be simplified. Load every metric.evaluator and top-level metric_implementations entry from BUILD_CONTRACT.json. Compiled process and rule-based metrics use DeclarativeMetricEvaluator; only metrics still declared model-based use the external evaluator boundary. Do not use fixed tool positions, keyword presence, successful-call coverage, or a boolean final-document shortcut as a substitute. Acceptance must test passing and failing cases for every evaluator family, including wrong tool arguments, wrong numeric results, missing business changes, repeated invalid calls, and user-intent deviation. The reward endpoint must use the declared metric scores and reward_formula exactly.
 
 The sandbox is acceptable only if it teaches the tool policy declared by BUILD_CONTRACT.training_contract. For direct_response, the successful trajectory must not call tools and unnecessary tool use must not improve reward. For tool-requiring profiles, a canned final answer without required task-tool calls must receive reward <= 0.2. A trajectory with corrupted business arguments, placeholder values, empty required collections, empty business results, or skipped required steps must be rejected or receive reward <= 0.2. For dependent_tool_chain, downstream tools must consume upstream outputs. Valid tool-requiring trajectories must use real fixture-backed values and every required tool result must contain meaningful business evidence. Never derive an evaluator's expected arguments from the actual call being scored. Deterministic evaluator mocks must compile expected calls independently from task intent, reward_key_steps, tool bindings, and fixture values. Outcome reward must be gated by the process steps required by the declared profile.
 
-The implementation must be contract-generic: do not copy generated metric IDs, metric weights, fixed expected tool-call maps, fixed session filenames, or fixed turn cutoffs into app.py. Load metric/evaluator definitions, reward weights, user_profiles, and user_scripts from BUILD_CONTRACT.json and its manifests. The runtime UserSimulator must reason from the current profile, FSM state, legal outgoing transitions, variables, and complete live conversation through RuntimeLLMClient; it must never replay or consume task-generation dialogue sessions. Implement a real ToolRegistry, RewardEvaluator, and UserSimulator boundary. The outer workflow will reject source that hard-codes generated metric IDs or a generated dialogue transcript.
+The implementation must be contract-generic: do not copy generated metric IDs, metric weights, fixed expected tool-call maps, or fixed turn cutoffs into app.py. Load metric/evaluator definitions, reward weights, user_profiles, and user_scripts from BUILD_CONTRACT.json and its manifests. The runtime UserSimulator must reason from the current profile, FSM state, legal outgoing transitions, variables, and complete live conversation through RuntimeLLMClient. Implement a real ToolRegistry, RewardEvaluator, and UserSimulator boundary. The outer workflow will reject source that hard-codes generated metric IDs or a dialogue transcript.
 
 ## Implementation task
 
@@ -352,7 +359,7 @@ The executable acceptance script must invoke python3 (or the active interpreter 
 
 Tool handlers enforce the JSON schema, not stronger restrictions inferred from descriptive examples: wording such as "fixed" does not create an enum. A read/search/lookup tool must remain read-only. For deliverable-only tasks with no mutating business tool, POST /v1/agent_response is the persisted deliverable boundary; do not make a read tool write a synthetic outcome row. For environment_plan.mode=external_capability, route task tools through ExternalCapabilityClient. It supports a configured HTTP provider, deterministic training fixtures, and an explicit data_unavailable response; never fabricate live external facts.
 
-External evaluator failure must be conservative: never derive the expected tool or arguments from the actual call being scored, and never award a match merely because any call occurred. Use a contract-derived independent expectation when present, otherwise score zero. ContractUserSimulator calls the configured RuntimeLLMClient by default using only the sanitized payload: complete live messages, profile, current state, outgoing transitions, variables, and recovery policy. Task-specific user_renderer injection is forbidden. It must emit one of the fixed dialogue outcomes: goal_satisfied, information_required, user_correction, user_rejection, user_acceptance, agent_off_topic, agent_premature_completion, or unrecognized. Normal outcomes require match_status=matched and a current transition_id carrying the same outcome_category. Recovery outcomes must not select or advance a normal transition; unrecognized may be ambiguous, while the other recovery outcomes are unmatched. The shared runtime bounds recovery attempts and terminates them as unresolved_dialogue. The renderer must not load or pass session files, future turns, or hidden business truth to the external model. Do not replace profile-aware rendering with hard-coded state-name responses.
+External evaluator failure must be conservative: never derive the expected tool or arguments from the actual call being scored, and never award a match merely because any call occurred. Use a contract-derived independent expectation when present, otherwise score zero. ContractUserSimulator calls the configured RuntimeLLMClient by default using only the sanitized payload: complete live messages, profile, current state, outgoing transitions, variables, and recovery policy. Task-specific user_renderer injection is forbidden. It must emit one of the fixed dialogue outcomes: goal_satisfied, information_required, user_correction, user_rejection, user_acceptance, agent_off_topic, agent_premature_completion, or unrecognized. Normal outcomes require match_status=matched and a current transition_id carrying the same outcome_category. Recovery outcomes must not select or advance a normal transition; unrecognized may be ambiguous, while the other recovery outcomes are unmatched. The shared runtime bounds recovery attempts and terminates them as unresolved_dialogue. The renderer must not receive future turns or hidden business truth. Do not replace profile-aware rendering with hard-coded state-name responses.
 
 Preserve the scaffold's contract-generic observation fields: conversation, available_tools, tool_results, episode_id, and public_observation. Task-specific observation data may extend public_observation but must not replace the required top-level observation contract or expose hidden simulator/reward state.
 EOF
@@ -578,12 +585,21 @@ for index, metric in enumerate(metrics):
     category = metric.get("category")
     metric_type = metric.get("type")
     if category == "process":
-        if (metric_type != "hybrid" or evaluator.get("kind") != "hybrid_tool_call"
-                or evaluator.get("source") != "external_llm"
-                or evaluator.get("comparison") != "exact_tool_name_and_canonical_arguments"):
-            raise SystemExit(f"metrics[{index}] process evaluator 必须是外部 LLM 精确工具调用比较")
-        if set(evaluator["score_mapping"]) != {"match", "mismatch"}:
-            raise SystemExit(f"metrics[{index}] process score_mapping 必须包含 match/mismatch")
+        compiled_rule = (
+            metric_type == "rule-based"
+            and evaluator.get("kind") == "trajectory_rule"
+            and evaluator.get("source") == "runtime_rule"
+            and set(evaluator["score_mapping"]) == {"pass", "fail"}
+        )
+        model_rule = (
+            metric_type == "hybrid"
+            and evaluator.get("kind") == "hybrid_tool_call"
+            and evaluator.get("source") == "external_llm"
+            and evaluator.get("comparison") == "exact_tool_name_and_canonical_arguments"
+            and set(evaluator["score_mapping"]) == {"match", "mismatch"}
+        )
+        if not (compiled_rule or model_rule):
+            raise SystemExit(f"metrics[{index}] process evaluator 与声明式或外部模型契约不匹配")
         if metric.get("target_action") not in key_action_names:
             raise SystemExit(f"metrics[{index}] process target_action 必须属于 reward_key_steps")
     elif metric_type == "rule-based":
@@ -685,7 +701,15 @@ validate_outer_conformance() {
 
 validate_mutation_tests() {
   echo "执行自动 mutation testing：要求每个受控缺陷都被验收测试杀死"
-  python3 "$project_dir/scripts/run_mutation_tests.py" --root "$output_path"
+  local mutation_log mutation_status
+  mutation_log="$output_path/mutation_report.log"
+  set +e
+  python3 "$project_dir/scripts/run_mutation_tests.py" --root "$output_path" \
+    >"$mutation_log" 2>&1
+  mutation_status=$?
+  set -e
+  cat "$mutation_log"
+  return "$mutation_status"
 }
 
 validate_training_readiness() {
@@ -710,16 +734,24 @@ validate_runtime_genericity() {
 
 validate_semantic_review() {
   echo "执行独立 Code Agent 语义验收"
-  local review_tmp review_stdout review_stderr review_status review_prompt
+  local review_tmp review_stdout review_stderr review_stdout_tmp review_stderr_tmp review_status review_prompt
   review_tmp="$(mktemp "${TMPDIR:-/tmp}/envfactory-review.XXXXXX")"
   review_stdout="$output_path/review_agent.stdout"
   review_stderr="$output_path/review_agent.stderr"
+  # Never stream reviewer logs into the directory being reviewed. Search
+  # commands inside the reviewer would read their own growing transcript and
+  # create a recursive context explosion. Publish logs only after completion.
+  review_stdout_tmp="$(mktemp "${TMPDIR:-/tmp}/envfactory-review-stdout.XXXXXX")"
+  review_stderr_tmp="$(mktemp "${TMPDIR:-/tmp}/envfactory-review-stderr.XXXXXX")"
   review_prompt="$(cat <<EOF
 You are an independent read-only semantic reviewer for an RL sandbox.
 
 Review the current sandbox directory and produce ONLY one JSON object in the
 last message. Do not modify any file, do not weaken BUILD_CONTRACT.json, and
 do not treat status.json or acceptance.sh as proof of semantic correctness.
+Inspect files selectively; do not dump whole JSON or source files into the
+transcript. Prefer targeted queries and executable evidence so the review
+stays within the Luna context budget.
 Compare task.json, BUILD_CONTRACT.json, the business data manifests, tools.json,
 app.py, runtime_llm.py, sandbox_runtime.py, tests, runtime_trace.jsonl, and the
 outer-conformance evidence.
@@ -727,6 +759,14 @@ Treat defects.json and older review reports as non-authoritative hints only;
 use the current acceptance output, current mutation output, and current source
 files as evidence. If a finding contradicts a current executable result, do
 not report it as a defect.
+
+Mutation orchestration is owned by the outer workflow. acceptance.sh is a
+single baseline/probe entry point which inherits SANDBOX_MUTATION_MODE; it is
+not required to loop over mutation modes itself. Read mutation_report.log.
+When it ends in "mutation testing: ok" and contains no surviving mutant,
+accept killed and explicitly non-applicable mutations as authoritative. Do
+not require an irrelevant mutation (for example skip_business_write in a
+read-only or direct-response sandbox) to become artificially observable.
 
 Review these modules independently:
 1. business data and the real behavior of every task tool. Read the
@@ -751,10 +791,28 @@ The Trainer protocol is reset-scoped: POST /v1/reset selects the active
 episode for subsequent calls. Per-episode isolation requires independent
 persisted state and no leakage when switching/resetting episode IDs; it does
 not require simultaneous request routing to older episodes unless the
-contract declares an episode-selection header. Compiled session files are
-valid executable FSM trajectories, but the runtime must retain script/profile
-identity and declared state/variable transitions; do not reject them merely
-because deterministic fallback uses a compiled trajectory.
+contract declares an episode-selection header. The runtime must retain
+script/profile identity and declared state/variable transitions.
+
+External-LLM failure cannot establish a normal user decision. A conservative
+fallback that emits unrecognized, selects no normal transition, preserves
+normal state/variables, and terminates only after the recovery bound is the
+required safe behavior. Do not demand that fallback simulate acceptance,
+rejection, correction, or goal completion.
+
+SANDBOX_EVALUATOR_MOCK is an explicitly non-semantic acceptance fixture and
+production defaults to the external evaluator. Its trace records
+semantic_verification=false and readiness records live rollout as unverified.
+Do not report exact fixture matching as a production reward shortcut unless
+the same shortcut is reachable when mock mode is disabled.
+
+Offline construction must not contact a real external evaluator or mark a
+sandbox defective merely because training_readiness says offline_mock or
+live_rollout_verified=false. The post-build live rollout stage owns real-model
+User Simulator and evaluator verification. During this build review, verify
+that the production default routes through RuntimeLLMClient, validates its
+structured response, records trace evidence, and fails conservatively; do not
+require external network evidence before the sandbox can reach that stage.
 
 A task-specific business handler is allowed, but fixed generated metric IDs,
 fixed metric weights, fixed expected-call maps, always selecting the first
@@ -793,19 +851,22 @@ EOF
       if [[ -n "$review_model" ]]; then review_codex_args+=(--model "$review_model"); fi
       review_codex_args+=("$review_prompt")
       (cd "$output_path" && codex "${review_codex_args[@]}") \
-          >"$review_stdout" 2>"$review_stderr"
+          >"$review_stdout_tmp" 2>"$review_stderr_tmp"
       ;;
     claude)
       (cd "$output_path" && claude --print "$review_prompt") \
-          >"$review_tmp" 2>"$review_stderr"
+          >"$review_tmp" 2>"$review_stderr_tmp"
       ;;
     opencode)
       (cd "$output_path" && opencode run "$review_prompt") \
-          >"$review_tmp" 2>"$review_stderr"
+          >"$review_tmp" 2>"$review_stderr_tmp"
       ;;
   esac
   review_status=$?
   set -e
+  cp "$review_stdout_tmp" "$review_stdout"
+  cp "$review_stderr_tmp" "$review_stderr"
+  rm -f "$review_stdout_tmp" "$review_stderr_tmp"
   if [[ "$review_status" -ne 0 || ! -s "$review_tmp" ]]; then
     echo "独立语义审查 Agent 执行失败：退出码=$review_status" >&2
     cat "$review_stderr" >&2 || true
@@ -826,6 +887,7 @@ root = Path(sys.argv[2])
 report = json.loads(report_path.read_text(encoding="utf-8"))
 contract = json.loads((root / "BUILD_CONTRACT.json").read_text(encoding="utf-8"))
 current_delivery_error = (root / "last_delivery_error.txt").read_text(encoding="utf-8", errors="replace") if (root / "last_delivery_error.txt").is_file() else ""
+mutation_report = (root / "mutation_report.log").read_text(encoding="utf-8", errors="replace") if (root / "mutation_report.log").is_file() else ""
 noise = {
     item.get("name")
     for item in contract.get("noise_tools", [])
@@ -839,12 +901,11 @@ for finding in report.get("findings", []):
         finding.setdefault("tool_name", None)
         finding.setdefault("tool_category", None)
     if (finding.get("category") == "mutation_testing"
-            and "surviv" in json.dumps(finding, ensure_ascii=False).lower()
-            and "mutation testing: ok" in current_delivery_error
-            and "surviv" not in current_delivery_error.lower()):
-        # The reviewer repeated stale mutation evidence. The executable
-        # mutation runner is authoritative for this gate; do not create a
-        # repair defect from a contradictory old report.
+            and "mutation testing: ok" in mutation_report
+            and "survived" not in mutation_report.lower()):
+        # The executable outer mutation runner is authoritative. Do not ask a
+        # task agent to reimplement mutation orchestration or make an
+        # archetype-irrelevant mutant artificially observable.
         continue
     finding_tool = finding.get("tool_name")
     finding_category = finding.get("tool_category")
@@ -1189,6 +1250,43 @@ required_sandbox_files=(
   requirements-dev.txt acceptance.sh IMPLEMENTATION_REPORT.md
 )
 
+# These files are generated or copied by EnvFactory and define the platform
+# boundary.  A task implementation agent may only extend task_impl.py and
+# focused tests; task-specific fixes must never fork the shared runtime.
+platform_owned_files=(
+  task.json BUILD_CONTRACT.json development_plan.json tools.json app.py
+  runtime_llm.py sandbox_runtime.py acceptance_runner.py acceptance.sh
+  Dockerfile docker_build.sh docker_run.sh requirements-dev.txt
+)
+
+snapshot_platform_assets() {
+  local backup_dir file
+  backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/envfactory-platform.XXXXXX")"
+  for file in "${platform_owned_files[@]}"; do
+    [[ -e "$output_path/$file" ]] && cp -p "$output_path/$file" "$backup_dir/$file"
+  done
+  printf '%s\n' "$backup_dir"
+}
+
+restore_and_reject_platform_changes() {
+  local backup_dir="$1" file changed=""
+  for file in "${platform_owned_files[@]}"; do
+    if [[ -e "$backup_dir/$file" ]] && ! cmp -s "$backup_dir/$file" "$output_path/$file"; then
+      changed="${changed}${changed:+, }${file}"
+      cp -p "$backup_dir/$file" "$output_path/$file"
+    fi
+  done
+  case "$backup_dir" in
+    "${TMPDIR:-/tmp}"/envfactory-platform.*) rm -rf -- "$backup_dir" ;;
+    *) echo "拒绝清理非临时平台快照：$backup_dir" >&2; return 1 ;;
+  esac
+  if [[ -n "$changed" ]]; then
+    echo "Code Agent 修改了平台资产，已恢复并拒绝本轮：$changed" >&2
+    return 1
+  fi
+  return 0
+}
+
 validate_delivery() {
   local missing=()
   local file
@@ -1241,16 +1339,23 @@ validate_delivery() {
   validate_training_readiness
   set_build_phase "agentic_training_value" "" "${current_attempt:-0}" "${current_defect_ids:-}" "正在验证 Agentic 训练价值"
   validate_agentic_training_value
-  # Mutation runs execute acceptance.sh repeatedly and may replace the result
-  # envelope. Restore canonical final evidence before semantic review/scoring.
-  normalize_acceptance_result
-  export_runtime_trace
+  # Mutation runs execute acceptance.sh repeatedly and deliberately leave the
+  # last mutant's failed evidence behind.  Re-run a clean baseline before the
+  # semantic reviewer; merely normalizing the mutant envelope would preserve
+  # false failure evidence and invite an unnecessary model repair.
+  restore_final_acceptance_evidence
   validate_dockerfile_security
   set_build_phase "semantic_review" "" "${current_attempt:-0}" "${current_defect_ids:-}" "正在执行独立语义验收"
   validate_semantic_review
 }
 
 run_agent_and_finalize_impl() {
+  set_build_phase "buildability" "" 0 "" "正在执行任务可构建性预检"
+  if ! PYTHONDONTWRITEBYTECODE=1 python3 "$project_dir/scripts/assess_task_buildability.py" \
+      --root "$output_path" --output "$output_path/buildability.json"; then
+    echo "任务契约未通过可构建性预检；不会消耗 Code Agent 修复预算" >&2
+    return 4
+  fi
   echo "Code Agent 模块化开发阶段开始：agent=$agent output=$output_path"
   implementation_prompt="$(<"$output_path/TASK_PROMPT.md")"
 
@@ -1261,11 +1366,15 @@ run_agent_and_finalize_impl() {
       --output "$output_path/development_plan.json"
     validate_development_plan
 
-    node_ids=()
+    # Bash 3.2 with `set -u` treats expansion of a declared-but-empty array as
+    # an unbound variable.  Keep an inert sentinel so fully declarative tasks
+    # can legitimately have a zero-node development plan.
+    node_ids=("")
     while IFS= read -r node_id; do
       [[ -n "$node_id" ]] && node_ids+=("$node_id")
     done < <(python3 "$project_dir/scripts/validate_development_plan.py" "$output_path/development_plan.json" --ids | tail -n +2)
     for node_id in "${node_ids[@]}"; do
+    [[ -z "$node_id" ]] && continue
     node_done="false"
     node_error=""
     for (( node_attempt = 1; node_attempt <= max_attempts; node_attempt++ )); do
@@ -1277,8 +1386,12 @@ $node_json
 
 Implement the task-specific behavior required by this node. Reuse runtime_llm.py and sandbox_runtime.py for platform behavior. Run every validation command declared by the node. If validation fails, fix the first root cause before continuing."
       set +e
+      platform_backup="$(snapshot_platform_assets)"
       run_code_agent "$node_prompt"
       node_status=$?
+      if ! restore_and_reject_platform_changes "$platform_backup"; then
+        node_status=10
+      fi
       set -e
       if [[ "$node_status" -eq 0 ]]; then
         node_done="true"
@@ -1332,8 +1445,12 @@ $defect
 
 请检查缺陷涉及的代码和契约，完成真实修复，并增加或运行能够证明该缺陷已修复的回归测试。修复后保留其他已完成模块的行为。"
       set +e
+      platform_backup="$(snapshot_platform_assets)"
       run_code_agent "$repair_prompt"
       repair_status=$?
+      if ! restore_and_reject_platform_changes "$platform_backup"; then
+        repair_status=10
+      fi
       set -e
       if [[ "$repair_status" -ne 0 ]]; then
         echo "缺陷 $defect_id 修复退出码：$repair_status" >&2
@@ -1488,6 +1605,9 @@ run_agent_and_finalize() {
     fi
   else
     case "$current_phase" in
+      buildability)
+        current_failure_category="task_contract_failure"
+        ;;
       node_development|acceptance|semantic_review|defect_repair|defect_validation|contract_validation|trace_validation|runtime_validation|mutation_testing|training_readiness|agentic_training_value)
         current_failure_category="sandbox_failure"
         ;;

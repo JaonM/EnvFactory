@@ -53,8 +53,12 @@ def build_plan(contract: dict[str, Any]) -> dict[str, Any]:
         item.get("metric_id") for item in contract.get("metric_implementations", [])
         if isinstance(item, dict) and item.get("metric_id")
     }
-    implemented_metrics.update(item.get("id") for item in contract.get("metrics", [])
-                               if item.get("evaluator", {}).get("kind") == "external_llm_judge")
+    implemented_metrics.update(
+        item.get("id") for item in contract.get("metrics", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("evaluator"), dict)
+        and item["evaluator"].get("kind") in {"external_llm_judge", "hybrid_outcome"}
+    )
     custom_metrics = [name for name in metrics if name not in implemented_metrics]
     nodes: list[dict[str, Any]] = []
     if custom_tools:
@@ -77,16 +81,6 @@ def build_plan(contract: dict[str, Any]) -> dict[str, Any]:
             "validation": ["python3 -m pytest -q tests/reward"],
             "scope": {"metrics": custom_metrics, "archetype": archetype},
         })
-    dependencies = [node["id"] for node in nodes]
-    nodes.append({
-        "id": "delivery",
-        "goal": "Add task-specific acceptance evidence and package the immutable EnvFactory scaffold.",
-        "depends_on": dependencies,
-        "inputs": ["task_spec", "acceptance_contract", "EnvFactory-owned scaffold"],
-        "outputs": ["acceptance.sh", "acceptance_result.json", "IMPLEMENTATION_REPORT.md"],
-        "validation": ["python3 -m pytest -q", "bash ./acceptance.sh"],
-        "scope": {"tables": tables, "tools": custom_tools, "metrics": custom_metrics, "archetype": archetype},
-    })
     return {
         "version": "2.0",
         "authority": "env_factory_outer_workflow",

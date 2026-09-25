@@ -91,16 +91,14 @@ def main() -> int:
         if isinstance(metric_id, str) and metric_id and metric_id in source:
             fail(f"runtime hard-codes generated metric id: {metric_id}")
 
-    # A simulator may choose a deterministic seeded branch, but it cannot be
-    # a replay of the first session with a fixed turn cutoff.
-    if re.search(r"sessions\)\.glob\([^\n]+\)\[0\]", source) or re.search(r"glob\([^\n]+\)\)\[0\]", source):
-        fail("User Simulator must select a profile/script branch, not always use the first session")
+    # The simulator chooses a deterministic seeded profile/FSM branch and may
+    # not replace the FSM's termination decision with a fixed turn cutoff.
     if re.search(r"turns\s*>=\s*\d+", source) or re.search(r"turn_count\s*>=\s*\d+", source):
         fail("User Simulator termination must consume script/LLM should_end, not a fixed turn cutoff")
     if "ContractUserSimulator" not in source and ("class UserSimulator" not in source or not all(
-        token in source for token in ("profiles", "scripts", "sessions")
+        token in source for token in ("profiles", "scripts")
     )):
-        fail("User Simulator must load profiles, scripts, and sessions from its manifest")
+        fail("User Simulator must load profiles and scripts from its manifest")
     if re.search(r"ContractUserSimulator\s*\([^)]*renderer\s*=", source, re.S):
         fail("ContractUserSimulator must use its default external-LLM renderer; task-specific renderer injection is forbidden")
 

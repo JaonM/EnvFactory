@@ -18,8 +18,8 @@ def load(path: Path) -> dict:
 def validate(plan: dict) -> list[str]:
     errors: list[str] = []
     nodes = plan.get("nodes")
-    if not isinstance(nodes, list) or not nodes:
-        return ["development_plan.nodes must be a non-empty list"]
+    if not isinstance(nodes, list):
+        return ["development_plan.nodes must be a list"]
     ids: list[str] = []
     by_id: dict[str, dict] = {}
     for index, node in enumerate(nodes):

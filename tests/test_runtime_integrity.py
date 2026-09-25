@@ -44,6 +44,33 @@ class IntegrityTest(unittest.TestCase):
             self.assertEqual(call.call_count, 1)
             self.assertEqual(call.call_args.kwargs["response_schema"]["properties"]["label"]["enum"], ["pass", "fail"])
 
+    def test_hybrid_outcome_is_a_platform_model_metric(self):
+        contract = {"metrics": [{"id": "quality", "score_range": [0, 1], "evaluator": {
+            "kind": "hybrid_outcome",
+            "source": "external_llm",
+            "rule": {"kind": "business_state_rule", "assertion": "state matches"},
+            "external_llm": {"judge_criteria": "answer is grounded"},
+            "score_mapping": {
+                "rule_pass_and_llm_pass": 1,
+                "rule_pass_llm_fail": 0.5,
+                "rule_fail": 0,
+            },
+        }}], "acceptance_contract": {"executable_scenarios": [{
+            "kind": "goal_success", "steps": [
+                {"operation": "agent_response", "content": "grounded answer"},
+            ],
+        }]}}
+        evaluator = ContractModelMetricEvaluator(contract, self.store)
+        with patch.dict("os.environ", {"SANDBOX_EVALUATOR_MOCK": "1"}):
+            self.assertEqual(
+                evaluator.evaluate_all({"final_agent_response": "grounded answer"}, {}),
+                {"quality": 1},
+            )
+            self.assertEqual(
+                evaluator.evaluate_all({"final_agent_response": "wrong"}, {}),
+                {"quality": 0},
+            )
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -207,6 +234,14 @@ class IntegrityTest(unittest.TestCase):
             noise_tools=[{"name": "lookup_venue", "category": "unrelated", "parameter_columns": {"city": "city"},
                           "records": [{"city": "A", "capacity": 10}, {"city": "B", "capacity": 20}]}])
         self.assertEqual(registry.execute("lookup_venue", {"city": "B"}), {"records": [{"city": "B", "capacity": 20}], "count": 1})
+
+    def test_noise_behavior_is_driven_by_fixture_not_function_name(self):
+        for name in ("lookup_dice_history", "roll_virtual_die", "roll_virtual_die_2"):
+            registry = ContractToolRegistry([{"type": "function", "function": {
+                "name": name, "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}}}}], {},
+                noise_tools=[{"name": name, "parameter_columns": {"id": "id"},
+                              "records": [{"id": 1, "value": 4}, {"id": 2, "value": 5}]}])
+            self.assertEqual(registry.execute(name, {"id": 2}), {"records": [{"id": 2, "value": 5}], "count": 1})
 
     def test_generated_scaffold_executes_persistent_stateful_episode(self):
         import env_factory.sandbox_runtime as runtime

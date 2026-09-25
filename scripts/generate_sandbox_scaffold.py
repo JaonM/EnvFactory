@@ -71,7 +71,8 @@ class TaskHooks:
             "conversation": conversation,
             "available_tools": self.contract.get("tools", []),
             "tool_results": [event.get("result") for event in events if event.get("event") == "tool_call"],
-            "public_observation": {},
+            "public_observation": {"task_input": self.contract.get("public_input", {})},
+            "final_agent_response": self.episode_store.get_state("final_agent_response", ""),
         }
     def metric_context(self) -> dict[str, Any]:
         return {"business_state": {name: self.data.table(name) for name in self.data.baseline}, "trajectory": self.episode_store.replay(), "final_agent_response": self.episode_store.get_state("final_agent_response", ""), "observation": self.observation()}
@@ -79,7 +80,94 @@ class TaskHooks:
     def reset(self, episode) -> None: return None
 '''
 
-DOCKERFILE_SOURCE = '''FROM python:3.12-slim
+ACCEPTANCE_RUNNER_SOURCE = '''#!/usr/bin/env python3
+"""EnvFactory-owned contract acceptance; no task-specific code generation."""
+from __future__ import annotations
+import json, os, sys, tempfile
+from pathlib import Path
+from app import create_app
+from sandbox_runtime import AcceptanceScenarioRunner, validate_json_schema
+
+ROOT = Path(__file__).resolve().parent
+
+def main() -> int:
+    contract = json.loads((ROOT / "BUILD_CONTRACT.json").read_text(encoding="utf-8"))
+    result_path = ROOT / "acceptance_result.json"
+    failure_path = ROOT / "acceptance_failure.log"
+    failure_path.unlink(missing_ok=True)
+    evidence = []
+    try:
+        db_path = Path(tempfile.mkdtemp(prefix="envfactory-acceptance-")) / "episodes.sqlite3"
+        app = create_app(db_path=db_path)
+        # This probe is part of baseline acceptance and kills bypass_trainer_auth.
+        status, body, _ = app.handle("GET", "/v1/observation", None, {})
+        if status != 401:
+            raise AssertionError(f"unauthorized observation expected 401, got {status}: {body}")
+        trainer_headers = {"Authorization": f"Bearer {os.environ['SANDBOX_TRAINER_API_KEY']}"}
+        status, observation, _ = app.handle("GET", "/v1/observation", None, trainer_headers)
+        if status != 200:
+            raise AssertionError(f"authorized observation expected 200, got {status}: {observation}")
+        validate_json_schema(contract.get("observation_schema", {}), observation, "observation")
+        runner = AcceptanceScenarioRunner(
+            app.handle,
+            trainer_headers=trainer_headers,
+            business_snapshot=app.business_snapshot,
+            mutate_business_state=app.mutate_business_state,
+        )
+        scenarios = contract.get("acceptance_contract", {}).get("executable_scenarios", [])
+        if not isinstance(scenarios, list) or not scenarios:
+            raise AssertionError("contract has no executable scenarios")
+        for scenario in scenarios:
+            outcome = runner.run(scenario)
+            evidence.append({
+                "scenario_id": scenario.get("scenario_id"),
+                "status": "passed",
+                "history": outcome.get("history", []),
+            })
+        result = {
+            "version": "1.0", "business_acceptance": "passed",
+            "http_conformance": "skipped",
+            "http_skip_reason": "validated through the in-process public application boundary",
+            "scenarios": evidence,
+        }
+        result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+        return 0
+    except Exception as exc:
+        failure = {
+            "version": "1.0", "business_acceptance": "failed",
+            "http_conformance": "skipped", "http_skip_reason": "baseline acceptance failed",
+            "scenarios": evidence,
+            "failure": {"type": type(exc).__name__, "message": str(exc)},
+        }
+        text = json.dumps(failure, ensure_ascii=False, indent=2) + "\\n"
+        result_path.write_text(text, encoding="utf-8")
+        failure_path.write_text(text, encoding="utf-8")
+        print(text, file=sys.stderr)
+        return 1
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+ACCEPTANCE_SH_SOURCE = '''#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+export SANDBOX_TRAINER_API_KEY="${SANDBOX_TRAINER_API_KEY:-acceptance-trainer-key}"
+export SANDBOX_EVALUATOR_MOCK="${SANDBOX_EVALUATOR_MOCK:-1}"
+exec python3 ./acceptance_runner.py
+'''
+
+IMPLEMENTATION_REPORT_SOURCE = '''# EnvFactory deterministic sandbox delivery
+
+The shared scaffold, declarative tools, compiled metrics, persistence layer,
+user simulator, and executable acceptance scenarios are generated from
+`BUILD_CONTRACT.json`. `acceptance.sh` runs the EnvFactory-owned in-process
+contract runner. Task-specific model work is limited to extensions explicitly
+listed in `development_plan.json`; this delivery layer contains no task-specific
+reward shortcut or hard-coded business answer.
+'''
+
+DOCKERFILE_SOURCE = '''FROM docker.m.daocloud.io/library/python:3.14-slim
 WORKDIR /app
 COPY requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt \\
@@ -98,7 +186,15 @@ docker build -t "${SANDBOX_IMAGE:-envfactory-sandbox}" .
 
 DOCKER_RUN_SOURCE = '''#!/usr/bin/env bash
 set -euo pipefail
-docker run --rm -p "${SANDBOX_PORT:-8000}:8000" \\
+docker run --rm --read-only \\
+  --cap-drop ALL \\
+  --security-opt no-new-privileges:true \\
+  --cpus "${SANDBOX_CPUS:-1.0}" \\
+  --memory "${SANDBOX_MEMORY:-512m}" \\
+  --pids-limit "${SANDBOX_PIDS_LIMIT:-128}" \\
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \\
+  --tmpfs /app/.runtime:rw,nosuid,size=64m \\
+  -p "${SANDBOX_PORT:-8000}:8000" \\
   -e SANDBOX_TRAINER_API_KEY \\
   -e SANDBOX_LLM_API_KEY \\
   -e SANDBOX_LLM_BASE_URL \\
@@ -181,6 +277,12 @@ def generate(root: Path, *, preserve_implementation: bool = False) -> None:
         json.dumps(training, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     (root / "requirements-dev.txt").write_text("pytest>=8,<10\n", encoding="utf-8")
+    (root / "acceptance_runner.py").write_text(ACCEPTANCE_RUNNER_SOURCE, encoding="utf-8")
+    (root / "acceptance.sh").write_text(ACCEPTANCE_SH_SOURCE, encoding="utf-8")
+    (root / "acceptance.sh").chmod(0o755)
+    (root / "IMPLEMENTATION_REPORT.md").write_text(
+        IMPLEMENTATION_REPORT_SOURCE, encoding="utf-8"
+    )
     tests_dir = root / "tests"
     tests_dir.mkdir(exist_ok=True)
     scaffold_test = tests_dir / "test_scaffold_contract.py"

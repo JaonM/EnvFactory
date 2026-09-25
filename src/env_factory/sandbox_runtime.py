@@ -204,10 +204,6 @@ class EpisodeStore:
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (episode_id, state_key)
                 );
-                CREATE TABLE IF NOT EXISTS migrations (
-                    version TEXT PRIMARY KEY,
-                    applied_at REAL NOT NULL
-                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(idempotency)")}
             if "request_hash" not in columns:
@@ -294,7 +290,16 @@ class EpisodeStore:
         with self._connect() as db:
             rows = db.execute("SELECT sequence,event_type,payload_json,result_json,created_at FROM events WHERE episode_id=? ORDER BY sequence", (episode.episode_id,)).fetchall()
         events = [{"sequence": r[0], "event": r[1], "payload": json.loads(r[2]), "result": json.loads(r[3]) if r[3] else None, "timestamp": r[4]} for r in rows]
-        return {"episode_id": episode.episode_id, "seed": episode.seed, "schema_version": episode.schema_version, "data_hash": episode.data_hash, "events": events, "trace_hash": sha256_json(events)}
+        # Transport identifiers and timing are diagnostics, not trajectory identity.
+        stable_events = []
+        for event in events:
+            payload = event["payload"]
+            if isinstance(payload, Mapping):
+                payload = {key: value for key, value in payload.items()
+                           if key not in {"tool_call_id", "request_id", "timestamp", "duration_ms"}}
+            stable_events.append({"sequence": event["sequence"], "event": event["event"],
+                                  "payload": payload, "result": event["result"]})
+        return {"episode_id": episode.episode_id, "seed": episode.seed, "schema_version": episode.schema_version, "data_hash": episode.data_hash, "events": events, "trace_hash": sha256_json(stable_events)}
 
 
 class DataManifestValidator:
@@ -352,6 +357,87 @@ class ManifestDataStore:
 
     STATE_KEY = "business_data"
 
+    @staticmethod
+    def _column_json_type(declared: Any) -> str | None:
+        kind = str(declared or "").strip().lower()
+        if re.match(r"^(?:serial|bigserial|tinyint|smallint|mediumint|int|integer|bigint)\b", kind):
+            return "integer"
+        if re.match(r"^(?:decimal|numeric|real|float|double)\b", kind):
+            return "number"
+        if re.match(r"^(?:char|varchar|text|date|datetime|timestamp|uuid)\b", kind):
+            return "string"
+        if re.match(r"^(?:bool|boolean)\b", kind):
+            return "boolean"
+        return None
+
+    @staticmethod
+    def _constraint_literal(raw: str) -> Any:
+        import ast
+        value = raw.strip()
+        if value.upper() == "NULL":
+            return None
+        if value.upper() in {"TRUE", "FALSE"}:
+            return value.upper() == "TRUE"
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            try:
+                return float(value) if "." in value else int(value)
+            except ValueError as exc:
+                raise SandboxError(
+                    "DATA_SCHEMA_INVALID", f"unsupported CHECK literal: {raw}", 500
+                ) from exc
+
+    @classmethod
+    def _check_constraint(cls, row: Mapping[str, Any], expression: str) -> bool:
+        clauses = re.split(r"\s+AND\s+", expression.strip(), flags=re.I)
+        for clause in clauses:
+            in_match = re.fullmatch(
+                r"\s*([A-Za-z_][A-Za-z0-9_]*)\s+IN\s*\((.*)\)\s*",
+                clause, flags=re.I,
+            )
+            if in_match:
+                field, raw_values = in_match.groups()
+                import ast
+                try:
+                    values = ast.literal_eval(f"({raw_values},)")
+                except (ValueError, SyntaxError) as exc:
+                    raise SandboxError(
+                        "DATA_SCHEMA_INVALID", f"unsupported CHECK expression: {expression}", 500
+                    ) from exc
+                if field not in row or row[field] not in values:
+                    return False
+                continue
+            match = re.fullmatch(
+                r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|<>|!=|=|>|<)\s*(.*?)\s*",
+                clause,
+            )
+            if not match:
+                raise SandboxError(
+                    "DATA_SCHEMA_INVALID", f"unsupported CHECK expression: {expression}", 500
+                )
+            field, operator, raw_expected = match.groups()
+            if field not in row:
+                raise SandboxError(
+                    "DATA_SCHEMA_INVALID", f"CHECK references unknown field: {field}", 500
+                )
+            actual, expected = row[field], cls._constraint_literal(raw_expected)
+            try:
+                passed = {
+                    "=": lambda: actual == expected,
+                    "!=": lambda: actual != expected,
+                    "<>": lambda: actual != expected,
+                    ">": lambda: actual > expected,
+                    "<": lambda: actual < expected,
+                    ">=": lambda: actual >= expected,
+                    "<=": lambda: actual <= expected,
+                }[operator]()
+            except TypeError:
+                passed = False
+            if not passed:
+                return False
+        return True
+
     def __init__(
         self,
         manifest: Mapping[str, Any],
@@ -383,8 +469,7 @@ class ManifestDataStore:
                         continue
                     if value is None and (field in primary or column.get("nullable") is False):
                         raise SandboxError("DATA_INVALID", f"null field: {name}.{field}", 400)
-                    kind = str(column.get("type", "")).lower()
-                    kind = {"int": "integer", "float": "number", "double": "number", "text": "string", "bool": "boolean"}.get(kind, kind)
+                    kind = self._column_json_type(column.get("type"))
                     if kind:
                         validate_json_schema({**column, "type": kind}, value, f"{name}.{field}")
                 if primary:
@@ -397,6 +482,36 @@ class ManifestDataStore:
                     values = [canonical_json(row[field]) for row in rows if row[field] is not None]
                     if len(values) != len(set(values)):
                         raise SandboxError("DATA_INVALID", f"duplicate unique field: {name}.{field}", 400)
+            for index in schema.get("indexes", []):
+                if not isinstance(index, Mapping):
+                    raise SandboxError("DATA_SCHEMA_INVALID", f"invalid index: {name}", 500)
+                fields = index.get("columns", [])
+                if not isinstance(fields, list) or not fields or any(
+                    not isinstance(field, str) or field not in columns for field in fields
+                ):
+                    raise SandboxError("DATA_SCHEMA_INVALID", f"invalid index columns: {name}", 500)
+                if index.get("unique") is True:
+                    values = [canonical_json([row[field] for field in fields]) for row in rows]
+                    if len(values) != len(set(values)):
+                        raise SandboxError(
+                            "DATA_INVALID", f"duplicate unique index: {name}.{','.join(fields)}", 400
+                        )
+            for constraint in schema.get("constraints", []):
+                if isinstance(constraint, str):
+                    expression, constraint_name = constraint.strip(), "unnamed"
+                elif isinstance(constraint, Mapping):
+                    expression = constraint.get("expression")
+                    constraint_name = constraint.get("name", "unnamed")
+                    if str(constraint.get("type", "CHECK")).upper() != "CHECK":
+                        expression = None
+                else:
+                    expression, constraint_name = None, "unnamed"
+                if not isinstance(expression, str) or not expression.strip():
+                    raise SandboxError("DATA_SCHEMA_INVALID", f"invalid constraint: {name}", 500)
+                if any(not self._check_constraint(row, expression) for row in rows):
+                    raise SandboxError(
+                        "DATA_INVALID", f"CHECK constraint failed: {name}.{constraint_name}", 400
+                    )
             for foreign in schema.get("foreign_keys", []):
                 if isinstance(foreign, Mapping):
                     field = foreign.get("column")
@@ -494,7 +609,11 @@ class DeclarativeToolCompiler:
         if operator == "in":
             return actual in expected if isinstance(expected, list) else False
         if operator == "contains":
-            return expected in actual if isinstance(actual, (str, list)) else False
+            if not isinstance(actual, (str, list)):
+                return False
+            if isinstance(expected, list):
+                return any(item in actual for item in expected)
+            return expected in actual
         if operator == "gte":
             return actual is not None and actual >= expected
         if operator == "lte":
@@ -569,23 +688,6 @@ class DeclarativeToolCompiler:
                 raise SandboxError("TOOL_SPEC_INVALID", "tool implementation name is invalid", 500)
             handlers[name] = self.compile(spec)
         return handlers
-
-
-class EvaluatorMock:
-    """Deterministic evaluator seam; production and mock share one contract."""
-
-    def __init__(self, handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> None:
-        self.handler = handler
-        self.calls: list[dict[str, Any]] = []
-
-    def evaluate(self, request: dict[str, Any]) -> dict[str, Any]:
-        self.calls.append({"request_hash": sha256_json(request), "request": request})
-        if self.handler is None:
-            raise SandboxError("EVALUATOR_MOCK_NOT_CONFIGURED", "mock evaluator handler is not configured", 500)
-        result = self.handler(request)
-        if not isinstance(result, dict):
-            raise SandboxError("EVALUATOR_INVALID_RESULT", "evaluator result must be an object", 500)
-        return result
 
 
 def validate_json_schema(schema: Mapping[str, Any], value: Any, path: str = "arguments") -> None:
@@ -702,8 +804,6 @@ class ContractToolRegistry:
                     return {"status": "ok", "mutation": "skip_business_write"}
                 if name in self.noise_tools:
                     metadata = self.noise_tools[name]
-                    if name.startswith("roll_virtual_die"):
-                        return {"value": random.Random(sha256_json(args)).randint(1, 6)}
                     rows = copy.deepcopy(metadata.get("records", []))
                     for argument, column in metadata.get("parameter_columns", {}).items():
                         if argument in args:
@@ -913,9 +1013,24 @@ class ContractRewardGate:
             if goals.get("requires_state_change"):
                 causal_progress = causal_progress and not BusinessGoalEvaluator.evaluate(predicates, baseline) and state != baseline
                 causal_progress = causal_progress and BusinessGoalEvaluator.preserves_unrelated(goals, baseline, state)
+        # Tool presence alone is not evidence that the Agent chose the right
+        # arguments or completed every required step.  Compiled process
+        # metrics encode those exact causal obligations.  Outcome credit is
+        # available only when each declared process metric reaches its best
+        # score; a later correct retry can still satisfy a trajectory rule.
+        process_complete = all(
+            metric.get("id") in result
+            and float(result[str(metric["id"])]) >= float(metric.get("score_range", [0, 1])[-1])
+            for metric in self.metrics
+            if metric.get("category") == "process"
+        )
+        causal_progress = causal_progress and process_complete
         if not causal_progress:
             for metric in self.metrics:
-                if metric.get("category") == "outcome" and metric.get("id") in result:
+                # Process shaping must not reward an isolated downstream call.
+                # Until the declared chain and state goal are jointly valid,
+                # both process and outcome evidence is non-causal.
+                if metric.get("category") in {"process", "outcome"} and metric.get("id") in result:
                     low = metric.get("score_range", [0, 1])[0]
                     result[str(metric["id"])] = float(low)
         return result
@@ -959,10 +1074,35 @@ class ContractEvaluatorRuntime:
         result: Mapping[str, Any]
         used_fallback = False
         try:
+            evaluator = metric.get("evaluator", {})
+            mapping = evaluator.get("score_mapping", {}) if isinstance(evaluator, Mapping) else {}
+            criteria = metric.get("criteria", [])
+            if not isinstance(criteria, list):
+                criteria = [criteria]
+            judge_instructions = {
+                "task": "Evaluate whether the runtime evidence satisfies this one metric.",
+                "rules": [
+                    "Apply only the supplied rubric and criteria; do not invent requirements.",
+                    "Judge semantic equivalence, not wording, unless the criteria explicitly require exact syntax.",
+                    "Treat the public task and public materials as the evaluation target.",
+                    "When conversation is present, evaluate all assistant responses cumulatively; a later acknowledgement or closing message does not erase a correct earlier answer.",
+                    "Use the highest-scoring label only when every material criterion is satisfied; use an intermediate label for partial evidence when available.",
+                    "Return exactly one label declared in label_scores.",
+                ],
+                "rubric": metric.get("rubric", ""),
+                "criteria": [str(item) for item in criteria if str(item).strip()],
+                "label_scores": mapping,
+            }
             result = RuntimeLLMClient().json_chat(
                 [
-                    {"role": "system", "content": "Evaluate the supplied metric and return only a JSON object."},
-                    {"role": "user", "content": canonical_json({"metric": metric, "context": stable_context})},
+                    {
+                        "role": "system",
+                        "content": (
+                            "Return only one JSON object that matches the requested response schema. "
+                            + canonical_json(judge_instructions)
+                        ),
+                    },
+                    {"role": "user", "content": canonical_json({"runtime_evidence": stable_context})},
                 ],
                 response_schema=response_schema or {"type": "object"},
             )
@@ -992,9 +1132,12 @@ class ContractModelMetricEvaluator:
         mock = os.getenv("SANDBOX_EVALUATOR_MOCK", "").lower() in {"1", "true", "yes"}
         for metric in self.contract.get("metrics", []):
             metric_id = metric["id"]
-            if metric_id in existing or metric.get("evaluator", {}).get("kind") != "external_llm_judge":
+            evaluator = metric.get("evaluator", {})
+            if metric_id in existing or evaluator.get("kind") not in {
+                "external_llm_judge", "hybrid_outcome",
+            }:
                 continue
-            mapping = metric["evaluator"].get("score_mapping", {})
+            mapping = evaluator.get("score_mapping", {})
             labels = {name: value for name, value in mapping.items()
                       if isinstance(value, (int, float)) and not isinstance(value, bool)}
             if not labels:
@@ -1013,7 +1156,39 @@ class ContractModelMetricEvaluator:
                 scores[metric_id] = float(labels[label])
                 self.store.event("evaluator_call", {"metric_id": metric_id, "mode": "offline_fixture", "semantic_verification": False}, {"label": label})
             else:
-                result = self.runtime.json_judge(metric, context, fallback={"label": failure}, response_schema={
+                declared_inputs = metric.get("evaluation_inputs", [])
+                if not isinstance(declared_inputs, list):
+                    declared_inputs = []
+                aliases = {
+                    "recent_conversation": "conversation",
+                    "terminal_observation": "public_observation",
+                    "tool_results": "trajectory",
+                }
+                selected_context: dict[str, Any] = {}
+                for name in declared_inputs:
+                    if not isinstance(name, str):
+                        continue
+                    source = aliases.get(name, name)
+                    if source in context:
+                        selected_context[name] = context[source]
+                # The judge must know what the public user actually requested.
+                # This is safe to add independently of model-authored
+                # ``evaluation_inputs`` because it contains no hidden truth.
+                public_input = self.contract.get("public_input")
+                if isinstance(public_input, Mapping):
+                    selected_context["public_input"] = dict(public_input)
+                public_task = self.contract.get("task")
+                if isinstance(public_task, str) and public_task.strip():
+                    selected_context["task"] = public_task.strip()
+                # Keep the judge input bounded and contract-directed.  Older
+                # contracts without evaluation_inputs still receive the two
+                # canonical response fields rather than the entire replay and
+                # business database.
+                if not selected_context:
+                    for name in ("conversation", "final_agent_response"):
+                        if name in context:
+                            selected_context[name] = context[name]
+                result = self.runtime.json_judge(metric, selected_context, fallback={"label": failure}, response_schema={
                     "type": "object", "required": ["label"],
                     "properties": {"label": {"type": "string", "enum": list(labels)}},
                 })
@@ -1024,20 +1199,62 @@ class ContractModelMetricEvaluator:
 class DeclarativeMetricEvaluator:
     """Evaluate deterministic metric predicates from a constrained DSL."""
 
-    OPERATORS = {"eq", "ne", "gte", "lte", "contains", "exists", "count_gte", "count_eq", "changed", "unchanged", "subset", "none_tool_calls"}
+    OPERATORS = {
+        "eq", "ne", "gte", "lte", "contains", "exists", "count_gte",
+        "count_eq", "changed", "unchanged", "subset", "none_tool_calls",
+        "contains_tool_call",
+    }
 
     @staticmethod
-    def _resolve(value: Any, path: str) -> Any:
-        current = value
+    def path_tokens(path: str) -> list[tuple[str, Any]]:
+        """Supported paths: fields, indices, array wildcards and equality filters."""
+        import ast
         if path in {"", "$"}:
-            return current
-        normalized = re.sub(r"\[(\d+)\]", r".\1", path).removeprefix("$.")
-        for part in normalized.split("."):
+            return []
+        remaining = path[1:] if path.startswith("$") else "." + path
+        tokens = []
+        while remaining:
+            field = re.match(r"\.([^\s.\[\]]+)", remaining)
+            index = re.match(r"\[(\d+)\]", remaining)
+            wildcard = re.match(r"\[\*\]", remaining)
+            selector = re.match(r"""\[\?\(@\.([^\s.\[\]=]+)\s*==\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|-?\d+(?:\.\d+)?|true|false|null)\s*\)\]""", remaining)
+            if field:
+                tokens.append(("field", field[1]))
+                remaining = remaining[field.end():]
+            elif index:
+                tokens.append(("index", int(index[1])))
+                remaining = remaining[index.end():]
+            elif wildcard:
+                tokens.append(("wildcard", None))
+                remaining = remaining[wildcard.end():]
+            elif selector:
+                literal = selector[2]
+                expected = ast.literal_eval(literal) if literal.startswith("'") else json.loads(literal)
+                tokens.append(("filter", (selector[1], expected)))
+                remaining = remaining[selector.end():]
+            else:
+                raise SandboxError("METRIC_SPEC_INVALID", "unsupported JSON path syntax", 500, {"path": path})
+        return tokens
+
+    @classmethod
+    def _resolve(cls, value: Any, path: str) -> Any:
+        current = value
+        for kind, part in cls.path_tokens(path):
+            if kind == "wildcard":
+                current = list(current) if isinstance(current, list) else []
+                continue
+            if kind == "filter":
+                column, expected = part
+                current = [row for row in current if isinstance(row, Mapping) and row.get(column) == expected] if isinstance(current, list) else []
+                continue
             if isinstance(current, Mapping):
                 current = current.get(part)
-            elif isinstance(current, list) and part.isdigit():
+            elif isinstance(current, list) and (kind == "index" or str(part).isdigit()):
                 index = int(part)
                 current = current[index] if index < len(current) else None
+            elif isinstance(current, list) and kind == "field":
+                values = [row.get(part) for row in current if isinstance(row, Mapping)]
+                current = values[0] if len(values) == 1 else values
             else:
                 return None
         return current
@@ -1053,6 +1270,14 @@ class DeclarativeMetricEvaluator:
         if operator == "lte":
             return actual is not None and actual <= expected
         if operator == "contains":
+            if isinstance(actual, list) and isinstance(expected, Mapping):
+                return any(
+                    isinstance(row, Mapping)
+                    and all(row.get(key) == value for key, value in expected.items())
+                    for row in actual
+                )
+            if isinstance(actual, Mapping) and isinstance(expected, Mapping):
+                return all(actual.get(key) == value for key, value in expected.items())
             return expected in actual if isinstance(actual, (str, list, dict)) else False
         if operator == "exists":
             return (actual is not None) is bool(expected)
@@ -1074,6 +1299,57 @@ class DeclarativeMetricEvaluator:
                 and event.get("event") == "tool_call"
                 and isinstance(event.get("payload"), Mapping)
                 and event["payload"].get("tool_name") in blocked
+                for event in actual
+            )
+        if operator == "contains_tool_call":
+            if not isinstance(actual, list) or not isinstance(expected, Mapping):
+                return False
+            tool_name = expected.get("tool_name")
+            arguments = expected.get("arguments")
+            captures = expected.get("captures", [])
+            if not isinstance(tool_name, str) or not isinstance(arguments, Mapping):
+                return False
+            resolved: dict[str, Any] = {}
+            if not isinstance(captures, list):
+                return False
+            for capture in captures:
+                if not isinstance(capture, Mapping):
+                    return False
+                capture_name = capture.get("name")
+                capture_tool = capture.get("tool_name")
+                capture_path = capture.get("path")
+                if not all(isinstance(value, str) and value for value in (
+                    capture_name, capture_tool, capture_path
+                )):
+                    return False
+                source = next((
+                    event.get("result") for event in actual
+                    if isinstance(event, Mapping)
+                    and event.get("event") == "tool_call"
+                    and isinstance(event.get("payload"), Mapping)
+                    and event["payload"].get("tool_name") == capture_tool
+                ), None)
+                value = cls._resolve(source, capture_path)
+                if value is None:
+                    return False
+                resolved[capture_name] = value
+
+            def resolve(value: Any) -> Any:
+                if isinstance(value, Mapping) and set(value) == {"$ref"}:
+                    return resolved.get(value["$ref"], value)
+                if isinstance(value, Mapping):
+                    return {key: resolve(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [resolve(item) for item in value]
+                return value
+
+            canonical_arguments = resolve(arguments)
+            return any(
+                isinstance(event, Mapping)
+                and event.get("event") == "tool_call"
+                and isinstance(event.get("payload"), Mapping)
+                and event["payload"].get("tool_name") == tool_name
+                and event["payload"].get("arguments") == canonical_arguments
                 for event in actual
             )
         raise SandboxError("METRIC_SPEC_INVALID", f"unsupported metric operator: {operator}", 500)
@@ -1123,16 +1399,12 @@ class ContractUserSimulator:
     def __init__(
         self,
         episode_store: EpisodeStore,
-        sessions: Sequence[Mapping[str, Any]] = (),
         *,
         profiles: Sequence[Mapping[str, Any]] = (),
         scripts: Sequence[Mapping[str, Any]] = (),
         renderer: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> None:
         self.episode_store = episode_store
-        # ``sessions`` is accepted only for source compatibility. Runtime user
-        # behavior must not replay task-generation dialogue samples.
-        self.sessions = []
         self.profiles = {str(item.get("profile_id")): dict(item) for item in profiles if isinstance(item, Mapping)}
         self.scripts = {
             str(item.get("script_id")): self._normalize_script(item)
@@ -1261,6 +1533,8 @@ class ContractUserSimulator:
         ), {}) if isinstance(script, Mapping) else {}
         payload = {
             "messages": list(messages), "profile": profile,
+            "goal": script.get("goal", ""),
+            "user_input": copy.deepcopy(script.get("user_input", {})),
             "current_state": current_state, "state_id": state.get("state_id"),
             "variables": copy.deepcopy(state.get("variables", {})),
             "transitions": transitions, "turn_index": index,
@@ -1305,7 +1579,7 @@ class ContractUserSimulator:
                 "match_status": match_status,
                 "outcome_category": outcome,
                 "reason_code": str(candidate.get("reason_code") or match_status),
-                "attachments": list(candidate.get("attachments", [])),
+                "attachments": [],
             }
         except Exception:
             used_fallback = True
@@ -1452,10 +1726,17 @@ class SandboxApplication:
         if method == "POST" and path == "/v1/user_simulator":
             if not isinstance(body, Mapping) or not isinstance(body.get("messages"), list):
                 raise SandboxError("INVALID_ARGUMENT", "messages must be an array", 400)
+            if set(body) != {"messages"} or any(
+                not isinstance(message, Mapping) or set(message) != {"role", "content"}
+                for message in body["messages"]
+            ):
+                raise SandboxError("INVALID_ARGUMENT", "undeclared message or request properties", 400)
             return dict(self.user_turn_callback(body["messages"]))
         if method == "POST" and path == "/v1/agent_response":
             if not isinstance(body, Mapping) or not isinstance(body.get("content"), str) or not body["content"].strip():
                 raise SandboxError("INVALID_ARGUMENT", "agent response requires non-empty content", 400)
+            if set(body) != {"content"}:
+                raise SandboxError("INVALID_ARGUMENT", "agent response has undeclared properties", 400)
             content = body["content"].strip()
             self.episode_store.set_state("final_agent_response", content)
             self.episode_store.event("agent_response", {"content": content}, {"accepted": True})
@@ -1485,18 +1766,33 @@ class SandboxApplication:
         path = str(environ.get("PATH_INFO", "/"))
         length = int(environ.get("CONTENT_LENGTH") or 0)
         raw = environ["wsgi.input"].read(length) if length else b""
+        request_headers = {
+            key[5:].replace("_", "-"): value
+            for key, value in environ.items() if key.startswith("HTTP_")
+        }
         try:
             body = json.loads(raw.decode("utf-8")) if raw else None
         except (UnicodeDecodeError, json.JSONDecodeError):
-            body = None
-            status, payload, headers = 400, SandboxError(
-                "INVALID_JSON", "request body is not valid JSON", 400
-            ).body(request_id()), {"Content-Type": "application/json"}
-        else:
-            request_headers = {
-                key[5:].replace("_", "-"): value
-                for key, value in environ.items() if key.startswith("HTTP_")
+            malformed_request_id = request_id()
+            error: SandboxError
+            trainer_paths = {
+                "/v1/reset", "/v1/observation", "/v1/user_simulator",
+                "/v1/agent_response", "/v1/reward", "/v1/replay",
             }
+            try:
+                if (
+                    path in trainer_paths
+                    and os.getenv("SANDBOX_MUTATION_MODE", "disabled") != "bypass_trainer_auth"
+                ):
+                    require_trainer(self._header(request_headers, "Authorization"))
+                error = SandboxError("INVALID_JSON", "request body is not valid JSON", 400)
+            except SandboxError as exc:
+                error = exc
+            status, payload, headers = error.status, error.body(malformed_request_id), {
+                "Content-Type": "application/json",
+                "X-Request-ID": malformed_request_id,
+            }
+        else:
             status, payload, headers = self.handle(method, path, body, request_headers)
         encoded = canonical_json(payload).encode("utf-8")
         response_headers = list(headers.items()) + [("Content-Length", str(len(encoded)))]
@@ -1591,18 +1887,6 @@ class AcceptanceScenarioRunner:
             if not DeclarativeMetricEvaluator._compare(actual, str(assertion.get("operator")), expected):
                 raise SandboxError("SCENARIO_ASSERTION_FAILED", "scenario assertion failed", 500, {"actual": actual, "assertion": dict(assertion)})
         return {"scenario_id": scenario.get("scenario_id"), "history": history, "variables": variables, "step_results": step_results}
-
-
-class MigrationRegistry:
-    def __init__(self, store: EpisodeStore) -> None:
-        self.store = store
-
-    def apply(self, version: str, migration: Callable[[sqlite3.Connection], None]) -> None:
-        with self.store._lock, self.store._connect() as db:
-            if db.execute("SELECT 1 FROM migrations WHERE version=?", (version,)).fetchone():
-                return
-            migration(db)
-            db.execute("INSERT INTO migrations VALUES(?,?)", (version, time.time()))
 
 
 def request_id() -> str:

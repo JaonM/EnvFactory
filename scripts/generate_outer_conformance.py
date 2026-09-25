@@ -145,8 +145,11 @@ def check_rewards(task: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict
         fail("reward_key_steps must be a list")
     actions = {a.get("name") for a in task.get("actions", []) if isinstance(a, dict)}
     step_actions = {s.get("action_name") for s in key_steps if isinstance(s, dict)}
-    if len(step_actions) != len(key_steps) or not step_actions <= actions:
-        fail("reward_key_steps contains duplicate or unknown actions")
+    if not step_actions <= actions:
+        fail("reward_key_steps contains unknown actions")
+    step_ids = [s.get("step_id") for s in key_steps if isinstance(s, dict)]
+    if len(step_ids) != len(key_steps) or len(set(step_ids)) != len(step_ids):
+        fail("reward_key_steps contains duplicate or missing step IDs")
     for step in key_steps:
         if not step.get("step_id") or not isinstance(step.get("rationale"), str) or not isinstance(step.get("required_for_goal"), bool):
             fail("invalid reward_key_steps entry")
@@ -160,8 +163,19 @@ def check_rewards(task: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict
         if not isinstance(evaluator, dict) or not isinstance(evaluator.get("score_mapping"), dict):
             fail(f"metric {metric.get('id')} lacks executable evaluator")
         if metric.get("category") == "process":
-            if evaluator.get("kind") != "hybrid_tool_call" or evaluator.get("source") != "external_llm":
-                fail(f"process metric {metric.get('id')} must use external hybrid evaluator")
+            compiled = (
+                metric.get("type") == "rule-based"
+                and evaluator.get("kind") == "trajectory_rule"
+                and evaluator.get("source") == "runtime_rule"
+                and set(evaluator.get("score_mapping", {})) == {"pass", "fail"}
+            )
+            provisional = (
+                metric.get("type") == "hybrid"
+                and evaluator.get("kind") == "hybrid_tool_call"
+                and evaluator.get("source") == "external_llm"
+            )
+            if not (compiled or provisional):
+                fail(f"process metric {metric.get('id')} lacks a compiled or provisional evaluator")
             if metric.get("target_action") not in step_actions:
                 fail(f"process metric {metric.get('id')} targets a non-key action")
         if metric.get("category") == "penalty" and any(float(v) > 0 for v in evaluator["score_mapping"].values()):

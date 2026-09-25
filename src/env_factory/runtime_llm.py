@@ -33,16 +33,18 @@ class RuntimeLLMConfig:
 
     @classmethod
     def from_env(cls) -> "RuntimeLLMConfig":
-        api_key = os.getenv("SANDBOX_LLM_API_KEY", "")
-        base_url = os.getenv("SANDBOX_LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        model = os.getenv("SANDBOX_LLM_MODEL", "")
-        timeout = float(os.getenv("SANDBOX_LLM_TIMEOUT_SECONDS", "60"))
-        retries = int(os.getenv("SANDBOX_LLM_MAX_RETRIES", "2"))
+        # Per-field overrides; empty values count as unconfigured. Keep this
+        # dependency-free so copied runtimes work with container env injection.
+        api_key = os.getenv("SANDBOX_LLM_API_KEY") or os.getenv("LLM_API_KEY", "")
+        base_url = (os.getenv("SANDBOX_LLM_BASE_URL") or os.getenv("LLM_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+        model = os.getenv("SANDBOX_LLM_MODEL") or os.getenv("LLM_MODEL", "")
+        timeout = float(os.getenv("SANDBOX_LLM_TIMEOUT_SECONDS") or os.getenv("LLM_TIMEOUT") or "60")
+        retries = int(os.getenv("SANDBOX_LLM_MAX_RETRIES") or "2")
         mock = os.getenv("SANDBOX_EVALUATOR_MOCK", "").lower() in {"1", "true", "yes"}
         if not api_key and not mock:
-            raise RuntimeLLMError("SANDBOX_LLM_API_KEY is not configured")
+            raise RuntimeLLMError("neither SANDBOX_LLM_API_KEY nor LLM_API_KEY is configured")
         if not model and not mock:
-            raise RuntimeLLMError("SANDBOX_LLM_MODEL is not configured")
+            raise RuntimeLLMError("neither SANDBOX_LLM_MODEL nor LLM_MODEL is configured")
         if timeout <= 0 or retries < 0:
             raise RuntimeLLMError("invalid runtime LLM timeout or retry configuration")
         return cls(api_key, base_url, model, timeout, retries, mock)
