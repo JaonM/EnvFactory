@@ -452,9 +452,11 @@ def valid_training_readiness(report: Mapping[str, Any]) -> bool:
     )
 
 
-def valid_user_turn(step: Mapping[str, Any]) -> bool:
+def valid_user_turn(
+    step: Mapping[str, Any], task: Mapping[str, Any]
+) -> bool:
     result = step.get("result")
-    return (
+    if not (
         step.get("status") == 200
         and isinstance(result, Mapping)
         and isinstance(result.get("user_query"), str)
@@ -463,9 +465,74 @@ def valid_user_turn(step: Mapping[str, Any]) -> bool:
         and result.get("match_status") in {"matched", "unmatched", "ambiguous"}
         and result.get("outcome_category") in USER_OUTCOMES
         and isinstance(result.get("reason_code"), str)
+        and bool(result["reason_code"])
+        and isinstance(result.get("fsm_script_id"), str)
+        and bool(result["fsm_script_id"])
+        and isinstance(result.get("fsm_state_before"), str)
+        and bool(result["fsm_state_before"])
+        and isinstance(result.get("fsm_state_after"), str)
+        and bool(result["fsm_state_after"])
+        and isinstance(result.get("fsm_transition_applied"), bool)
+        and isinstance(result.get("fsm_recovery_count"), int)
+        and not isinstance(result.get("fsm_recovery_count"), bool)
+        and result["fsm_recovery_count"] >= 0
         and (
             not result.get("should_end")
             or isinstance(result.get("termination_reason"), str)
+        )
+    ):
+        return False
+    scripts = {
+        str(script.get("script_id")): script
+        for script in task.get("user_scripts", [])
+        if isinstance(script, Mapping) and script.get("script_id")
+    }
+    script = scripts.get(result["fsm_script_id"])
+    if not isinstance(script, Mapping):
+        return False
+    outcome = result["outcome_category"]
+    if result["match_status"] == "matched":
+        transition_id = result.get("fsm_transition_id")
+        transition = next((
+            item for item in script.get("transitions", [])
+            if isinstance(item, Mapping)
+            and item.get("transition_id") == transition_id
+        ), None)
+        if not isinstance(transition, Mapping):
+            return False
+        terminal_states = {
+            item.get("state_id") for item in script.get("states", [])
+            if isinstance(item, Mapping) and item.get("terminal") is True
+        }
+        expected_end = bool(
+            transition.get("should_end")
+            or transition.get("to_state") in terminal_states
+        )
+        return (
+            outcome in {
+                "goal_satisfied", "information_required", "user_correction",
+                "user_rejection", "user_acceptance",
+            }
+            and result.get("fsm_transition_applied") is True
+            and transition.get("outcome_category") == outcome
+            and transition.get("from_state") == result["fsm_state_before"]
+            and transition.get("to_state") == result["fsm_state_after"]
+            and result["should_end"] is expected_end
+            and (
+                not expected_end
+                or result.get("termination_reason") == "completed"
+            )
+        )
+    return (
+        outcome in {
+            "agent_off_topic", "agent_premature_completion", "unrecognized",
+        }
+        and result.get("fsm_transition_id") is None
+        and result.get("fsm_transition_applied") is False
+        and result["fsm_state_before"] == result["fsm_state_after"]
+        and (
+            not result["should_end"]
+            or result.get("termination_reason") == "unresolved_dialogue"
         )
     )
 
@@ -966,14 +1033,30 @@ def certify(
     )
     successes = sum(item.get("agent_success") is True for item in episodes)
     complete_episodes = sum(complete_episode(item) for item in audited_episodes)
-    user_turns = [
-        step for episode in audited_episodes for step in episode.get("trajectory", [])
-        if isinstance(step, Mapping) and step.get("path") == "/v1/user_simulator"
-    ]
-    valid_user_turns = sum(valid_user_turn(step) for step in user_turns)
+    user_turn_records = []
+    for item in claimed_qualified:
+        try:
+            task = load(Path(str(item.get("task_path", ""))))
+        except (OSError, json.JSONDecodeError, TypeError):
+            task = {}
+        live = item.get("live_rollout")
+        if not isinstance(live, Mapping) or not isinstance(task, Mapping):
+            continue
+        user_turn_records.extend(
+            (step, task)
+            for episode in live.get("episodes", [])
+            if isinstance(episode, Mapping)
+            for step in episode.get("trajectory", [])
+            if isinstance(step, Mapping)
+            and step.get("path") == "/v1/user_simulator"
+        )
+    user_turns = [step for step, _ in user_turn_records]
+    valid_user_turns = sum(
+        valid_user_turn(step, task) for step, task in user_turn_records
+    )
     user_outcomes = Counter(
         str(step.get("result", {}).get("outcome_category"))
-        for step in user_turns if valid_user_turn(step)
+        for step, task in user_turn_records if valid_user_turn(step, task)
     )
     interactive_outcomes = {
         "information_required", "user_correction", "user_rejection",

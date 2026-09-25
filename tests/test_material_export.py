@@ -116,6 +116,15 @@ class MaterialExportTest(unittest.TestCase):
         (sandbox / "acceptance_result.json").write_text(
             '{"business_acceptance":"passed"}'
         )
+        user_result = {
+            "user_query": "accepted", "should_end": True,
+            "termination_reason": "completed", "match_status": "matched",
+            "outcome_category": "user_acceptance", "reason_code": "accepted",
+            "fsm_script_id": "dialogue", "fsm_transition_id": "accept",
+            "fsm_state_before": "start", "fsm_state_after": "done",
+            "fsm_transition_applied": True, "fsm_recovery_count": 0,
+            "attachments": [],
+        }
         transition = {
             "step": 0,
             "agent_input": [{"role": "user", "content": "use the tool"}],
@@ -128,7 +137,7 @@ class MaterialExportTest(unittest.TestCase):
             "terminated": True,
             "truncated": False,
             "trainer_metadata": {
-                "user_simulator": {"outcome_category": "user_acceptance"},
+                "user_simulator": user_result,
             },
         }
         rollout = {
@@ -153,6 +162,9 @@ class MaterialExportTest(unittest.TestCase):
                 "trajectory": [{
                     "method": "GET", "path": "/v1/reward", "status": 200,
                     "result": {"reward": 1.0},
+                }, {
+                    "method": "POST", "path": "/v1/user_simulator",
+                    "status": 200, "result": user_result,
                 }],
                 "replay": {"events": []},
                 "initial_state": {}, "final_state": {},

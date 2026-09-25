@@ -1537,7 +1537,16 @@ class OpenAIToolArtifactTest(unittest.TestCase):
         user_endpoint = next(item for item in interface["endpoints"] if item["name"] == "user_simulator")
         self.assertEqual(user_endpoint["path"], "/v1/user_simulator")
         self.assertEqual(user_endpoint["access"], "rl_trainer_only")
-        self.assertEqual(user_endpoint["response_schema"]["required"], ["user_query", "should_end"])
+        self.assertEqual(
+            user_endpoint["response_schema"]["required"],
+            [
+                "user_query", "should_end", "match_status",
+                "outcome_category", "reason_code", "attachments",
+                "fsm_script_id", "fsm_transition_id",
+                "fsm_state_before", "fsm_state_after",
+                "fsm_transition_applied", "fsm_recovery_count",
+            ],
+        )
         self.assertEqual(user_endpoint["request_schema"]["required"], ["messages"])
         self.assertIn("Trainer", user_endpoint["request_schema"]["description"])
         response_endpoint = next(item for item in interface["endpoints"] if item["name"] == "agent_response")

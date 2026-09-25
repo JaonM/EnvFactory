@@ -299,6 +299,12 @@ class SandboxRuntimeTest(unittest.TestCase):
             result = simulator.turn([{"role": "assistant", "content": "完成"}])
             state = store.get_state(ContractUserSimulator.STATE_KEY)
             self.assertTrue(result["should_end"])
+            self.assertEqual(result["fsm_script_id"], "s1")
+            self.assertEqual(result["fsm_transition_id"], "t1")
+            self.assertEqual(result["fsm_state_before"], "start")
+            self.assertEqual(result["fsm_state_after"], "done")
+            self.assertTrue(result["fsm_transition_applied"])
+            self.assertEqual(result["fsm_recovery_count"], 0)
             self.assertEqual(state["state_id"], "done")
             self.assertTrue(state["variables"]["known"])
 
@@ -333,6 +339,11 @@ class SandboxRuntimeTest(unittest.TestCase):
             self.assertEqual(state["recovery_count"], 1)
             self.assertFalse(result["should_end"])
             self.assertEqual(result["match_status"], "ambiguous")
+            self.assertIsNone(result["fsm_transition_id"])
+            self.assertEqual(result["fsm_state_before"], "start")
+            self.assertEqual(result["fsm_state_after"], "start")
+            self.assertFalse(result["fsm_transition_applied"])
+            self.assertEqual(result["fsm_recovery_count"], 1)
 
     def test_contract_user_simulator_rejects_truncated_conversation(self):
         with tempfile.TemporaryDirectory() as directory:

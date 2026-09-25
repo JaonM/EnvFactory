@@ -49,6 +49,11 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
   不得混入供策略摄取的 `transitions.jsonl`。
 - episode 环境错误率不高于 0.1%，LLM fallback 为 0。
 - User Simulator 调用协议有效率不低于 99.5%，并且至少产生一条真实用户响应证据。
+- 每次 User Simulator 调用在 trainer-only 元数据中保存 FSM 脚本、实际迁移、迁移前后状态、是否应用迁移
+  和恢复计数。认证器逐条对照冻结任务的 `user_scripts`：正常结果必须匹配当前合法边及 outcome，恢复结果
+  不得应用边或推进状态，`should_end` 与目标状态 terminal 属性及终止原因必须一致。这些字段不会进入策略
+  可见的 transition result。原始 Trainer HTTP 轨迹与 transition 的 `trainer_metadata.user_simulator` 必须
+  逐条一致，policy transition 的固定白名单会在导出时移除整段 trainer metadata。
 - 真实 User Simulator 轨迹至少覆盖 3 类结果，同时包含成功/接受类结果和需要继续交互或恢复的结果，
   防止只验证“用户永远接受”的退化模拟器。
 - 每个合格沙箱的固定 seed reset、episode 隔离、replay 稳定性、隐藏字段扫描和确定性验证全部通过。

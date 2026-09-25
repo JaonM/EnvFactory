@@ -1625,6 +1625,7 @@ class ContractUserSimulator:
                 "termination_reason": state["termination_reason"],
             }
         index = int(state["turn_index"])
+        state_before = str(state.get("state_id", ""))
         transitions = [
             item for item in script.get("transitions", [])
             if isinstance(item, Mapping) and item.get("from_state") == state.get("state_id")
@@ -1687,6 +1688,7 @@ class ContractUserSimulator:
             used_fallback = True
             fallback = self._fallback_render(payload)
             result = {**fallback, "attachments": []}
+        applied_transition = None
         if result["match_status"] != "matched":
             recovery_policy = script.get("recovery_policy", {})
             maximum = int(recovery_policy.get("max_recoveries", 2))
@@ -1699,6 +1701,7 @@ class ContractUserSimulator:
             requested = result.get("transition_id") if isinstance(result, Mapping) else None
             transition = next((item for item in transitions if item.get("transition_id") == requested), None)
             if transition is not None:
+                applied_transition = transition
                 state["recovery_count"] = 0
                 state["state_id"] = transition.get("to_state")
                 state["variables"] = {**state.get("variables", {}), **dict(transition.get("updates", {}))}
@@ -1714,6 +1717,15 @@ class ContractUserSimulator:
                 result["should_end"] = False
         else:
             result["should_end"] = bool(current_state.get("terminal"))
+        result["fsm_script_id"] = str(state.get("script_id", ""))
+        result["fsm_transition_id"] = (
+            str(applied_transition.get("transition_id"))
+            if applied_transition is not None else None
+        )
+        result["fsm_state_before"] = state_before
+        result["fsm_state_after"] = str(state.get("state_id", ""))
+        result["fsm_transition_applied"] = applied_transition is not None
+        result["fsm_recovery_count"] = int(state.get("recovery_count", 0))
         result.pop("transition_id", None)
         state["turn_index"] = index + 1
         state["memory"] = [*state.get("memory", []), {"messages": list(messages), "result": result}]

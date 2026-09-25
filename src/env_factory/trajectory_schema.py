@@ -142,6 +142,19 @@ def episode_errors(episode: Any) -> list[str]:
         )
     ):
         errors.append("episode:trajectory")
+        trajectory = []
+    raw_user_results = [
+        step.get("result") for step in trajectory
+        if isinstance(step, Mapping) and step.get("path") == "/v1/user_simulator"
+    ]
+    metadata_user_results = [
+        transition.get("trainer_metadata", {}).get("user_simulator")
+        for transition in transitions if isinstance(transition, Mapping)
+        and isinstance(transition.get("trainer_metadata"), Mapping)
+        and "user_simulator" in transition["trainer_metadata"]
+    ]
+    if raw_user_results != metadata_user_results:
+        errors.append("episode:user_simulator_evidence_mismatch")
     for name in ("replay", "initial_state", "final_state"):
         if not isinstance(episode.get(name), Mapping):
             errors.append(f"episode:{name}")

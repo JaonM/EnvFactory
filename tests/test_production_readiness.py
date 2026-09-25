@@ -57,6 +57,39 @@ class ProductionReadinessTest(unittest.TestCase):
         )
 
     @staticmethod
+    def fixture_user_turn(episode: int) -> dict:
+        if episode < 8:
+            return {
+                "user_query": "accepted", "should_end": True,
+                "termination_reason": "completed", "match_status": "matched",
+                "outcome_category": "user_acceptance",
+                "reason_code": "fixture_acceptance",
+                "fsm_script_id": "fixture-dialogue",
+                "fsm_transition_id": "accept", "fsm_state_before": "start",
+                "fsm_state_after": "done", "fsm_transition_applied": True,
+                "fsm_recovery_count": 0,
+            }
+        if episode == 8:
+            return {
+                "user_query": "need details", "should_end": False,
+                "match_status": "matched",
+                "outcome_category": "information_required",
+                "reason_code": "fixture_information",
+                "fsm_script_id": "fixture-dialogue",
+                "fsm_transition_id": "clarify", "fsm_state_before": "start",
+                "fsm_state_after": "clarification",
+                "fsm_transition_applied": True, "fsm_recovery_count": 0,
+            }
+        return {
+            "user_query": "try again", "should_end": False,
+            "match_status": "unmatched", "outcome_category": "agent_off_topic",
+            "reason_code": "fixture_recovery",
+            "fsm_script_id": "fixture-dialogue", "fsm_transition_id": None,
+            "fsm_state_before": "start", "fsm_state_after": "start",
+            "fsm_transition_applied": False, "fsm_recovery_count": 1,
+        }
+
+    @staticmethod
     def fixture_task(category: str, description: str) -> dict:
         task = {
             "training_category": "simple_agentic",
@@ -94,6 +127,29 @@ class ProductionReadinessTest(unittest.TestCase):
                 "mutation_tests": [{"id": "constant_reward"}],
             },
             "task_readiness": {"ready": True, "warnings": []},
+            "user_scripts": [{
+                "script_id": "fixture-dialogue",
+                "initial_state": "start",
+                "states": [
+                    {"state_id": "start", "terminal": False},
+                    {"state_id": "clarification", "terminal": False},
+                    {"state_id": "done", "terminal": True},
+                ],
+                "transitions": [
+                    {
+                        "transition_id": "accept",
+                        "outcome_category": "user_acceptance",
+                        "from_state": "start", "to_state": "done",
+                        "should_end": True,
+                    },
+                    {
+                        "transition_id": "clarify",
+                        "outcome_category": "information_required",
+                        "from_state": "start", "to_state": "clarification",
+                        "should_end": False,
+                    },
+                ],
+            }],
             "task_spec": {
                 "version": "1.0", "task_contract": {},
                 "training_contract": {
@@ -366,6 +422,9 @@ class ProductionReadinessTest(unittest.TestCase):
                         "observation": {},
                         "action": {"kind": "respond", "content": "done"},
                         "result": {"status": 200},
+                        "trainer_metadata": {
+                            "user_simulator": self.fixture_user_turn(episode),
+                        },
                         "next_observation": {},
                         "reward": 1.0 if episode < 8 else 0.0,
                         "terminated": episode < 8,
@@ -378,19 +437,8 @@ class ProductionReadinessTest(unittest.TestCase):
                         },
                         {
                             "method": "POST", "path": "/v1/user_simulator", "status": 200,
-                            "body": {"messages": []}, "result": {
-                                "user_query": "accepted", "should_end": True,
-                                "termination_reason": "completed",
-                                "match_status": (
-                                    "unmatched" if episode % 3 == 2 else "matched"
-                                ),
-                                "outcome_category": (
-                                    "user_acceptance" if episode % 3 == 0
-                                    else "information_required" if episode % 3 == 1
-                                    else "agent_off_topic"
-                                ),
-                                "reason_code": "fixture_outcome",
-                            },
+                            "body": {"messages": []},
+                            "result": self.fixture_user_turn(episode),
                         },
                     ],
                 }
@@ -624,11 +672,15 @@ class ProductionReadinessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             history = self.make_history(Path(directory))
             jobs = [job for batch in history["holdouts"] for job in batch["jobs"]]
-            for job in jobs[:46]:
+            for index, job in enumerate(jobs[:46]):
                 turns = job["result"]["live_rollout"]["episodes"][0]["trajectory"]
-                turns[1]["result"].pop("outcome_category")
+                if index % 2:
+                    turns[1]["result"].pop("outcome_category")
+                else:
+                    turns[1]["result"]["fsm_state_after"] = "undeclared-state"
             report = self.certify(history)
             self.assertFalse(report["gates"]["user_simulator_protocol"])
+            self.assertFalse(report["gates"]["trajectory_schema"])
 
     def test_rollout_must_be_bound_to_the_exact_task_and_sandbox(self):
         with tempfile.TemporaryDirectory() as directory:
