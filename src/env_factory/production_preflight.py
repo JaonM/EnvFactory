@@ -167,6 +167,7 @@ def valid_production_preflight(
     *,
     expected_agent_provider: Mapping[str, Any] | None = None,
     expected_runtime_provider: Mapping[str, Any] | None = None,
+    expected_signing_key_identity: str | None = None,
 ) -> bool:
     """Validate evidence produced by a fresh, trusted preflight execution."""
     if not isinstance(value, Mapping) or value.get("version") != "1.0":
@@ -192,6 +193,21 @@ def valid_production_preflight(
     if not (
         set(by_name) == REQUIRED_CHECKS
         and all(check.get("passed") is True for check in by_name.values())
+    ):
+        return False
+    signing_evidence = by_name["bundle_signing_identity"].get("evidence")
+    if not (
+        isinstance(signing_evidence, Mapping)
+        and signing_evidence.get("bundle_version") == BUNDLE_VERSION
+        and isinstance(signing_evidence.get("key_identity_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", signing_evidence["key_identity_sha256"]
+        ) is not None
+        and (
+            expected_signing_key_identity is None
+            or signing_evidence["key_identity_sha256"]
+                == expected_signing_key_identity
+        )
     ):
         return False
     model_evidence = by_name["model_configuration"].get("evidence")

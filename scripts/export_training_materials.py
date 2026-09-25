@@ -298,6 +298,27 @@ def _export_bundle_uncommitted(
         raise ValueError("only a certified production report can be exported")
     if certification.get("material_verification", {}).get("verified") is not True:
         raise ValueError("source material verification is required before export")
+    attestation = (
+        signed_metadata(
+            signing_private_key, trusted_public_key, BUNDLE_SIGNATURE_FILE
+        )
+        if signing_private_key is not None and trusted_public_key is not None
+        else {"version": "1.0", "status": "unsigned"}
+    )
+    preflight = certification.get("measurements", {}).get(
+        "production_preflight"
+    )
+    expected_key_identity = (
+        attestation.get("key_identity_sha256")
+        if attestation.get("status") == "signed" else None
+    )
+    if not valid_production_preflight(
+        preflight,
+        expected_signing_key_identity=expected_key_identity,
+    ):
+        raise ValueError(
+            "production preflight does not match bundle signing identity"
+        )
     source_manifest = certification.get("materials_manifest")
     if not isinstance(source_manifest, Mapping) or source_manifest.get("version") != "4.0":
         raise ValueError("a v4 materials manifest is required")
@@ -524,13 +545,7 @@ def _export_bundle_uncommitted(
         "certification_file": CERTIFICATION_FILE,
         "dataset_card_file": DATASET_CARD_FILE,
         "consumer_contract_file": CONSUMER_CONTRACT_FILE,
-        "attestation": (
-            signed_metadata(
-                signing_private_key, trusted_public_key, BUNDLE_SIGNATURE_FILE
-            )
-            if signing_private_key is not None and trusted_public_key is not None
-            else {"version": "1.0", "status": "unsigned"}
-        ),
+        "attestation": attestation,
         "transition_visibility": {
             "version": "1.0",
             "policy_projection": "env_factory.trajectory_schema.policy_transition",
@@ -561,6 +576,13 @@ def verify_bundle(
     except (OSError, json.JSONDecodeError) as exc:
         return {"verified": False, "failed_gates": ["bundle_manifest"], "message": str(exc)}
     unsigned = {key: value for key, value in manifest.items() if key != "bundle_sha256"}
+    attestation = manifest.get("attestation")
+    expected_attestation_key = (
+        attestation.get("key_identity_sha256")
+        if isinstance(attestation, Mapping)
+        and attestation.get("status") == "signed"
+        else None
+    )
     if manifest.get("bundle_sha256") != digest_json(unsigned):
         failures.append("bundle_digest")
     if (
@@ -679,7 +701,8 @@ def verify_bundle(
                 and valid_production_preflight(
                     portable_certification.get("measurements", {}).get(
                         "production_preflight"
-                    )
+                    ),
+                    expected_signing_key_identity=expected_attestation_key,
                 )
             )
         )
@@ -1020,7 +1043,8 @@ def verify_bundle(
         and valid_production_preflight(
             portable_certification.get("measurements", {}).get(
                 "production_preflight"
-            )
+            ),
+            expected_signing_key_identity=expected_attestation_key,
         )
     )
     if (
@@ -1210,7 +1234,6 @@ def verify_bundle(
         or manifest.get("successful_episodes") != verified_successes
     ):
         failures.append("bundle_episode_counts")
-    attestation = manifest.get("attestation")
     trusted_attestation = (
         manifest.get("version") in {
             "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",

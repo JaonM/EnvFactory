@@ -70,6 +70,7 @@ class ProductionPreflightTest(unittest.TestCase):
                 report,
                 expected_agent_provider=model["evidence"]["agent_provider"],
                 expected_runtime_provider=model["evidence"]["runtime_provider"],
+                expected_signing_key_identity="a" * 64,
             ))
             mismatched = dict(model["evidence"]["runtime_provider"])
             mismatched["model"] = "different"
@@ -77,6 +78,10 @@ class ProductionPreflightTest(unittest.TestCase):
                 report,
                 expected_agent_provider=model["evidence"]["agent_provider"],
                 expected_runtime_provider=mismatched,
+            ))
+            self.assertFalse(valid_production_preflight(
+                report,
+                expected_signing_key_identity="b" * 64,
             ))
 
     def test_unavailable_docker_and_bad_runtime_limits_fail(self):

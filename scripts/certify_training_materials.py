@@ -748,13 +748,19 @@ def certify(
     expected_runtime_provider = (
         config.get("runtime_provider") if isinstance(config, Mapping) else None
     )
+    expected_signing_key_identity = (
+        config.get("bundle_attestation_key_identity_sha256")
+        if isinstance(config, Mapping) else None
+    )
     preflight_verified = (
         isinstance(expected_agent_provider, Mapping)
         and isinstance(expected_runtime_provider, Mapping)
+        and isinstance(expected_signing_key_identity, str)
         and valid_production_preflight(
             production_preflight,
             expected_agent_provider=expected_agent_provider,
             expected_runtime_provider=expected_runtime_provider,
+            expected_signing_key_identity=expected_signing_key_identity,
         )
     )
     recorded_execution = (

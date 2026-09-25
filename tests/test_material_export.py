@@ -12,6 +12,7 @@ from env_factory.material_artifacts import (
     portable_artifact_digests,
 )
 from env_factory.execution_provenance import collect_execution_provenance
+from env_factory.material_attestation import public_key_identity
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -272,7 +273,11 @@ class MaterialExportTest(unittest.TestCase):
                                         "identity_sha256": "b" * 64,
                                     },
                                 }
-                                if name == "model_configuration" else {}
+                                if name == "model_configuration" else {
+                                    "key_identity_sha256": "e" * 64,
+                                    "bundle_version": "12.0",
+                                }
+                                if name == "bundle_signing_identity" else {}
                             ),
                         }
                         for name in sorted(exporter.REQUIRED_CHECKS)
@@ -877,6 +882,15 @@ class MaterialExportTest(unittest.TestCase):
             root = Path(directory)
             private, public = self.signing_keys(root)
             certification = self.source(root)
+            signing_check = next(
+                check
+                for check in certification["measurements"]
+                    ["production_preflight"]["checks"]
+                if check["name"] == "bundle_signing_identity"
+            )
+            signing_check["evidence"]["key_identity_sha256"] = (
+                public_key_identity(public)
+            )
             bundle = root / "bundle"
             report = exporter.export_bundle(
                 certification, bundle, ROOT,
@@ -895,6 +909,22 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(changed["verified"])
             self.assertFalse(changed["trusted_attestation"])
             self.assertIn("trusted_attestation", changed["failed_gates"])
+
+    def test_signed_bundle_rejects_preflight_from_another_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private, public = self.signing_keys(root)
+            certification = self.source(root)
+            with self.assertRaisesRegex(
+                ValueError, "does not match bundle signing identity"
+            ):
+                exporter.export_bundle(
+                    certification,
+                    root / "bundle",
+                    ROOT,
+                    signing_private_key=private,
+                    trusted_public_key=public,
+                )
 
     def test_rehashed_item_and_records_cannot_change_content_based_split(self):
         with tempfile.TemporaryDirectory() as directory:

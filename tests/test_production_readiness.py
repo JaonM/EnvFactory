@@ -54,7 +54,11 @@ class ProductionReadinessTest(unittest.TestCase):
                             "agent_provider": agent_provider,
                             "runtime_provider": runtime_provider,
                         }
-                        if name == "model_configuration" else {}
+                        if name == "model_configuration" else {
+                            "key_identity_sha256": "e" * 64,
+                            "bundle_version": "12.0",
+                        }
+                        if name == "bundle_signing_identity" else {}
                     ),
                 }
                 for name in sorted(certifier.REQUIRED_CHECKS)
@@ -603,6 +607,7 @@ class ProductionReadinessTest(unittest.TestCase):
                     "model": "simulator-model",
                     "identity_sha256": "b" * 64,
                 },
+                "bundle_attestation_key_identity_sha256": "e" * 64,
             },
             "holdout": holdouts[0], "holdouts": holdouts,
         }
@@ -676,6 +681,16 @@ class ProductionReadinessTest(unittest.TestCase):
                 "host": "other.example", "model": "simulator-model",
                 "identity_sha256": "d" * 64,
             }
+            report = self.certify(history)
+            self.assertFalse(report["certified"])
+            self.assertIn("production_preflight", report["failed_gates"])
+
+    def test_preflight_signing_key_drift_cannot_certify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            history["config"][
+                "bundle_attestation_key_identity_sha256"
+            ] = "f" * 64
             report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertIn("production_preflight", report["failed_gates"])
