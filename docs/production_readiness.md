@@ -31,6 +31,9 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 每个合格沙箱必须实际完成 Docker 构建，并在禁网、只读根文件系统、非 root、丢弃全部 capabilities、
   `no-new-privileges` 和资源上限下通过容器内 pytest smoke test。基础镜像必须解析并固化为
   `sha256` 内容地址，测试依赖必须精确锁版本；镜像 ID、平台、Dockerfile 和依赖摘要由认证器独立复核。
+  安全 smoke 容器还会使用 `importlib.metadata` 导出排序后的实际 Python 分发包名称与版本到
+  `python_packages.json`；认证器复核其摘要、结构、唯一性，并确认每个无条件直接 pin 的安装版本一致。
+  该 inventory 用于依赖可追溯，不等同于漏洞扫描、许可证判断或 SBOM 法务审批。
 - 工具契约、真实业务结果、mutation resistance 和奖励反事实全部通过。
 - 奖励假阳性率不高于 0.5%，假阴性率不高于 2%。
 - 奖励反事实必须使用生产配置的真实 evaluator 重跑；mock 报告只用于离线构建测试，不能进入生产认证。

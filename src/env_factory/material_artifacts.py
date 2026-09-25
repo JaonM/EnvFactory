@@ -11,7 +11,7 @@ from typing import Any
 RUNTIME_ROOT_NAMES = {
     "task.json", "BUILD_CONTRACT.json", "tools.json", "sandbox_profile.json",
     "Dockerfile", "requirements-dev.txt", "docker_image_metadata.json", "TASK_PROMPT.md",
-    "IMPLEMENTATION_REPORT.md",
+    "IMPLEMENTATION_REPORT.md", "python_packages.json",
 }
 RUNTIME_ROOT_SUFFIXES = {".py", ".sh", ".toml", ".yaml", ".yml"}
 RUNTIME_DIRECTORIES = ("tests", "data", ".outer_conformance")

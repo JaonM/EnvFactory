@@ -29,8 +29,12 @@ class ProductionReadinessTest(unittest.TestCase):
             f"FROM {pinned_image}\nUSER sandbox\n"
         )
         (evidence / "requirements-dev.txt").write_text("pytest==9.1.1\n")
+        (evidence / "python_packages.json").write_text(json.dumps({
+            "version": "1.0",
+            "packages": [{"name": "pytest", "version": "9.1.1"}],
+        }))
         (evidence / "docker_image_metadata.json").write_text(json.dumps({
-            "version": "2.0",
+            "version": "3.0",
             "tag": "fixture",
             "base_image": pinned_image,
             "image_id": "sha256:" + "d" * 64,
@@ -41,6 +45,9 @@ class ProductionReadinessTest(unittest.TestCase):
             ).hexdigest(),
             "requirements_sha256": __import__("hashlib").sha256(
                 (evidence / "requirements-dev.txt").read_bytes()
+            ).hexdigest(),
+            "python_packages_sha256": __import__("hashlib").sha256(
+                (evidence / "python_packages.json").read_bytes()
             ).hexdigest(),
             "smoke_test": {
                 "passed": True,

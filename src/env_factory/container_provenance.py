@@ -14,6 +14,9 @@ EXACT_REQUIREMENT = re.compile(
 )
 PINNED_IMAGE = re.compile(r"^[^\s]+@sha256:[0-9a-f]{64}$")
 CONTENT_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+REQUIREMENT_PARTS = re.compile(
+    r"^([A-Za-z0-9_.-]+)(?:\[[A-Za-z0-9_,.-]+\])?==([^\s;]+)(?:\s*;(.*))?$"
+)
 
 
 def file_sha256(path: Path) -> str:
@@ -29,6 +32,65 @@ def exact_requirements(path: Path) -> bool:
     return bool(values) and all(EXACT_REQUIREMENT.fullmatch(line) for line in values)
 
 
+def _package_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).casefold()
+
+
+def verify_python_packages(path: Path, requirements: Path) -> dict[str, Any]:
+    failures = []
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"verified": False, "packages": 0, "failed_gates": ["inventory_file"]}
+    packages = document.get("packages") if isinstance(document, Mapping) else None
+    if (
+        not isinstance(document, Mapping)
+        or set(document) != {"version", "packages"}
+        or document.get("version") != "1.0"
+        or not isinstance(packages, list) or not packages
+    ):
+        failures.append("inventory_schema")
+        packages = []
+    normalized = {}
+    rendered_order = []
+    for package in packages:
+        if not (
+            isinstance(package, Mapping)
+            and set(package) == {"name", "version"}
+            and isinstance(package.get("name"), str) and package["name"].strip()
+            and isinstance(package.get("version"), str) and package["version"].strip()
+        ):
+            failures.append("inventory_schema")
+            continue
+        name = _package_name(package["name"])
+        if name in normalized:
+            failures.append("inventory_duplicates")
+        normalized[name] = package["version"]
+        rendered_order.append(package["name"])
+    if rendered_order != sorted(rendered_order, key=str.casefold):
+        failures.append("inventory_order")
+    try:
+        lines = requirements.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        match = REQUIREMENT_PARTS.fullmatch(value)
+        if match is None:
+            continue
+        name, wanted, marker = match.groups()
+        # Environment-marked pins may deliberately be absent on this platform.
+        if marker is None and normalized.get(_package_name(name)) != wanted:
+            failures.append("direct_dependency_version")
+    return {
+        "verified": not failures,
+        "packages": len(normalized),
+        "failed_gates": sorted(set(failures)),
+    }
+
+
 def verify_container_provenance(
     root: Path, *, expected_tag: str | None = None
 ) -> dict[str, Any]:
@@ -36,12 +98,13 @@ def verify_container_provenance(
     metadata_path = root / "docker_image_metadata.json"
     dockerfile = root / "Dockerfile"
     requirements = root / "requirements-dev.txt"
+    package_inventory = root / "python_packages.json"
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         metadata = {}
         failures.append("metadata")
-    if not isinstance(metadata, Mapping) or metadata.get("version") != "2.0":
+    if not isinstance(metadata, Mapping) or metadata.get("version") != "3.0":
         failures.append("metadata_schema")
         metadata = {}
     if PINNED_IMAGE.fullmatch(str(metadata.get("base_image", ""))) is None:
@@ -81,6 +144,15 @@ def verify_container_provenance(
         requirements_digest = ""
     if metadata.get("requirements_sha256") != requirements_digest:
         failures.append("requirements_digest")
+    package_report = verify_python_packages(package_inventory, requirements)
+    if package_report["verified"] is not True:
+        failures.extend(package_report["failed_gates"])
+    try:
+        package_digest = file_sha256(package_inventory)
+    except OSError:
+        package_digest = ""
+    if metadata.get("python_packages_sha256") != package_digest:
+        failures.append("python_packages_digest")
     smoke = metadata.get("smoke_test", {})
     if not (
         isinstance(smoke, Mapping)
@@ -106,4 +178,5 @@ def verify_container_provenance(
         "tag": metadata.get("tag"),
         "image_id": metadata.get("image_id"),
         "platform": metadata.get("platform"),
+        "python_packages": package_report["packages"],
     }

@@ -47,8 +47,16 @@ class ContainerProvenanceTest(unittest.TestCase):
         requirements = root / "requirements-dev.txt"
         dockerfile.write_text(f"FROM {image}\nUSER sandbox\n")
         requirements.write_text("pluggy==1.6.0\npytest==9.1.1\n")
+        packages = root / "python_packages.json"
+        packages.write_text(json.dumps({
+            "version": "1.0",
+            "packages": [
+                {"name": "pluggy", "version": "1.6.0"},
+                {"name": "pytest", "version": "9.1.1"},
+            ],
+        }))
         metadata = {
-            "version": "2.0",
+            "version": "3.0",
             "tag": "fixture",
             "base_image": image,
             "image_id": "sha256:" + "b" * 64,
@@ -56,6 +64,7 @@ class ContainerProvenanceTest(unittest.TestCase):
             "platform": {"os": "linux", "architecture": "amd64"},
             "dockerfile_sha256": hashlib.sha256(dockerfile.read_bytes()).hexdigest(),
             "requirements_sha256": hashlib.sha256(requirements.read_bytes()).hexdigest(),
+            "python_packages_sha256": hashlib.sha256(packages.read_bytes()).hexdigest(),
             "smoke_test": {
                 "passed": True,
                 "network": "none",
@@ -115,6 +124,42 @@ class ContainerProvenanceTest(unittest.TestCase):
             report = verify_container_provenance(root, expected_tag="fixture")
             self.assertIn("image_tag", report["failed_gates"])
             self.assertIn("base_image_mismatch", report["failed_gates"])
+
+    def test_inventory_must_match_pinned_direct_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = self.fixture(root)
+            inventory = root / "python_packages.json"
+            inventory.write_text(json.dumps({
+                "version": "1.0",
+                "packages": [
+                    {"name": "pluggy", "version": "1.6.0"},
+                    {"name": "pytest", "version": "0.0.0"},
+                ],
+            }))
+            metadata["python_packages_sha256"] = hashlib.sha256(
+                inventory.read_bytes()
+            ).hexdigest()
+            (root / "docker_image_metadata.json").write_text(json.dumps(metadata))
+            report = verify_container_provenance(root)
+            self.assertFalse(report["verified"])
+            self.assertIn("direct_dependency_version", report["failed_gates"])
+
+    def test_inventory_rejects_undeclared_host_or_debug_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = self.fixture(root)
+            inventory = root / "python_packages.json"
+            value = json.loads(inventory.read_text())
+            value["host_path"] = "/private/build/worker"
+            inventory.write_text(json.dumps(value))
+            metadata["python_packages_sha256"] = hashlib.sha256(
+                inventory.read_bytes()
+            ).hexdigest()
+            (root / "docker_image_metadata.json").write_text(json.dumps(metadata))
+            report = verify_container_provenance(root)
+            self.assertFalse(report["verified"])
+            self.assertIn("inventory_schema", report["failed_gates"])
 
 
 if __name__ == "__main__":

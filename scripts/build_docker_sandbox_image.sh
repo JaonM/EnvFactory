@@ -118,7 +118,8 @@ candidates=("$base_image" "${mirrors[@]}")
 selected=""
 manifest_file="$(mktemp "${TMPDIR:-/tmp}/env-factory-manifest.XXXXXX")"
 resolved_dockerfile="$(mktemp "${TMPDIR:-/tmp}/env-factory-dockerfile.XXXXXX")"
-cleanup() { rm -f "$manifest_file" "$resolved_dockerfile"; }
+package_inventory="$(mktemp "${TMPDIR:-/tmp}/env-factory-packages.XXXXXX")"
+cleanup() { rm -f "$manifest_file" "$resolved_dockerfile" "$package_inventory"; }
 trap cleanup EXIT
 read -r docker_os docker_arch < <(docker info --format '{{.OSType}} {{.Architecture}}')
 for candidate in "${candidates[@]}"; do
@@ -178,8 +179,26 @@ docker run --rm --network none --read-only \
   -e SANDBOX_EVALUATOR_MOCK=1 \
   -e PYTHONDONTWRITEBYTECODE=1 \
   "$tag" python3 -m pytest -q -p no:cacheprovider
+echo "采集镜像内 Python 分发包 inventory" >&2
+docker run --rm --network none --read-only \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --pids-limit 128 --memory 512m --cpus 1.0 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  "$tag" python3 -c 'import importlib.metadata as m,json; values={}; [(values.__setitem__(str(d.metadata.get("Name") or "").strip(), d.version)) for d in m.distributions() if str(d.metadata.get("Name") or "").strip()]; print(json.dumps({"version":"1.0","packages":[{"name":name,"version":values[name]} for name in sorted(values,key=str.casefold)]},sort_keys=True,separators=(",",":")))' \
+  > "$package_inventory"
+python3 - "$package_inventory" "$context/python_packages.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+Path(sys.argv[2]).write_text(
+    json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+)
+PY
 python3 - "$context/docker_image_metadata.json" "$tag" "$selected" "$image_id" \
-  "$image_os" "$image_arch" "$image_user" "$dockerfile" "$context/requirements-dev.txt" <<'PY'
+  "$image_os" "$image_arch" "$image_user" "$dockerfile" "$context/requirements-dev.txt" \
+  "$context/python_packages.json" <<'PY'
 import hashlib
 import json
 import sys
@@ -190,7 +209,7 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 Path(sys.argv[1]).write_text(json.dumps({
-    "version": "2.0",
+    "version": "3.0",
     "tag": sys.argv[2],
     "base_image": sys.argv[3],
     "image_id": sys.argv[4],
@@ -198,6 +217,7 @@ Path(sys.argv[1]).write_text(json.dumps({
     "runtime_user": sys.argv[7],
     "dockerfile_sha256": digest(sys.argv[8]),
     "requirements_sha256": digest(sys.argv[9]),
+    "python_packages_sha256": digest(sys.argv[10]),
     "smoke_test": {
         "passed": True,
         "command": "python3 -m pytest -q -p no:cacheprovider",
