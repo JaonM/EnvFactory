@@ -23,6 +23,9 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 沙箱离线分数必须与冻结的 `score_summary.json` 完全一致。认证器重新计算实现与评分器源码指纹、检查
   标准 10 项评分集合，并从各项权重和 critical 状态重建总分、资格及失败门禁；裸 `score=10`、陈旧报告
   或手工修改的汇总不能进入构建良品率分子。
+- 最终样本分数也不是可信输入。认证器先从原始 episode 重建 rollout 结论，再按照
+  `min(10, 0.9 × 离线沙箱分 + rollout质量分)` 重算最终分；只有声明的 `passed` 和分数均与重算结果一致
+  时，样本才能进入训练素材清单。
 - 每个出现的训练类别端到端合格率不低于 75%。
 - 三个留出批次分别保持训练构成骨架：`direct_response` 不少于 10% 且不高于 30%，
   `simple_agentic` 不少于 20%，`multi_step_agentic` 不少于 35%；未知或失败路由仍进入分母。

@@ -459,11 +459,44 @@ def certify(
             >= policy["score_threshold"]
         )
 
+    verified_final_results: set[int] = set()
+    expected_final_scores: dict[int, float] = {}
+    final_result_failures = []
+    for item in results:
+        live = item.get("live_rollout")
+        expected_score = None
+        if (
+            sandbox_passes(item)
+            and isinstance(live, Mapping)
+            and valid_rollout_outcome(live, policy)
+        ):
+            expected_score = round(min(
+                10.0,
+                float(item["sandbox_score"]["score"]) * 0.9
+                + float(live["quality_score"]),
+            ), 2)
+            expected_final_scores[id(item)] = expected_score
+        claimed_score = item.get("score")
+        if (
+            expected_score is not None
+            and item.get("passed") is True
+            and isinstance(claimed_score, (int, float))
+            and not isinstance(claimed_score, bool)
+            and math.isclose(float(claimed_score), expected_score)
+        ):
+            verified_final_results.add(id(item))
+        elif (
+            item.get("passed") is True
+            and isinstance(claimed_score, (int, float))
+            and not isinstance(claimed_score, bool)
+            and claimed_score >= policy["score_threshold"]
+        ):
+            final_result_failures.append(str(item.get("task_path", "")))
+
     def result_passes(item: Mapping[str, Any]) -> bool:
         return (
-            sandbox_passes(item)
-            and item.get("passed") is True
-            and item.get("score", 0) >= policy["score_threshold"]
+            id(item) in verified_final_results
+            and expected_final_scores[id(item)] >= policy["score_threshold"]
         )
 
     task_good = [item for item in results if task_passes(item)]
@@ -483,6 +516,7 @@ def certify(
     qualification_lineage = lineage_violations == 0
     task_score_provenance = not task_score_failures
     sandbox_score_provenance = not sandbox_score_failures
+    final_result_provenance = not final_result_failures
     rates = {
         "generation_completion": len(generated) / total if total else 0.0,
         "task_good_yield": len(task_good) / total if total else 0.0,
@@ -546,30 +580,39 @@ def certify(
                 "task_path": str(task_path), "error_type": type(exc).__name__,
             })
 
+    claimed_live_reports = [
+        item.get("live_rollout") for item in claimed_qualified
+        if isinstance(item.get("live_rollout"), Mapping)
+    ]
+    rollout_outcomes_verified = sum(
+        valid_rollout_outcome(report, policy) for report in claimed_live_reports
+    )
+    rollout_outcome_integrity = (
+        bool(claimed_qualified)
+        and len(claimed_live_reports) == len(claimed_qualified)
+        and rollout_outcomes_verified == len(claimed_qualified)
+    )
     live_reports = [
         item.get("live_rollout") for item in qualified
         if isinstance(item.get("live_rollout"), Mapping)
     ]
-    rollout_outcomes_verified = sum(
-        valid_rollout_outcome(report, policy) for report in live_reports
-    )
-    rollout_outcome_integrity = (
-        bool(qualified)
-        and len(live_reports) == len(qualified)
-        and rollout_outcomes_verified == len(qualified)
-    )
+    audited_episodes = [
+        episode for report in claimed_live_reports
+        for episode in report.get("episodes", []) if isinstance(episode, Mapping)
+    ]
     episodes = [
         episode for report in live_reports
         for episode in report.get("episodes", []) if isinstance(episode, Mapping)
     ]
-    environment_errors = sum(bool(item.get("issues")) for item in episodes)
+    environment_errors = sum(bool(item.get("issues")) for item in audited_episodes)
     fallbacks = sum(
-        "runtime_llm_fallback" in item.get("issues", []) for item in episodes
+        "runtime_llm_fallback" in item.get("issues", [])
+        for item in audited_episodes
     )
     successes = sum(item.get("agent_success") is True for item in episodes)
-    complete_episodes = sum(complete_episode(item) for item in episodes)
+    complete_episodes = sum(complete_episode(item) for item in audited_episodes)
     user_turns = [
-        step for episode in episodes for step in episode.get("trajectory", [])
+        step for episode in audited_episodes for step in episode.get("trajectory", [])
         if isinstance(step, Mapping) and step.get("path") == "/v1/user_simulator"
     ]
     valid_user_turns = sum(valid_user_turn(step) for step in user_turns)
@@ -744,7 +787,7 @@ def certify(
                 Path(str(item.get("output", "")))
             ),
             "category": str(item.get("category", "unknown")),
-            "score": item.get("score"),
+            "score": expected_final_scores[id(item)],
             "rollout_sha256": digest_json(live),
             "episode_count": len(item_episodes) if isinstance(item_episodes, list) else 0,
             "successful_episodes": sum(
@@ -786,6 +829,10 @@ def certify(
             "verified": len(verified_sandbox_scores),
             "failures": len(sandbox_score_failures),
         },
+        "final_result_provenance": {
+            "verified": len(verified_final_results),
+            "failures": len(final_result_failures),
+        },
         **rates,
         "by_category": category_counts,
         "category_mix": category_mix(results, policy),
@@ -793,22 +840,29 @@ def certify(
         "near_duplicate_rate": near_duplicate_rate(task_documents),
         "live_sandboxes": len(live_reports),
         "episodes": len(episodes),
+        "audited_episodes": len(audited_episodes),
         "successful_episodes": successes,
         "failed_episodes": len(episodes) - successes,
         "complete_episodes": complete_episodes,
         "agent_success_rate": successes / len(episodes) if episodes else 0.0,
         "environment_errors": environment_errors,
-        "environment_error_rate": environment_errors / len(episodes) if episodes else 1.0,
+        "environment_error_rate": (
+            environment_errors / len(audited_episodes)
+            if audited_episodes else 1.0
+        ),
         "llm_fallbacks": fallbacks,
         "rollout_coverage": rollout_coverage,
         "rollout_outcome_integrity": {
             "verified": rollout_outcomes_verified,
-            "expected": len(qualified),
+            "expected": len(claimed_qualified),
             "all_verified": rollout_outcome_integrity,
         },
         "rollout_provenance": rollout_provenance,
         "container_rollout_execution": container_rollout_execution,
-        "trajectory_schema_complete": bool(episodes) and complete_episodes == len(episodes),
+        "trajectory_schema_complete": (
+            bool(audited_episodes)
+            and complete_episodes == len(audited_episodes)
+        ),
         "user_simulator_calls": len(user_turns),
         "user_simulator_valid_calls": valid_user_turns,
         "user_simulator_protocol_rate": (
@@ -880,6 +934,7 @@ def certify(
         "task_score_provenance": task_score_provenance,
         "qualification_lineage": qualification_lineage,
         "sandbox_score_provenance": sandbox_score_provenance,
+        "final_result_provenance": final_result_provenance,
         "task_good_yield": (
             rates["task_good_yield"] >= policy["min_task_yield"]
             and rates["task_good_yield_ci95_lower"] >= policy["min_task_yield_ci95_lower"]

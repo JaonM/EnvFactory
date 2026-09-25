@@ -390,7 +390,7 @@ class ProductionReadinessTest(unittest.TestCase):
                     "category": category,
                     "task_score": task_score,
                     "sandbox_score": sandbox_report,
-                    "score": 9, "passed": True,
+                    "score": 10.0, "passed": True,
                     "live_rollout": {
                         "schema_version": "2.0",
                         "material_visibility_version": "1.0",
@@ -677,6 +677,19 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["gates"]["task_score_provenance"])
             self.assertEqual(
                 report["measurements"]["task_score_provenance"],
+                {"verified": 899, "failures": 1},
+            )
+
+    def test_final_score_is_recomputed_from_sandbox_and_rollout_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            result["score"] = 9.5
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["final_result_provenance"])
+            self.assertEqual(
+                report["measurements"]["final_result_provenance"],
                 {"verified": 899, "failures": 1},
             )
 
