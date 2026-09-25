@@ -30,13 +30,40 @@ class MaterialPrivacyTest(unittest.TestCase):
             }],
         }
 
-    def test_trainer_metadata_is_not_scanned_as_policy_visible(self):
+    def test_safe_trainer_metadata_is_not_projected_to_policy(self):
         report = audit_rollout_privacy(self.rollout())
         self.assertTrue(report["eligible_for_policy_training_export"])
         projected = policy_transition(
             self.rollout()["episodes"][0]["transitions"][0]
         )
         self.assertNotIn("trainer_metadata", projected)
+
+    def test_pii_in_trainer_only_metadata_is_not_exportable(self):
+        rollout = self.rollout()
+        rollout["episodes"][0]["transitions"][0]["trainer_metadata"] = {
+            "operator_note": "contact fixture@example.test",
+        }
+        report = audit_rollout_privacy(rollout)
+        self.assertFalse(report["eligible_for_policy_training_export"])
+        self.assertEqual(report["pii_findings"], [])
+        self.assertEqual(
+            report["packaged_rollout_pii_findings"][0]["kind"], "email"
+        )
+
+    def test_credential_in_trainer_only_replay_is_not_exportable(self):
+        rollout = self.rollout()
+        rollout["episodes"][0]["replay"] = {
+            "events": [{"payload": {"authorization": (
+                "Bearer abcdefghijklmnopqrstuvwxyz123456"
+            )}}],
+        }
+        report = audit_rollout_privacy(rollout)
+        self.assertFalse(report["eligible_for_policy_training_export"])
+        self.assertEqual(report["credential_findings"], [])
+        self.assertEqual(
+            report["packaged_rollout_credential_findings"][0]["kind"],
+            "bearer_token",
+        )
 
     def test_credential_in_visible_tool_result_is_rejected_without_echoing_it(self):
         secret = "sk-abcdefghijklmnopqrstuvwxyz123456"

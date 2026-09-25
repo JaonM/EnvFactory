@@ -156,10 +156,11 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 中的 CSV、TSV、YAML 及其他 UTF-8 fixture 与 JSON/JSONL 使用同一规则；无法解码的二进制业务数据
 采用 fail-closed，必须先提供可审计的文本导出才能进入生产素材。
 
-`audit_trajectory_privacy.py` 在 live rollout 后扫描 Agent 实际可见的 messages、observation、action、
-tool/User 公开结果和 next observation。凭证或 acceptance contract、ground truth、future user turns 等
-内部控制字段，以及 Agent/User Simulator 在运行时新生成的疑似 PII，一旦进入可见轨迹，该样本立即失去
-导出资格。生产认证器和便携包导出器都会针对原始 rollout 独立重算，不能用人工修改的干净报告绕过。
+`audit_trajectory_privacy.py` 在 live rollout 后执行两层审计：策略可见层扫描 Agent 实际收到或产生的
+messages、observation、action、tool/User 公开结果和 next observation，并禁止 acceptance contract、
+ground truth、future user turns 等内部控制字段；素材包层扫描将被打包的完整 `live_rollout.json`。因此，
+即使 trainer-only metadata、replay、初末状态不会进入策略输入，其中出现的凭证或疑似 PII 也会使样本
+失去导出资格。生产认证器和便携包导出器都会针对原始 rollout 独立重算，不能用人工修改的干净报告绕过。
 
 `build_docker_sandbox_image.sh` 将可达镜像标签解析为当前 Docker 平台的 manifest digest，以该内容地址
 构建并回写最终 Dockerfile；随后在生产安全参数下执行镜像内测试，成功后才写

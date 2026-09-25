@@ -1416,6 +1416,18 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["gates"]["trajectory_privacy"])
             self.assertIn("trajectory_privacy", report["failed_gates"])
 
+    def test_trainer_only_pii_breaks_trajectory_privacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = self.make_history(root)
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            result["live_rollout"]["episodes"][0]["transitions"][0][
+                "trainer_metadata"
+            ] = {"operator_note": "contact fixture@example.test"}
+            report = self.certify(history)
+            self.assertFalse(report["gates"]["trajectory_privacy"])
+            self.assertIn("trajectory_privacy", report["failed_gates"])
+
     def test_category_mix_prevents_single_route_dataset(self):
         with tempfile.TemporaryDirectory() as directory:
             history = self.make_history(Path(directory))

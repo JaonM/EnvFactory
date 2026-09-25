@@ -289,7 +289,7 @@ def _transition_records(
         raise ValueError("rollout model provenance is incomplete")
     privacy = audit_rollout_privacy(rollout)
     if privacy.get("eligible_for_policy_training_export") is not True:
-        raise ValueError(f"rollout policy-visible payload is unsafe: {privacy}")
+        raise ValueError(f"rollout material payload is unsafe: {privacy}")
     episodes = rollout.get("episodes")
     if not isinstance(episodes, list) or not episodes:
         raise ValueError("rollout episodes must be non-empty")

@@ -54,7 +54,12 @@ def policy_visible_payloads(rollout: Mapping[str, Any]) -> dict[str, Any]:
 
 def audit_rollout_privacy(rollout: Mapping[str, Any]) -> dict[str, Any]:
     payloads = policy_visible_payloads(rollout)
-    scan = scan_payloads(payloads)
+    policy_scan = scan_payloads(payloads)
+    # The complete live rollout is copied into the certified material bundle as
+    # trainer-only evidence.  Keeping it away from policy inputs prevents label
+    # leakage, but does not make credentials or PII safe to distribute.  Scan
+    # the complete packaged document independently and fail closed on either.
+    packaged_rollout_scan = scan_payloads({"rollout": rollout})
     forbidden = [
         finding
         for label, payload in payloads.items()
@@ -62,11 +67,13 @@ def audit_rollout_privacy(rollout: Mapping[str, Any]) -> dict[str, Any]:
     ]
     marker = rollout.get("material_visibility_version") == "1.0"
     return {
-        "version": "1.0",
+        "version": "1.1",
         "eligible_for_policy_training_export": (
             marker
-            and not scan["credential_findings"]
-            and not scan["pii_findings"]
+            and not policy_scan["credential_findings"]
+            and not policy_scan["pii_findings"]
+            and not packaged_rollout_scan["credential_findings"]
+            and not packaged_rollout_scan["pii_findings"]
             and not forbidden
         ),
         "material_visibility_version": rollout.get("material_visibility_version"),
@@ -78,7 +85,11 @@ def audit_rollout_privacy(rollout: Mapping[str, Any]) -> dict[str, Any]:
             "trajectory", "replay", "initial_state", "final_state",
             "trainer_metadata", "user_simulator_outcome",
         ],
-        "credential_findings": scan["credential_findings"],
-        "pii_findings": scan["pii_findings"],
+        "credential_findings": policy_scan["credential_findings"],
+        "pii_findings": policy_scan["pii_findings"],
+        "packaged_rollout_credential_findings": packaged_rollout_scan[
+            "credential_findings"
+        ],
+        "packaged_rollout_pii_findings": packaged_rollout_scan["pii_findings"],
         "forbidden_key_findings": forbidden,
     }
