@@ -10,12 +10,15 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from env_factory.material_artifacts import (
+    MATERIAL_MANIFEST_VERSION,
+    SUPPORTED_MATERIAL_MANIFEST_VERSIONS,
     digest_json,
     evidence_artifact_digests,
     portable_artifact_digests,
 )
 from env_factory.execution_provenance import valid_execution_provenance
 from env_factory.generation_provenance import valid_generation_provenance
+from env_factory.certification_policy import valid_certification_policy
 
 
 def verify_artifact_digests(root: Path, expected: Mapping[str, Any]) -> list[str]:
@@ -47,21 +50,30 @@ def verify(
     *, fingerprint: Callable[[Path, Path], str] | None = None,
 ) -> dict[str, Any]:
     failures = []
+    version = manifest.get("version")
+    if (
+        version not in SUPPORTED_MATERIAL_MANIFEST_VERSIONS
+        or manifest.get("kind") != "agentic_rl_pretraining_materials"
+    ):
+        failures.append({
+            "gate": "manifest_schema",
+            "message": "unsupported material manifest version or kind",
+        })
     base = {key: value for key, value in manifest.items() if key != "dataset_sha256"}
     if manifest.get("dataset_sha256") != digest_json(base):
         failures.append({"gate": "dataset_digest", "message": "manifest digest changed"})
-    if manifest.get("version") in {"3.0", "4.0"} and not valid_execution_provenance(
+    if version in {"3.0", "4.0", MATERIAL_MANIFEST_VERSION} and not valid_execution_provenance(
         manifest.get("execution_provenance")
     ):
         failures.append({
             "gate": "execution_provenance",
-            "message": "v3/v4 manifest needs a valid execution environment snapshot",
+            "message": "v3+ manifest needs a valid execution environment snapshot",
         })
     items = manifest.get("items")
     if not isinstance(items, list) or not items:
         failures.append({"gate": "manifest_schema", "message": "items must be non-empty"})
         items = []
-    if manifest.get("version") == "4.0" and any(
+    if version in {"4.0", MATERIAL_MANIFEST_VERSION} and any(
         not isinstance(item, Mapping)
         or not valid_generation_provenance(item.get("generation_provenance"))
         or item["generation_provenance"].get("task_sha256")
@@ -70,17 +82,17 @@ def verify(
     ):
         failures.append({
             "gate": "generation_provenance",
-            "message": "v4 manifest items need valid generation provenance",
+            "message": "v4+ manifest items need valid generation provenance",
         })
+    policy = manifest.get("certification_policy")
     policy_digest = manifest.get("certification_policy_sha256")
-    if manifest.get("version") == "4.0" and not (
-        isinstance(policy_digest, str)
-        and len(policy_digest) == 64
-        and all(character in "0123456789abcdef" for character in policy_digest)
+    if version == MATERIAL_MANIFEST_VERSION and not (
+        valid_certification_policy(policy)
+        and policy_digest == digest_json(policy)
     ):
         failures.append({
             "gate": "certification_policy",
-            "message": "v4 manifest needs a canonical certification policy digest",
+            "message": "v5 manifest needs a canonical certification policy binding",
         })
     seen = set()
     seen_roots = set()
@@ -103,7 +115,7 @@ def verify(
             failures.append({"gate": "task_digest", "item": index})
         expected_fingerprint = item.get("sandbox_evidence_fingerprint")
         artifact_hashes = item.get("sandbox_artifacts_sha256")
-        if manifest.get("version") in {"2.0", "3.0", "4.0"} and not (
+        if version in {"2.0", "3.0", "4.0", MATERIAL_MANIFEST_VERSION} and not (
             isinstance(artifact_hashes, Mapping) and artifact_hashes
         ):
             failures.append({"gate": "manifest_schema", "item": index,
@@ -134,7 +146,7 @@ def verify(
             if actual_fingerprint != expected_fingerprint:
                 failures.append({"gate": "sandbox_digest", "item": index})
         evidence_hashes = item.get("sandbox_evidence_sha256")
-        if manifest.get("version") in {"2.0", "3.0", "4.0"} and not (
+        if version in {"2.0", "3.0", "4.0", MATERIAL_MANIFEST_VERSION} and not (
             isinstance(evidence_hashes, Mapping) and evidence_hashes
         ):
             failures.append({"gate": "manifest_schema", "item": index,

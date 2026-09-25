@@ -13,6 +13,7 @@ from env_factory.sandbox_scoring import (
 from env_factory.task_quality import score_file
 from env_factory.material_artifacts import (
     DOCKERIGNORE_SOURCE,
+    MATERIAL_MANIFEST_VERSION,
     docker_build_context_digest,
 )
 
@@ -690,7 +691,10 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertTrue(report["gates"]["production_experiment_profile"])
             self.assertTrue(report["gates"]["production_preflight"])
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
-            self.assertEqual(report["materials_manifest"]["version"], "4.0")
+            self.assertEqual(
+                report["materials_manifest"]["version"],
+                MATERIAL_MANIFEST_VERSION,
+            )
             self.assertRegex(
                 report["measurements"]["sandbox_executable_revalidation"]
                     ["evidence_set_sha256"],
@@ -720,6 +724,31 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(
                 report["measurements"]["certification_policy"]["verified"]
             )
+            forged_manifest = json.loads(json.dumps(report["materials_manifest"]))
+            forged_manifest["certification_policy"]["min_tasks"] = 1
+            forged_manifest["certification_policy_sha256"] = (
+                certifier.digest_json(forged_manifest["certification_policy"])
+            )
+            forged_manifest["dataset_sha256"] = certifier.digest_json({
+                key: value for key, value in forged_manifest.items()
+                if key != "dataset_sha256"
+            })
+            verification = verifier.verify(forged_manifest, ROOT)
+            self.assertFalse(verification["verified"])
+            self.assertIn(
+                "certification_policy", verification["failed_gates"]
+            )
+
+    def test_material_manifest_rejects_unknown_schema_version(self):
+        manifest = {
+            "version": "99.0",
+            "kind": "agentic_rl_pretraining_materials",
+            "items": [],
+        }
+        manifest["dataset_sha256"] = certifier.digest_json(manifest)
+        report = verifier.verify(manifest, ROOT)
+        self.assertFalse(report["verified"])
+        self.assertIn("manifest_schema", report["failed_gates"])
 
     def test_pilot_profile_cannot_claim_production_certification(self):
         with tempfile.TemporaryDirectory() as directory:

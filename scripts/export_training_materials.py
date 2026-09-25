@@ -15,6 +15,7 @@ import tempfile
 from typing import Any, Mapping
 
 from env_factory.material_artifacts import (
+    MATERIAL_MANIFEST_VERSION,
     digest_json,
     docker_context_errors,
     portable_artifact_digests,
@@ -348,8 +349,13 @@ def _export_bundle_uncommitted(
         "production_preflight"
     )
     source_manifest = certification.get("materials_manifest")
-    if not isinstance(source_manifest, Mapping) or source_manifest.get("version") != "4.0":
-        raise ValueError("a v4 materials manifest is required")
+    if (
+        not isinstance(source_manifest, Mapping)
+        or source_manifest.get("version") != MATERIAL_MANIFEST_VERSION
+    ):
+        raise ValueError(
+            f"a v{MATERIAL_MANIFEST_VERSION.removesuffix('.0')} materials manifest is required"
+        )
     experiment_config_sha256 = source_manifest.get("experiment_config_sha256")
     if not (
         isinstance(experiment_config_sha256, str)
@@ -362,6 +368,7 @@ def _export_bundle_uncommitted(
     )
     if not (
         valid_certification_policy(certification_policy)
+        and source_manifest.get("certification_policy") == certification_policy
         and certification_policy_sha256 == digest_json(certification_policy)
         and certification.get("gates", {}).get("certification_policy") is True
         and certification.get("measurements", {}).get(

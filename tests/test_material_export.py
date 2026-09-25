@@ -8,6 +8,7 @@ import subprocess
 
 from env_factory.material_artifacts import (
     DOCKERIGNORE_SOURCE,
+    MATERIAL_MANIFEST_VERSION,
     docker_build_context_digest,
     digest_json,
     evidence_artifact_digests,
@@ -269,11 +270,12 @@ class MaterialExportTest(unittest.TestCase):
         item["generation_provenance"]["task_sha256"] = item["task_sha256"]
         policy = canonical_certification_policy()
         manifest = {
-            "version": "4.0",
+            "version": MATERIAL_MANIFEST_VERSION,
             "kind": "agentic_rl_pretraining_materials",
             "evaluator_source_digest": "source",
             "execution_provenance": collect_execution_provenance(ROOT),
             "experiment_config_sha256": "f" * 64,
+            "certification_policy": policy,
             "certification_policy_sha256": digest_json(policy),
             "items": [item],
         }

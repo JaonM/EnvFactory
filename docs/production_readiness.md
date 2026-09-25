@@ -269,7 +269,8 @@ uv run python scripts/verify_training_materials.py \
 验证器会分别重新计算任务文件、沙箱可移植文件树、rollout JSON 和整批清单摘要；任何文件变化、
 轨迹数量变化或重复沙箱身份都会返回非零退出码。评估器版本作为 provenance 固化，但后续评估器升级
 不会被误判成已认证沙箱遭到篡改。v1/v2/v3 清单仍可按各自规则验证，但应重新认证并升级为同时包含
-执行环境和任务生成 provenance 的 v4 后再导入训练系统。
+执行环境、任务生成 provenance 和 canonical 认证策略绑定的 v5 后再导入训练系统。v4 及更早版本
+仍可按各自历史 schema 做完整性验证，但不能导出为当前生产准备 Bundle。
 
 迁移或导入训练平台后可独立验证便携包：
 

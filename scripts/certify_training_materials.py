@@ -23,6 +23,7 @@ import tempfile
 from typing import Any, Iterable, Mapping
 
 from env_factory.material_artifacts import (
+    MATERIAL_MANIFEST_VERSION,
     digest_json,
     evidence_artifact_digests,
     portable_artifact_digest,
@@ -1423,11 +1424,12 @@ def certify(
         item["sandbox_evidence_fingerprint"] for item in material_items
     ]
     material_manifest = {
-        "version": "4.0",
+        "version": MATERIAL_MANIFEST_VERSION,
         "kind": "agentic_rl_pretraining_materials",
         "evaluator_source_digest": history.get("config", {}).get("source_digest"),
         "execution_provenance": recorded_execution,
         "experiment_config_sha256": experiment_config_sha256,
+        "certification_policy": dict(policy),
         "certification_policy_sha256": certification_policy_sha256,
         "items": material_items,
     }
