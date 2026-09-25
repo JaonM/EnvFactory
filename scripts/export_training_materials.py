@@ -88,6 +88,7 @@ def _portable_certification(certification: Mapping[str, Any]) -> dict[str, Any]:
         "failed_gates": certification.get("failed_gates", []),
         "source_dataset_sha256": source.get("dataset_sha256"),
         "evaluator_source_digest": source.get("evaluator_source_digest"),
+        "experiment_config_sha256": source.get("experiment_config_sha256"),
         "execution_provenance": source.get("execution_provenance"),
     }
 
@@ -156,7 +157,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "1.8",
+        "version": "1.9",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -314,6 +315,15 @@ def _export_bundle_uncommitted(
     preflight = certification.get("measurements", {}).get(
         "production_preflight"
     )
+    source_manifest = certification.get("materials_manifest")
+    if not isinstance(source_manifest, Mapping) or source_manifest.get("version") != "4.0":
+        raise ValueError("a v4 materials manifest is required")
+    experiment_config_sha256 = source_manifest.get("experiment_config_sha256")
+    if not (
+        isinstance(experiment_config_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", experiment_config_sha256) is not None
+    ):
+        raise ValueError("source manifest lacks a valid experiment configuration digest")
     expected_key_identity = (
         attestation.get("key_identity_sha256")
         if attestation.get("status") == "signed" else None
@@ -321,13 +331,11 @@ def _export_bundle_uncommitted(
     if not valid_production_preflight(
         preflight,
         expected_signing_key_identity=expected_key_identity,
+        expected_experiment_config_sha256=experiment_config_sha256,
     ):
         raise ValueError(
             "production preflight does not match bundle signing identity"
         )
-    source_manifest = certification.get("materials_manifest")
-    if not isinstance(source_manifest, Mapping) or source_manifest.get("version") != "4.0":
-        raise ValueError("a v4 materials manifest is required")
     try:
         from verify_training_materials import verify
     except ModuleNotFoundError:
@@ -545,6 +553,7 @@ def _export_bundle_uncommitted(
         "version": BUNDLE_VERSION,
         "kind": "portable_agentic_rl_training_materials",
         "source_dataset_sha256": source_manifest.get("dataset_sha256"),
+        "experiment_config_sha256": experiment_config_sha256,
         "execution_provenance_sha256": digest_json(
             source_manifest.get("execution_provenance")
         ),
@@ -598,7 +607,7 @@ def verify_bundle(
         failures.append("bundle_digest")
     if (
         manifest.get("version") not in {
-            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",
+            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0",
             BUNDLE_VERSION,
         }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
@@ -607,7 +616,7 @@ def verify_bundle(
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",
+        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0",
         BUNDLE_VERSION,
     }
     if production_contract_ready:
@@ -687,6 +696,13 @@ def verify_bundle(
         and portable_certification.get("failed_gates") == []
         and portable_certification.get("source_dataset_sha256")
             == manifest.get("source_dataset_sha256")
+        and (
+            not supports_bundle_feature(
+                str(manifest.get("version")), "experiment_binding"
+            )
+            or portable_certification.get("experiment_config_sha256")
+                == manifest.get("experiment_config_sha256")
+        )
         and digest_json(portable_certification.get("execution_provenance"))
             == manifest.get("execution_provenance_sha256")
         and valid_execution_provenance(
@@ -731,6 +747,13 @@ def verify_bundle(
                         "production_preflight"
                     ),
                     expected_signing_key_identity=expected_attestation_key,
+                    expected_experiment_config_sha256=(
+                        manifest.get("experiment_config_sha256")
+                        if supports_bundle_feature(
+                            str(manifest.get("version")), "experiment_binding"
+                        ) else None
+                    ),
+                    expected_bundle_version=str(manifest.get("version")),
                 )
             )
         )
@@ -1107,9 +1130,26 @@ def verify_bundle(
                 "production_preflight"
             ),
             expected_signing_key_identity=expected_attestation_key,
+            expected_experiment_config_sha256=(
+                manifest.get("experiment_config_sha256")
+                if supports_bundle_feature(
+                    str(manifest.get("version")), "experiment_binding"
+                ) else None
+            ),
+            expected_bundle_version=str(manifest.get("version")),
         )
         and bool(items)
         and verified_preflight_provider_bindings == len(items)
+    )
+    experiment_config_ready = (
+        supports_bundle_feature(str(manifest.get("version")), "experiment_binding")
+        and isinstance(manifest.get("experiment_config_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", manifest["experiment_config_sha256"]
+        ) is not None
+        and isinstance(preflight_report, Mapping)
+        and preflight_report.get("experiment_config_sha256")
+            == manifest.get("experiment_config_sha256")
     )
     evaluator_independence_ready = (
         supports_bundle_feature(
@@ -1260,7 +1300,8 @@ def verify_bundle(
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "1.8" if manifest.get("version") == BUNDLE_VERSION
+            "1.9" if manifest.get("version") == BUNDLE_VERSION
+            else "1.8" if manifest.get("version") == "12.0"
             else "1.7" if manifest.get("version") == "11.0"
             else "1.6" if manifest.get("version") == "10.0"
             else "1.5" if manifest.get("version") == "9.0"
@@ -1283,7 +1324,7 @@ def verify_bundle(
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
             manifest.get("version") not in {
-                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",
+                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0",
                 BUNDLE_VERSION,
             }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
@@ -1319,7 +1360,7 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     trusted_attestation = (
         manifest.get("version") in {
-            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",
+            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0",
             BUNDLE_VERSION,
         }
         and trusted_public_key is not None
@@ -1349,6 +1390,7 @@ def verify_bundle(
         "provider_identity_ready": provider_identity_ready,
         "task_lineage_ready": task_lineage_ready,
         "production_preflight_ready": production_preflight_ready,
+        "experiment_config_ready": experiment_config_ready,
         "preflight_provider_bindings": verified_preflight_provider_bindings,
         "metadata_privacy_ready": portable_metadata_privacy["safe"],
         "evaluator_independence_ready": evaluator_independence_ready,

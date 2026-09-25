@@ -13,17 +13,18 @@ CERTIFICATION_FILE = "certification.json"
 DATASET_CARD_FILE = "dataset_card.json"
 CONSUMER_CONTRACT_FILE = "consumer_contract.json"
 BUNDLE_SIGNATURE_FILE = "bundle_manifest.sig"
-BUNDLE_VERSION = "12.0"
+BUNDLE_VERSION = "13.0"
 DATASET_SPLITS = ("train", "validation", "test")
 FEATURE_VERSIONS = {
-    "splits": {"6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0"},
-    "families": {"7.0", "8.0", "9.0", "10.0", "11.0", "12.0"},
-    "generation": {"8.0", "9.0", "10.0", "11.0", "12.0"},
-    "container_rollout": {"9.0", "10.0", "11.0", "12.0"},
-    "reward_calibration": {"10.0", "11.0", "12.0"},
-    "provider_binding": {"11.0", "12.0"},
-    "task_lineage": {"11.0", "12.0"},
-    "production_preflight": {"12.0"},
+    "splits": {"6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0"},
+    "families": {"7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0"},
+    "generation": {"8.0", "9.0", "10.0", "11.0", "12.0", "13.0"},
+    "container_rollout": {"9.0", "10.0", "11.0", "12.0", "13.0"},
+    "reward_calibration": {"10.0", "11.0", "12.0", "13.0"},
+    "provider_binding": {"11.0", "12.0", "13.0"},
+    "task_lineage": {"11.0", "12.0", "13.0"},
+    "production_preflight": {"12.0", "13.0"},
+    "experiment_binding": {"13.0"},
 }
 
 

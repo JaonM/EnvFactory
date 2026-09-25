@@ -1351,6 +1351,7 @@ def main():
                         trusted_public_key=bundle_public_key,
                         environment=os.environ,
                         minimum_free_bytes=int(minimum_free_gib * 1024**3),
+                        experiment_config=config,
                     )
                     write_json(
                         root / "production_certification_preflight.json",

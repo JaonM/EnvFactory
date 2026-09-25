@@ -8,6 +8,7 @@ from env_factory.production_preflight import (
     run_production_preflight,
     valid_production_preflight,
 )
+from env_factory.material_artifacts import digest_json
 
 
 class Usage:
@@ -60,6 +61,17 @@ class ProductionPreflightTest(unittest.TestCase):
                 )
             self.assertTrue(report["ready"])
             self.assertTrue(valid_production_preflight(report))
+            bound = dict(report)
+            bound["version"] = "1.1"
+            bound["experiment_config_sha256"] = digest_json({"threshold": 8.5})
+            self.assertTrue(valid_production_preflight(
+                bound,
+                expected_experiment_config_sha256=digest_json({"threshold": 8.5}),
+            ))
+            self.assertFalse(valid_production_preflight(
+                bound,
+                expected_experiment_config_sha256=digest_json({"threshold": 9.0}),
+            ))
             self.assertNotIn("secret-value", str(report))
             model = next(
                 item for item in report["checks"]

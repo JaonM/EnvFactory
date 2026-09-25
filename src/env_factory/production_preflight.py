@@ -15,6 +15,7 @@ from .material_attestation import (
     public_key_identity,
 )
 from .material_consumer import BUNDLE_VERSION
+from .material_artifacts import digest_json
 from .data_governance import provider_identity
 from .model_roles import resolve_model_roles
 
@@ -38,6 +39,7 @@ def run_production_preflight(
     which: Callable[[str], str | None] = shutil.which,
     disk_usage: Callable[[Path], Any] = shutil.disk_usage,
     minimum_free_bytes: int = 10 * 1024**3,
+    experiment_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return non-secret readiness evidence without contacting model providers."""
     env = dict(os.environ if environment is None else environment)
@@ -158,8 +160,12 @@ def run_production_preflight(
 
     failed = [item["name"] for item in checks if not item["passed"]]
     return {
-        "version": "1.0",
+        "version": "1.1" if experiment_config is not None else "1.0",
         "scope": "production_pre_training_material_experiment",
+        **(
+            {"experiment_config_sha256": digest_json(experiment_config)}
+            if experiment_config is not None else {}
+        ),
         "network_probe_performed": False,
         "ready": not failed,
         "failed_checks": failed,
@@ -186,9 +192,22 @@ def valid_production_preflight(
     expected_runtime_provider: Mapping[str, Any] | None = None,
     expected_generation_provider: Mapping[str, Any] | None = None,
     expected_signing_key_identity: str | None = None,
+    expected_experiment_config_sha256: str | None = None,
+    expected_bundle_version: str = BUNDLE_VERSION,
 ) -> bool:
     """Validate evidence produced by a fresh, trusted preflight execution."""
-    if not isinstance(value, Mapping) or value.get("version") != "1.0":
+    if not isinstance(value, Mapping) or value.get("version") not in {"1.0", "1.1"}:
+        return False
+    config_digest = value.get("experiment_config_sha256")
+    if value.get("version") == "1.1" and not (
+        isinstance(config_digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", config_digest) is not None
+    ):
+        return False
+    if expected_experiment_config_sha256 is not None and not (
+        value.get("version") == "1.1"
+        and config_digest == expected_experiment_config_sha256
+    ):
         return False
     if (
         value.get("scope") != "production_pre_training_material_experiment"
@@ -220,7 +239,7 @@ def valid_production_preflight(
     signing_evidence = by_name["bundle_signing_identity"].get("evidence")
     if not (
         isinstance(signing_evidence, Mapping)
-        and signing_evidence.get("bundle_version") == BUNDLE_VERSION
+        and signing_evidence.get("bundle_version") == expected_bundle_version
         and isinstance(signing_evidence.get("key_identity_sha256"), str)
         and re.fullmatch(
             r"[0-9a-f]{64}", signing_evidence["key_identity_sha256"]

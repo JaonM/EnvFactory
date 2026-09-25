@@ -232,6 +232,7 @@ class MaterialExportTest(unittest.TestCase):
             "kind": "agentic_rl_pretraining_materials",
             "evaluator_source_digest": "source",
             "execution_provenance": collect_execution_provenance(ROOT),
+            "experiment_config_sha256": "f" * 64,
             "items": [item],
         }
         manifest["dataset_sha256"] = digest_json(manifest)
@@ -256,7 +257,8 @@ class MaterialExportTest(unittest.TestCase):
                     "same_provider_rate": 0.0,
                 },
                 "production_preflight": {
-                    "version": "1.0",
+                    "version": "1.1",
+                    "experiment_config_sha256": "f" * 64,
                     "scope": "production_pre_training_material_experiment",
                     "network_probe_performed": False,
                     "ready": True,
@@ -285,7 +287,7 @@ class MaterialExportTest(unittest.TestCase):
                                 }
                                 if name == "model_configuration" else {
                                     "key_identity_sha256": "e" * 64,
-                                    "bundle_version": "12.0",
+                                    "bundle_version": "13.0",
                                 }
                                 if name == "bundle_signing_identity" else {}
                                 if name != "evaluator_role_separation" else {
@@ -377,7 +379,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "12.0")
+            self.assertEqual(contract["bundle_version"], "13.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -431,7 +433,7 @@ class MaterialExportTest(unittest.TestCase):
                     certification, root / "bundle", ROOT
                 )
 
-    def test_v12_verifier_rejects_rehashed_missing_preflight_evidence(self):
+    def test_v13_verifier_rejects_rehashed_missing_preflight_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             certification = self.source(root)
@@ -458,7 +460,7 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["production_preflight_ready"])
             self.assertIn("portable_certification", report["failed_gates"])
 
-    def test_v12_verifier_binds_preflight_to_environment_providers(self):
+    def test_v13_verifier_binds_preflight_to_environment_providers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             certification = self.source(root)
@@ -493,7 +495,26 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["production_preflight_ready"])
             self.assertIn("preflight_provider_binding", report["failed_gates"])
 
-    def test_v12_verifier_rejects_rehashed_local_metadata(self):
+    def test_v13_verifier_rejects_rehashed_experiment_binding_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "bundle"
+            exporter.export_bundle(self.source(root), bundle, ROOT)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["experiment_config_sha256"] = "0" * 64
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["experiment_config_ready"])
+            self.assertIn("portable_certification", report["failed_gates"])
+
+    def test_v13_verifier_rejects_rehashed_local_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             certification = self.source(root)

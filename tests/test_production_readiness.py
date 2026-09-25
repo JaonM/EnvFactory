@@ -30,7 +30,7 @@ rollout_runner = load_script("run_live_rollout")
 
 class ProductionReadinessTest(unittest.TestCase):
     @staticmethod
-    def production_preflight():
+    def production_preflight(config):
         agent_provider = {
             "host": "agent.example", "model": "policy-model",
             "identity_sha256": "a" * 64,
@@ -44,7 +44,8 @@ class ProductionReadinessTest(unittest.TestCase):
             "identity_sha256": "b" * 64,
         }
         return {
-            "version": "1.0",
+            "version": "1.1",
+            "experiment_config_sha256": certifier.digest_json(config),
             "scope": "production_pre_training_material_experiment",
             "network_probe_performed": False,
             "ready": True,
@@ -61,7 +62,7 @@ class ProductionReadinessTest(unittest.TestCase):
                         }
                         if name == "model_configuration" else {
                             "key_identity_sha256": "e" * 64,
-                            "bundle_version": "12.0",
+                            "bundle_version": "13.0",
                         }
                         if name == "bundle_signing_identity" else {}
                         if name != "evaluator_role_separation" else {
@@ -99,7 +100,7 @@ class ProductionReadinessTest(unittest.TestCase):
             history,
             certifier.default_policy(),
             sandbox_revalidation=self.sandbox_revalidation(history),
-            production_preflight=self.production_preflight(),
+            production_preflight=self.production_preflight(history["config"]),
         )
 
     @staticmethod
@@ -721,6 +722,20 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["certified"])
             self.assertIn("production_preflight", report["failed_gates"])
 
+    def test_preflight_cannot_be_reused_after_frozen_config_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            preflight = self.production_preflight(history["config"])
+            history["config"]["score_threshold"] = 9.0
+            report = certifier.certify(
+                history,
+                certifier.default_policy(),
+                sandbox_revalidation=self.sandbox_revalidation(history),
+                production_preflight=preflight,
+            )
+            self.assertFalse(report["gates"]["production_preflight"])
+            self.assertIn("production_preflight", report["failed_gates"])
+
     def test_execution_environment_drift_breaks_certification(self):
         with tempfile.TemporaryDirectory() as directory:
             history = self.make_history(Path(directory))
@@ -1311,7 +1326,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "materials_manifest": {"dataset_sha256": "dataset"},
         }
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "12.0",
+            "verified": True, "bundle_version": "13.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1322,6 +1337,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "provider_identity_ready": True,
             "task_lineage_ready": True,
             "production_preflight_ready": True,
+            "experiment_config_ready": True,
             "metadata_privacy_ready": True,
             "evaluator_independence_ready": True,
             "source_dataset_sha256": "different",
@@ -1329,7 +1345,7 @@ class ProductionReadinessTest(unittest.TestCase):
         self.assertFalse(report["certified"])
         self.assertIn("portable_materials_bundle", report["failed_gates"])
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "12.0",
+            "verified": True, "bundle_version": "13.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1340,6 +1356,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "provider_identity_ready": True,
             "task_lineage_ready": True,
             "production_preflight_ready": True,
+            "experiment_config_ready": True,
             "metadata_privacy_ready": True,
             "evaluator_independence_ready": True,
             "source_dataset_sha256": "dataset",

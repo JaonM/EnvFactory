@@ -781,6 +781,9 @@ def certify(
         config.get("bundle_attestation_key_identity_sha256")
         if isinstance(config, Mapping) else None
     )
+    experiment_config_sha256 = (
+        digest_json(config) if isinstance(config, Mapping) else None
+    )
     preflight_verified = (
         isinstance(expected_generation_provider, Mapping)
         and isinstance(expected_agent_provider, Mapping)
@@ -792,6 +795,7 @@ def certify(
             expected_agent_provider=expected_agent_provider,
             expected_runtime_provider=expected_runtime_provider,
             expected_signing_key_identity=expected_signing_key_identity,
+            expected_experiment_config_sha256=experiment_config_sha256,
         )
     )
     recorded_execution = (
@@ -1329,6 +1333,7 @@ def certify(
         "kind": "agentic_rl_pretraining_materials",
         "evaluator_source_digest": history.get("config", {}).get("source_digest"),
         "execution_provenance": recorded_execution,
+        "experiment_config_sha256": experiment_config_sha256,
         "items": material_items,
     }
     material_manifest["dataset_sha256"] = digest_json(material_manifest)
@@ -1647,6 +1652,7 @@ def attach_bundle_verification(
         and verification.get("provider_identity_ready") is True
         and verification.get("task_lineage_ready") is True
         and verification.get("production_preflight_ready") is True
+        and verification.get("experiment_config_ready") is True
         and verification.get("metadata_privacy_ready") is True
         and verification.get("evaluator_independence_ready") is True
         and verification.get("source_dataset_sha256")
@@ -1679,6 +1685,7 @@ def main() -> int:
         signing_private_key=args.bundle_signing_private_key,
         trusted_public_key=args.bundle_trusted_public_key,
         environment=os.environ,
+        experiment_config=history.get("config", {}),
     )
     print(
         "production certification: re-executing sandbox evidence",
