@@ -18,6 +18,11 @@ from env_factory.execution_provenance import collect_execution_provenance
 from env_factory.material_attestation import public_key_identity
 from env_factory.certification_policy import canonical_certification_policy
 from env_factory.experiment_contract import build_experiment_contract
+from env_factory.data_governance import (
+    FORBIDDEN_OUTBOUND,
+    OUTBOUND_SURFACES,
+    SYNTHETIC_ORIGIN,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -111,6 +116,9 @@ class MaterialExportTest(unittest.TestCase):
             "task": "use the tool",
             "requirements": {"runtime_interface": {
                 "protocol": "http", "base_path": "/v1", "version": "1.0",
+            }},
+            "artifacts": {"data_manifest": {
+                "data_governance": SYNTHETIC_ORIGIN,
             }},
         }))
         task_document = json.loads(task.read_text())
@@ -243,6 +251,9 @@ class MaterialExportTest(unittest.TestCase):
             }},
         }))
         (sandbox / "data_governance.json").write_text(json.dumps({
+            "version": "1.0",
+            "eligible_for_external_model_processing": True,
+            "data_origin": SYNTHETIC_ORIGIN,
             "providers": {
                 "agent": {
                     "host": "agent.example", "model": "policy",
@@ -253,6 +264,10 @@ class MaterialExportTest(unittest.TestCase):
                     "identity_sha256": "b" * 64,
                 },
             },
+            "outbound_surfaces": OUTBOUND_SURFACES,
+            "forbidden_outbound": FORBIDDEN_OUTBOUND,
+            "credential_findings": [],
+            "pii_findings": [],
         }))
         item = {
             "task_path": str(task),
@@ -340,6 +355,11 @@ class MaterialExportTest(unittest.TestCase):
                     "verified": True,
                 },
                 "training_ready": 1,
+                "data_governance": {
+                    "reports": 1,
+                    "verified": 1,
+                    "all_verified": True,
+                },
                 "production_experiment_profile": True,
                 "evaluator_independence": {
                     "same_provider_items": 0,
@@ -422,6 +442,7 @@ class MaterialExportTest(unittest.TestCase):
                 "container_rollout_execution": True,
                 "container_reward_calibration": True,
                 "provider_identity_consistency": True,
+                "data_governance": True,
                 "production_experiment_profile": True,
                 "production_preflight": True,
                 "evaluator_independence": True,

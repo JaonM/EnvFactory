@@ -150,7 +150,9 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 
 `audit_data_governance.py` 在任何 live rollout 前验证任务的合成数据声明，扫描会进入公开任务、工具定义和
 业务 fixture 的凭证与疑似 PII，并将目标 provider、允许的出站面和禁止出站字段写入
-`data_governance.json`。报告只保存命中类型与 JSON 路径，不回写疑似敏感值。
+`data_governance.json`。生产素材采用零命中策略：即使任务声明为模型生成的合成数据，任何凭证或疑似 PII
+都会阻止外部模型处理与 Bundle 发布。报告只保存命中类型与 JSON 路径，不回写疑似敏感值；Bundle
+验证器会对便携任务和 fixture 独立重扫，不能通过清空治理报告绕过。
 
 `audit_trajectory_privacy.py` 在 live rollout 后扫描 Agent 实际可见的 messages、observation、action、
 tool/User 公开结果和 next observation。凭证或 acceptance contract、ground truth、future user turns 等

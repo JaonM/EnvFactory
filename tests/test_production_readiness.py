@@ -411,10 +411,7 @@ class ProductionReadinessTest(unittest.TestCase):
                     "identity_sha256": "b" * 64,
                 },
             },
-            "outbound_surfaces": {
-                name: sorted(values)
-                for name, values in certifier.REQUIRED_OUTBOUND_SURFACES.items()
-            },
+            "outbound_surfaces": certifier.OUTBOUND_SURFACES,
             "forbidden_outbound": certifier.FORBIDDEN_OUTBOUND,
             "credential_findings": [],
             "pii_findings": [],
@@ -1346,6 +1343,23 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["gates"]["data_governance"])
             self.assertIn("data_governance", report["failed_gates"])
 
+    def test_synthetic_pii_breaks_data_governance_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = self.make_history(root)
+            task_path = Path(
+                history["holdouts"][0]["jobs"][0]["result"]["task_path"]
+            )
+            task = json.loads(task_path.read_text())
+            task["public_input"] = {
+                "initial_user_message": "请联系 fixture@example.test",
+                "materials": [],
+            }
+            task_path.write_text(json.dumps(task))
+            report = self.certify(history)
+            self.assertFalse(report["gates"]["data_governance"])
+            self.assertIn("data_governance", report["failed_gates"])
+
     def test_governance_report_cannot_hide_a_credential_in_the_frozen_task(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1483,6 +1497,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "certification_policy_ready": True,
             "container_reward_calibration_ready": True,
             "provider_identity_ready": True,
+            "data_governance_ready": True,
             "task_lineage_ready": True,
             "production_preflight_ready": True,
             "experiment_config_ready": True,
@@ -1509,6 +1524,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "certification_policy_ready": True,
             "container_reward_calibration_ready": True,
             "provider_identity_ready": True,
+            "data_governance_ready": True,
             "task_lineage_ready": True,
             "production_preflight_ready": True,
             "experiment_config_ready": True,

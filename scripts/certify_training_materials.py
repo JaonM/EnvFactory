@@ -35,9 +35,8 @@ from env_factory.trajectory_schema import complete_episode
 from env_factory.data_governance import (
     FORBIDDEN_OUTBOUND,
     OUTBOUND_SURFACES,
-    SYNTHETIC_ORIGIN,
-    sandbox_payloads,
-    scan_payloads,
+    REQUIRED_OUTBOUND_SURFACES,
+    valid_governance_report,
     valid_provider_binding as valid_governed_provider_binding,
 )
 from env_factory.container_provenance import verify_container_provenance
@@ -73,11 +72,6 @@ USER_OUTCOMES = {
 NEGATIVE_COUNTERFACTUALS = (
     "goal_failure", "no_tools", "noise_selection", "reordered_tools",
 )
-REQUIRED_OUTBOUND_SURFACES = {
-    name: set(values) for name, values in OUTBOUND_SURFACES.items()
-}
-
-
 def load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -266,42 +260,11 @@ def valid_data_governance(
     report: Mapping[str, Any], sandbox_root: Path, task_path: Path
 ) -> bool:
     """Independently recompute claims over the frozen task and fixture payloads."""
-    origin = report.get("data_origin", {})
-    providers = report.get("providers", {})
-    surfaces = report.get("outbound_surfaces", {})
     try:
         task = load(task_path)
-        declared = task.get("artifacts", {}).get("data_manifest", {}).get(
-            "data_governance", {}
-        )
-        rescanned = scan_payloads(sandbox_payloads(sandbox_root, task))
-    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+    except (OSError, json.JSONDecodeError, TypeError):
         return False
-    return (
-        report.get("version") == "1.0"
-        and report.get("eligible_for_external_model_processing") is True
-        and isinstance(origin, Mapping)
-        and dict(origin) == SYNTHETIC_ORIGIN
-        and isinstance(declared, Mapping)
-        and dict(declared) == SYNTHETIC_ORIGIN
-        and report.get("credential_findings") == rescanned["credential_findings"] == []
-        and report.get("pii_findings") == rescanned["pii_findings"]
-        and isinstance(providers, Mapping)
-        and all(
-            isinstance(providers.get(name), Mapping)
-            and bool(providers[name].get("host"))
-            and bool(providers[name].get("model"))
-            and isinstance(providers[name].get("identity_sha256"), str)
-            and re.fullmatch(r"[0-9a-f]{64}", providers[name]["identity_sha256"])
-            for name in ("agent", "user_simulator_and_reward")
-        )
-        and isinstance(surfaces, Mapping)
-        and all(
-            required <= set(surfaces.get(name, []))
-            for name, required in REQUIRED_OUTBOUND_SURFACES.items()
-        )
-        and set(FORBIDDEN_OUTBOUND) <= set(report.get("forbidden_outbound", []))
-    )
+    return valid_governance_report(report, sandbox_root, task)
 
 
 def _counterfactual_counts(reports: Iterable[Mapping[str, Any]]) -> dict[str, int]:
@@ -1794,6 +1757,7 @@ def attach_bundle_verification(
         and verification.get("certification_policy_ready") is True
         and verification.get("container_reward_calibration_ready") is True
         and verification.get("provider_identity_ready") is True
+        and verification.get("data_governance_ready") is True
         and verification.get("task_lineage_ready") is True
         and verification.get("production_preflight_ready") is True
         and verification.get("experiment_config_ready") is True

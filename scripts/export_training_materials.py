@@ -47,7 +47,10 @@ from env_factory.execution_provenance import valid_execution_provenance
 from env_factory.task_similarity import task_family_ids
 from env_factory.generation_provenance import valid_generation_provenance
 from env_factory.runtime_provenance import valid_container_rollout_execution
-from env_factory.data_governance import valid_provider_binding
+from env_factory.data_governance import (
+    valid_governance_report,
+    valid_provider_binding,
+)
 from env_factory.certification_policy import valid_certification_policy
 from env_factory.experiment_contract import valid_experiment_contract
 from env_factory.task_portability import valid_task_lineage
@@ -1056,6 +1059,7 @@ def verify_bundle(
     verified_runtime_response_models: Counter[str] = Counter()
     verified_container_reward_calibrations = 0
     verified_provider_bindings = 0
+    verified_data_governance_items = 0
     verified_preflight_provider_bindings = 0
     verified_same_provider_evaluator_items = 0
     verified_task_lineages = 0
@@ -1256,6 +1260,13 @@ def verify_bundle(
                     )
                 except (OSError, json.JSONDecodeError):
                     governance = {}
+                governance_valid = valid_governance_report(
+                    governance, root / environment, task_document
+                )
+                if governance_valid:
+                    verified_data_governance_items += 1
+                else:
+                    failures.append("data_governance")
                 governed_binding_valid = valid_provider_binding(
                     rollout, calibration, governance
                 )
@@ -1412,6 +1423,23 @@ def verify_bundle(
         and bool(items)
         and verified_provider_bindings == len(items)
     )
+    data_governance_ready = (
+        supports_bundle_feature(str(manifest.get("version")), "provider_binding")
+        and bool(items)
+        and verified_data_governance_items == len(items)
+        and portable_certification.get("gates", {}).get("data_governance") is True
+        and portable_certification.get("measurements", {}).get(
+            "data_governance"
+        ) == {
+            "reports": len(items),
+            "verified": len(items),
+            "all_verified": True,
+        }
+    )
+    if supports_bundle_feature(
+        str(manifest.get("version")), "provider_binding"
+    ) and not data_governance_ready:
+        failures.append("data_governance")
     task_lineage_ready = (
         supports_bundle_feature(str(manifest.get("version")), "task_lineage")
         and bool(items)
@@ -1833,6 +1861,7 @@ def verify_bundle(
         "certification_policy_ready": certification_policy_ready,
         "container_reward_calibration_ready": container_reward_calibration_ready,
         "provider_identity_ready": provider_identity_ready,
+        "data_governance_ready": data_governance_ready,
         "task_lineage_ready": task_lineage_ready,
         "production_preflight_ready": production_preflight_ready,
         "experiment_config_ready": experiment_config_ready,

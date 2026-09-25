@@ -44,6 +44,9 @@ FORBIDDEN_OUTBOUND = [
     "future_user_turns",
     "trainer_authentication",
 ]
+REQUIRED_OUTBOUND_SURFACES = {
+    name: set(values) for name, values in OUTBOUND_SURFACES.items()
+}
 
 CREDENTIAL_PATTERNS = {
     "private_key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
@@ -206,9 +209,12 @@ def audit(
         provider["host"] != "unknown" and bool(provider["model"].strip())
         for provider in (agent_provider, runtime_provider)
     )
-    eligible = synthetic and providers_complete and not scan["credential_findings"]
-    if scan["pii_findings"] and not synthetic:
-        eligible = False
+    eligible = (
+        synthetic
+        and providers_complete
+        and not scan["credential_findings"]
+        and not scan["pii_findings"]
+    )
     return {
         "version": "1.0",
         "eligible_for_external_model_processing": eligible,
@@ -221,3 +227,52 @@ def audit(
         "forbidden_outbound": FORBIDDEN_OUTBOUND,
         **scan,
     }
+
+
+def valid_governance_report(
+    report: Mapping[str, Any] | Any,
+    root: Path,
+    task: Mapping[str, Any] | Any,
+) -> bool:
+    """Recompute the complete external-model data boundary from portable files."""
+    if not isinstance(report, Mapping) or not isinstance(task, Mapping):
+        return False
+    declared = task.get("artifacts", {}).get("data_manifest", {}).get(
+        "data_governance", {}
+    )
+    try:
+        rescanned = scan_payloads(sandbox_payloads(root, task))
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+        return False
+    providers = report.get("providers")
+    surfaces = report.get("outbound_surfaces")
+
+    def valid_provider(value: Any) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and isinstance(value.get("host"), str)
+            and bool(value["host"].strip())
+            and value["host"] != "unknown"
+            and isinstance(value.get("model"), str)
+            and bool(value["model"].strip())
+            and isinstance(value.get("identity_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", value["identity_sha256"])
+                is not None
+        )
+
+    return (
+        report.get("version") == "1.0"
+        and report.get("eligible_for_external_model_processing") is True
+        and report.get("data_origin") == SYNTHETIC_ORIGIN
+        and declared == SYNTHETIC_ORIGIN
+        and report.get("credential_findings")
+            == rescanned["credential_findings"] == []
+        and report.get("pii_findings") == rescanned["pii_findings"] == []
+        and isinstance(providers, Mapping)
+        and all(valid_provider(providers.get(name)) for name in (
+            "agent", "user_simulator_and_reward",
+        ))
+        and isinstance(surfaces, Mapping)
+        and dict(surfaces) == OUTBOUND_SURFACES
+        and report.get("forbidden_outbound") == FORBIDDEN_OUTBOUND
+    )

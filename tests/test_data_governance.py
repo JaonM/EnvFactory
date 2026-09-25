@@ -3,7 +3,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from env_factory.data_governance import audit, provider_identity
+from env_factory.data_governance import (
+    audit,
+    provider_identity,
+    valid_governance_report,
+)
 
 
 class DataGovernanceTest(unittest.TestCase):
@@ -71,7 +75,7 @@ class DataGovernanceTest(unittest.TestCase):
             self.assertTrue(report["credential_findings"])
             self.assertNotIn(secret, json.dumps(report))
 
-    def test_synthetic_pii_fixture_is_reported_but_not_mislabeled_as_real(self):
+    def test_synthetic_pii_fixture_is_ineligible_for_external_processing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.make_root(
@@ -80,8 +84,10 @@ class DataGovernanceTest(unittest.TestCase):
                 material="fictional contact: fixture@example.test",
             )
             report = self.run_audit(root)
-            self.assertTrue(report["eligible_for_external_model_processing"])
+            self.assertFalse(report["eligible_for_external_model_processing"])
             self.assertEqual(report["pii_findings"][0]["kind"], "email")
+            task = json.loads((root / "task.json").read_text())
+            self.assertFalse(valid_governance_report(report, root, task))
 
     def test_missing_synthetic_declaration_is_ineligible(self):
         with tempfile.TemporaryDirectory() as directory:
