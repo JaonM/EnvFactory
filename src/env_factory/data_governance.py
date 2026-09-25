@@ -182,7 +182,9 @@ def sandbox_payloads(root: Path, task: Mapping[str, Any]) -> dict[str, Any]:
     data_root = root / "data"
     if data_root.is_dir():
         for path in sorted(data_root.rglob("*")):
-            if path.is_file() and path.suffix in {".json", ".jsonl", ".txt", ".md"}:
+            # Business tools may expose any fixture file. Scan every UTF-8
+            # payload instead of maintaining a bypass-prone suffix allowlist.
+            if path.is_file():
                 payloads[f"data/{path.relative_to(data_root)}"] = load_json_or_lines(path)
     return payloads
 
@@ -242,7 +244,9 @@ def valid_governance_report(
     )
     try:
         rescanned = scan_payloads(sandbox_payloads(root, task))
-    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+    except (
+        OSError, UnicodeError, json.JSONDecodeError, TypeError, AttributeError,
+    ):
         return False
     providers = report.get("providers")
     surfaces = report.get("outbound_surfaces")

@@ -89,6 +89,26 @@ class DataGovernanceTest(unittest.TestCase):
             task = json.loads((root / "task.json").read_text())
             self.assertFalse(valid_governance_report(report, root, task))
 
+    def test_csv_fixture_cannot_bypass_pii_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_root(root, governance=self.synthetic_manifest())
+            (root / "data/contacts.csv").write_text(
+                "name,email\nfixture,fixture@example.test\n"
+            )
+            report = self.run_audit(root)
+            self.assertFalse(report["eligible_for_external_model_processing"])
+            self.assertEqual(report["pii_findings"][0]["kind"], "email")
+
+    def test_unreadable_binary_fixture_fails_governance_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_root(root, governance=self.synthetic_manifest())
+            report = self.run_audit(root)
+            (root / "data/blob.bin").write_bytes(b"\xff\xfe\x00")
+            task = json.loads((root / "task.json").read_text())
+            self.assertFalse(valid_governance_report(report, root, task))
+
     def test_missing_synthetic_declaration_is_ineligible(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
