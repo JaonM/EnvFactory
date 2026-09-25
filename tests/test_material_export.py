@@ -33,8 +33,16 @@ class MaterialExportTest(unittest.TestCase):
         sandbox = root / "sandbox"
         sandbox.mkdir()
         task = sandbox / "task.json"
-        task.write_text('{"task":"use the tool"}')
+        task.write_text(json.dumps({
+            "task": "use the tool",
+            "requirements": {"runtime_interface": {
+                "protocol": "http", "base_path": "/v1", "version": "1.0",
+            }},
+        }))
         (sandbox / "app.py").write_text("# portable runtime\n")
+        (sandbox / "Dockerfile").write_text(
+            "FROM python@sha256:" + "a" * 64 + "\nUSER sandbox\n"
+        )
         (sandbox / "acceptance_result.json").write_text(
             '{"business_acceptance":"passed"}'
         )
@@ -120,6 +128,7 @@ class MaterialExportTest(unittest.TestCase):
             self.assertTrue(report["verified"], report)
             self.assertEqual(report["items"], 1)
             self.assertEqual(report["transitions"], 1)
+            self.assertTrue(report["production_contract_ready"])
             record = json.loads((bundle / "transitions.jsonl").read_text())
             self.assertEqual(record["transition"]["reward"], 1.0)
             self.assertEqual(record["episode_final_reward"], 1.0)
@@ -143,6 +152,12 @@ class MaterialExportTest(unittest.TestCase):
                     "execution_provenance_sha256"
                 ],
                 digest_json(card["build_environment"]),
+            )
+            contract = json.loads((bundle / "consumer_contract.json").read_text())
+            self.assertEqual(contract["bundle_version"], "4.0")
+            self.assertEqual(
+                contract["records"]["policy_transition_fields"],
+                exporter.consumer_contract()["records"]["policy_transition_fields"],
             )
             copied_app = next((bundle / "environments").glob("*/app.py"))
             copied_app.write_text("# tampered\n")
@@ -216,6 +231,88 @@ class MaterialExportTest(unittest.TestCase):
             report = exporter.verify_bundle(bundle)
             self.assertFalse(report["verified"])
             self.assertIn("dataset_card", report["failed_gates"])
+
+    def test_bundle_verifier_rejects_rehashed_consumer_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            contract_path = bundle / "consumer_contract.json"
+            contract = json.loads(contract_path.read_text())
+            contract["visibility"]["trainer_only"] = "transitions.jsonl"
+            contract_path.write_text(json.dumps(contract))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files_sha256"]["consumer_contract.json"] = exporter.file_sha256(
+                contract_path
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["production_contract_ready"])
+            self.assertIn("consumer_contract", report["failed_gates"])
+
+    def test_legacy_v3_bundle_keeps_integrity_status_but_not_production_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            card_path = bundle / "dataset_card.json"
+            card = json.loads(card_path.read_text())
+            card["version"] = "1.0"
+            card.pop("consumer_contract")
+            card_path.write_text(json.dumps(card))
+            contract_path = bundle / "consumer_contract.json"
+            contract_path.unlink()
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = "3.0"
+            manifest.pop("consumer_contract_file")
+            manifest["files_sha256"].pop("consumer_contract.json")
+            manifest["files_sha256"]["dataset_card.json"] = exporter.file_sha256(
+                card_path
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertTrue(report["verified"], report)
+            self.assertFalse(report["production_contract_ready"])
+
+    def test_rehashed_bundle_cannot_remove_environment_rebuild_entrypoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            item = manifest["items"][0]
+            relative = f"{item['environment_path']}/Dockerfile"
+            (bundle / relative).unlink()
+            item["files_sha256"].pop("Dockerfile")
+            manifest["files_sha256"].pop(relative)
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertIn(
+                "environment_reconstruction_contract", report["failed_gates"]
+            )
 
     def test_uncertified_report_cannot_be_exported(self):
         with tempfile.TemporaryDirectory() as directory:

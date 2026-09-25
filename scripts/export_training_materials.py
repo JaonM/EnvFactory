@@ -15,15 +15,18 @@ import tempfile
 from typing import Any, Mapping
 
 from env_factory.material_artifacts import digest_json
+from env_factory.material_consumer import (
+    BUNDLE_MANIFEST,
+    BUNDLE_VERSION,
+    CERTIFICATION_FILE,
+    CONSUMER_CONTRACT_FILE,
+    DATASET_CARD_FILE,
+    TRANSITIONS_FILE,
+    consumer_contract,
+)
 from env_factory.material_privacy import audit_rollout_privacy
 from env_factory.trajectory_schema import episode_errors, policy_transition
 from env_factory.execution_provenance import valid_execution_provenance
-
-
-BUNDLE_MANIFEST = "bundle_manifest.json"
-TRANSITIONS_FILE = "transitions.jsonl"
-CERTIFICATION_FILE = "certification.json"
-DATASET_CARD_FILE = "dataset_card.json"
 
 
 def file_sha256(path: Path) -> str:
@@ -86,7 +89,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "1.0",
+        "version": "1.1",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -103,6 +106,7 @@ def _dataset_card(
         "prohibited_interpretations": sorted(set(limitations)),
         "distribution_status": "internal_only_until_legal_and_security_review",
         "license_status": "not_asserted_by_envfactory",
+        "consumer_contract": CONSUMER_CONTRACT_FILE,
         "build_environment": certification.get("materials_manifest", {}).get(
             "execution_provenance"
         ),
@@ -214,7 +218,16 @@ def _export_bundle_uncommitted(
     successful_episodes = 0
     model_pairs: Counter[tuple[str, str]] = Counter()
     with transition_path.open("w", encoding="utf-8", newline="\n") as stream:
-        for item in source_manifest.get("items", []):
+        source_items = source_manifest.get("items", [])
+        if not isinstance(source_items, list):
+            raise ValueError("material items must be a list")
+        for item in sorted(
+            source_items,
+            key=lambda value: (
+                str(value.get("task_sha256", "")),
+                str(value.get("sandbox_evidence_fingerprint", "")),
+            ) if isinstance(value, Mapping) else ("", ""),
+        ):
             if not isinstance(item, Mapping):
                 raise ValueError("material item is not an object")
             item_id = f"{item['task_sha256'][:16]}-{item['sandbox_evidence_fingerprint'][:16]}"
@@ -290,6 +303,10 @@ def _export_bundle_uncommitted(
         json.dumps(card, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8", newline="\n",
     )
+    (output / CONSUMER_CONTRACT_FILE).write_text(
+        json.dumps(consumer_contract(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n",
+    )
 
     files = {
         str(path.relative_to(output)): file_sha256(path)
@@ -297,7 +314,7 @@ def _export_bundle_uncommitted(
         if path.is_file() and path.name != BUNDLE_MANIFEST
     }
     manifest = {
-        "version": "3.0",
+        "version": BUNDLE_VERSION,
         "kind": "portable_agentic_rl_training_materials",
         "source_dataset_sha256": source_manifest.get("dataset_sha256"),
         "execution_provenance_sha256": digest_json(
@@ -310,6 +327,7 @@ def _export_bundle_uncommitted(
         "successful_episodes": successful_episodes,
         "certification_file": CERTIFICATION_FILE,
         "dataset_card_file": DATASET_CARD_FILE,
+        "consumer_contract_file": CONSUMER_CONTRACT_FILE,
         "transition_visibility": {
             "version": "1.0",
             "policy_projection": "env_factory.trajectory_schema.policy_transition",
@@ -335,12 +353,28 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     if manifest.get("bundle_sha256") != digest_json(unsigned):
         failures.append("bundle_digest")
     if (
-        manifest.get("version") != "3.0"
+        manifest.get("version") not in {"3.0", BUNDLE_VERSION}
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
         or not isinstance(manifest.get("source_dataset_sha256"), str)
         or len(manifest["source_dataset_sha256"]) != 64
     ):
         failures.append("bundle_schema")
+    production_contract_ready = manifest.get("version") == BUNDLE_VERSION
+    if production_contract_ready:
+        try:
+            contract_relative = _safe_relative(
+                str(manifest.get("consumer_contract_file", ""))
+            )
+            if contract_relative != Path(CONSUMER_CONTRACT_FILE):
+                raise ValueError("unexpected consumer contract path")
+            consumer_contract_document = json.loads(
+                (root / contract_relative).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError, ValueError):
+            consumer_contract_document = {}
+        if consumer_contract_document != consumer_contract():
+            failures.append("consumer_contract")
+            production_contract_ready = False
     visibility = manifest.get("transition_visibility", {})
     if not (
         isinstance(visibility, Mapping)
@@ -458,6 +492,21 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         task_path = root / environment / "task.json"
         if not task_path.is_file() or file_sha256(task_path) != item.get("task_sha256"):
             failures.append("item_task")
+        try:
+            task_document = json.loads(task_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            task_document = {}
+        runtime_interface = (
+            task_document.get("requirements", {}).get("runtime_interface")
+            if isinstance(task_document, Mapping) else None
+        )
+        if not (
+            (root / environment / "Dockerfile").is_file()
+            and "Dockerfile" in item_files
+            and isinstance(runtime_interface, Mapping)
+            and bool(runtime_interface)
+        ):
+            failures.append("environment_reconstruction_contract")
         rollout_path = root / environment / "live_rollout.json"
         try:
             rollout = json.loads(rollout_path.read_text(encoding="utf-8"))
@@ -483,6 +532,17 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         )] += 1
     if records != expected_records:
         failures.append("transition_projection")
+    item_ids = [item.get("item_id") for item in items if isinstance(item, Mapping)]
+    record_identities = [
+        (
+            record.get("item_id"), record.get("episode_index"),
+            record.get("transition", {}).get("step")
+            if isinstance(record.get("transition"), Mapping) else None,
+        )
+        for record in records if isinstance(record, Mapping)
+    ]
+    if item_ids != sorted(item_ids) or len(record_identities) != len(set(record_identities)):
+        failures.append("consumer_record_order_or_identity")
     if (
         len(records) != manifest.get("transition_count")
         or len(items) != manifest.get("item_count")
@@ -506,7 +566,8 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     ) else set()
     if not (
         isinstance(dataset_card, Mapping)
-        and dataset_card.get("version") == "1.0"
+        and dataset_card.get("version")
+            == ("1.1" if manifest.get("version") == BUNDLE_VERSION else "1.0")
         and dataset_card.get("kind") == "agentic_rl_pretraining_material_dataset_card"
         and dataset_card.get("source_dataset_sha256")
             == manifest.get("source_dataset_sha256")
@@ -518,6 +579,10 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         and dataset_card.get("distribution_status")
             == "internal_only_until_legal_and_security_review"
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
+        and (
+            manifest.get("version") != BUNDLE_VERSION
+            or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
+        )
         and card_composition.get("items") == len(items)
         and card_composition.get("transitions") == len(records)
         and card_composition.get("episodes") == verified_episode_count
@@ -552,6 +617,7 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         "source_dataset_sha256": manifest.get("source_dataset_sha256"),
         "items": manifest.get("item_count", 0),
         "transitions": len(records),
+        "production_contract_ready": production_contract_ready,
         "failed_gates": sorted(set(failures)),
     }
 

@@ -441,14 +441,31 @@ class ProductionReadinessTest(unittest.TestCase):
             "materials_manifest": {"dataset_sha256": "dataset"},
         }
         certifier.attach_bundle_verification(report, {
-            "verified": True, "source_dataset_sha256": "different",
+            "verified": True, "production_contract_ready": True,
+            "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
         self.assertIn("portable_materials_bundle", report["failed_gates"])
         certifier.attach_bundle_verification(report, {
-            "verified": True, "source_dataset_sha256": "dataset",
+            "verified": True, "production_contract_ready": True,
+            "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])
+
+    def test_legacy_bundle_cannot_satisfy_production_contract_gate(self):
+        report = {
+            "certified": True,
+            "gates": {"base": True},
+            "failed_gates": [],
+            "materials_manifest": {"dataset_sha256": "dataset"},
+        }
+        certifier.attach_bundle_verification(report, {
+            "verified": True,
+            "production_contract_ready": False,
+            "source_dataset_sha256": "dataset",
+        })
+        self.assertFalse(report["certified"])
+        self.assertIn("portable_materials_bundle", report["failed_gates"])
 
     def test_v2_manifest_tracks_sandbox_files_independently_of_evaluator(self):
         with tempfile.TemporaryDirectory() as directory:

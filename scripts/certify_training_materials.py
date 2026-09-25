@@ -772,6 +772,7 @@ def attach_bundle_verification(
     report["materials_bundle_verification"] = dict(verification)
     report["gates"]["portable_materials_bundle"] = (
         verification.get("verified") is True
+        and verification.get("production_contract_ready") is True
         and verification.get("source_dataset_sha256")
         == report.get("materials_manifest", {}).get("dataset_sha256")
     )
