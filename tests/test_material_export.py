@@ -324,7 +324,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "10.0")
+            self.assertEqual(contract["bundle_version"], "11.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -746,6 +746,45 @@ class MaterialExportTest(unittest.TestCase):
             self.assertTrue(report["verified"], report)
             self.assertTrue(report["container_rollout_ready"])
             self.assertFalse(report["container_reward_calibration_ready"])
+
+    def test_legacy_v10_bundle_keeps_reward_claim_without_v11_identity_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            contract_path = bundle / "consumer_contract.json"
+            contract_path.write_text(json.dumps(exporter.consumer_contract("10.0")))
+            card_path = bundle / "dataset_card.json"
+            card = json.loads(card_path.read_text())
+            card["version"] = "1.6"
+            card_path.write_text(json.dumps(card))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = "10.0"
+            item = manifest["items"][0]
+            lineage_path = bundle / item["environment_path"] / "task_lineage.json"
+            lineage_relative = str(lineage_path.relative_to(bundle))
+            lineage_path.unlink()
+            item["files_sha256"].pop("task_lineage.json")
+            manifest["files_sha256"].pop(lineage_relative)
+            manifest["files_sha256"]["consumer_contract.json"] = (
+                exporter.file_sha256(contract_path)
+            )
+            manifest["files_sha256"]["dataset_card.json"] = (
+                exporter.file_sha256(card_path)
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertTrue(report["verified"], report)
+            self.assertTrue(report["container_reward_calibration_ready"])
+            self.assertFalse(report["provider_identity_ready"])
+            self.assertFalse(report["task_lineage_ready"])
 
     def test_rehashed_bundle_cannot_remove_environment_rebuild_entrypoint(self):
         with tempfile.TemporaryDirectory() as directory:

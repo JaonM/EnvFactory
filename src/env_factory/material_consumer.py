@@ -13,8 +13,21 @@ CERTIFICATION_FILE = "certification.json"
 DATASET_CARD_FILE = "dataset_card.json"
 CONSUMER_CONTRACT_FILE = "consumer_contract.json"
 BUNDLE_SIGNATURE_FILE = "bundle_manifest.sig"
-BUNDLE_VERSION = "10.0"
+BUNDLE_VERSION = "11.0"
 DATASET_SPLITS = ("train", "validation", "test")
+FEATURE_VERSIONS = {
+    "splits": {"6.0", "7.0", "8.0", "9.0", "10.0", "11.0"},
+    "families": {"7.0", "8.0", "9.0", "10.0", "11.0"},
+    "generation": {"8.0", "9.0", "10.0", "11.0"},
+    "container_rollout": {"9.0", "10.0", "11.0"},
+    "reward_calibration": {"10.0", "11.0"},
+    "provider_binding": {"11.0"},
+    "task_lineage": {"11.0"},
+}
+
+
+def supports_bundle_feature(bundle_version: str, feature: str) -> bool:
+    return bundle_version in FEATURE_VERSIONS.get(feature, set())
 
 
 def assign_dataset_splits(items: list[dict[str, Any]]) -> dict[str, str]:
@@ -46,9 +59,10 @@ def assign_dataset_splits(items: list[dict[str, Any]]) -> dict[str, str]:
 
 def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
     """Return the exact portable handoff; consumers need no prompt conventions."""
-    supports_splits = bundle_version in {"6.0", "7.0", "8.0", "9.0", BUNDLE_VERSION}
-    supports_families = bundle_version in {"7.0", "8.0", "9.0", BUNDLE_VERSION}
-    supports_generation = bundle_version in {"8.0", "9.0", BUNDLE_VERSION}
+    supports_splits = supports_bundle_feature(bundle_version, "splits")
+    supports_families = supports_bundle_feature(bundle_version, "families")
+    supports_generation = supports_bundle_feature(bundle_version, "generation")
+    supports_lineage = supports_bundle_feature(bundle_version, "task_lineage")
     record_fields = [
         "schema_version", "item_id", "task_sha256", "category",
         "episode_index", "episode_seed", "episode_success",
@@ -144,7 +158,9 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
             "index": f"{BUNDLE_MANIFEST}#items",
             "root_template": "environments/{item_id}",
             "task_contract": "environments/{item_id}/task.json",
-            "task_lineage": "environments/{item_id}/task_lineage.json",
+            **({
+                "task_lineage": "environments/{item_id}/task_lineage.json",
+            } if supports_lineage else {}),
             "docker_build_context": "environments/{item_id}",
             "dockerfile": "environments/{item_id}/Dockerfile",
             "runtime_interface_source": "task.json#requirements.runtime_interface",
@@ -168,6 +184,6 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
             "only_final_transition_is_terminal_or_truncated",
             "final_transition_reward_equals_episode_final_reward",
             "trainer_only_fields_are_not_policy_inputs",
-            "generated_task_equals_runtime_task",
+            *(["generated_task_equals_runtime_task"] if supports_lineage else []),
         ],
     }

@@ -26,6 +26,7 @@ from env_factory.material_consumer import (
     TRANSITIONS_FILE,
     assign_dataset_splits,
     consumer_contract,
+    supports_bundle_feature,
 )
 from env_factory.material_attestation import (
     sign_file,
@@ -145,7 +146,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "1.6",
+        "version": "1.7",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -560,7 +561,8 @@ def verify_bundle(
         failures.append("bundle_digest")
     if (
         manifest.get("version") not in {
-            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", BUNDLE_VERSION,
+            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0",
+            BUNDLE_VERSION,
         }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
         or not isinstance(manifest.get("source_dataset_sha256"), str)
@@ -568,7 +570,8 @@ def verify_bundle(
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", BUNDLE_VERSION,
+        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0",
+        BUNDLE_VERSION,
     }
     if production_contract_ready:
         try:
@@ -642,12 +645,20 @@ def verify_bundle(
         and portable_certification["gates"]
         and all(value is True for value in portable_certification["gates"].values())
         and (
-            manifest.get("version") != BUNDLE_VERSION
+            not supports_bundle_feature(
+                str(manifest.get("version")), "reward_calibration"
+            )
             or {
                 "container_rollout_execution",
                 "container_reward_calibration",
-                "provider_identity_consistency",
             } <= set(portable_certification["gates"])
+        )
+        and (
+            not supports_bundle_feature(
+                str(manifest.get("version")), "provider_binding"
+            )
+            or "provider_identity_consistency"
+                in portable_certification["gates"]
         )
     ):
         failures.append("portable_certification")
@@ -717,12 +728,14 @@ def verify_bundle(
         seen_item_ids.add(item_id)
         expected_family_id = recomputed_families.get(item_id, "")
         if (
-            manifest.get("version") in {"7.0", "8.0", "9.0", BUNDLE_VERSION}
+            supports_bundle_feature(str(manifest.get("version")), "families")
             and item.get("task_family_id") != expected_family_id
         ):
             failures.append("task_family_identity")
         generation = item.get("generation_provenance")
-        if manifest.get("version") in {"8.0", "9.0", BUNDLE_VERSION} and (
+        if supports_bundle_feature(
+            str(manifest.get("version")), "generation"
+        ) and (
             not valid_generation_provenance(generation)
             or generation.get("training_category") != item.get("category")
             or generation.get("task_sha256") != item.get("task_sha256")
@@ -762,10 +775,13 @@ def verify_bundle(
             )
         except (OSError, json.JSONDecodeError):
             task_lineage = {}
-        if valid_task_lineage(task_lineage, task_path, task_path):
-            verified_task_lineages += 1
-        else:
-            failures.append("task_lineage")
+        if supports_bundle_feature(
+            str(manifest.get("version")), "task_lineage"
+        ):
+            if valid_task_lineage(task_lineage, task_path, task_path):
+                verified_task_lineages += 1
+            else:
+                failures.append("task_lineage")
         runtime_interface = (
             task_document.get("requirements", {}).get("runtime_interface")
             if isinstance(task_document, Mapping) else None
@@ -780,7 +796,9 @@ def verify_bundle(
         rollout_path = root / environment / "live_rollout.json"
         try:
             rollout = json.loads(rollout_path.read_text(encoding="utf-8"))
-            if manifest.get("version") in {"9.0", BUNDLE_VERSION}:
+            if supports_bundle_feature(
+                str(manifest.get("version")), "container_rollout"
+            ):
                 execution_valid = valid_container_rollout_execution(
                     rollout, root / environment
                 ) and item.get("runtime_execution") == rollout.get(
@@ -794,32 +812,32 @@ def verify_bundle(
                 item_id, item, rollout, split=str(item.get("split", "")),
                 task_family_id=(
                     expected_family_id
-                    if manifest.get("version") in {"7.0", "8.0", "9.0", BUNDLE_VERSION} else ""
+                    if supports_bundle_feature(
+                        str(manifest.get("version")), "families"
+                    ) else ""
                 ),
                 generation_provenance=(
                     generation
-                    if manifest.get("version") in {"8.0", "9.0", BUNDLE_VERSION}
+                    if supports_bundle_feature(
+                        str(manifest.get("version")), "generation"
+                    )
                     else None
                 ),
             )
         except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
             failures.append("transition_schema")
             continue
-        if manifest.get("version") == BUNDLE_VERSION:
+        if supports_bundle_feature(
+            str(manifest.get("version")), "reward_calibration"
+        ):
             try:
                 calibration = json.loads(
                     (root / environment / "agentic_training_value_live.json").read_text(
                         encoding="utf-8"
                     )
                 )
-                governance = json.loads(
-                    (root / environment / "data_governance.json").read_text(
-                        encoding="utf-8"
-                    )
-                )
             except (OSError, json.JSONDecodeError):
                 calibration = {}
-                governance = {}
             calibration_valid = (
                 calibration.get("curriculum_training_ready") is True
                 and calibration.get("validation_mode") == "live_evaluator"
@@ -833,10 +851,21 @@ def verify_bundle(
                 verified_container_reward_calibrations += 1
             else:
                 failures.append("container_reward_calibration")
-            if valid_provider_binding(rollout, calibration, governance):
-                verified_provider_bindings += 1
-            else:
-                failures.append("provider_identity_binding")
+            if supports_bundle_feature(
+                str(manifest.get("version")), "provider_binding"
+            ):
+                try:
+                    governance = json.loads(
+                        (root / environment / "data_governance.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                except (OSError, json.JSONDecodeError):
+                    governance = {}
+                if valid_provider_binding(rollout, calibration, governance):
+                    verified_provider_bindings += 1
+                else:
+                    failures.append("provider_identity_binding")
         if item.get("episode_count") != len(rollout.get("episodes", [])):
             failures.append("item_episode_count")
         if item.get("transition_count") != len(projected):
@@ -872,7 +901,9 @@ def verify_bundle(
             "category": str(item.get("category")),
             "task_family_id": (
                 recomputed_families.get(str(item.get("item_id")), "")
-                if manifest.get("version") in {"7.0", "8.0", "9.0", BUNDLE_VERSION} else ""
+                if supports_bundle_feature(
+                    str(manifest.get("version")), "families"
+                ) else ""
             ),
         }
         for item in items if isinstance(item, Mapping)
@@ -884,7 +915,9 @@ def verify_bundle(
         (str(item.get("category")), str(item.get("split")))
         for item in items if isinstance(item, Mapping)
     )
-    if manifest.get("version") in {"6.0", "7.0", "8.0", "9.0", BUNDLE_VERSION} and any(
+    if supports_bundle_feature(
+        str(manifest.get("version")), "splits"
+    ) and any(
         item.get("split") != expected_splits.get(str(item.get("item_id")))
         for item in items if isinstance(item, Mapping)
     ):
@@ -906,7 +939,7 @@ def verify_bundle(
         family_categories.setdefault(family, set()).add(str(item.get("category")))
         family_splits.setdefault(family, set()).add(str(item.get("split")))
     family_split_ready = (
-        manifest.get("version") in {"7.0", "8.0", "9.0", BUNDLE_VERSION}
+        supports_bundle_feature(str(manifest.get("version")), "families")
         and bool(family_categories)
         and all(len(values) == 1 for values in family_categories.values())
         and all(len(values) == 1 for values in family_splits.values())
@@ -920,28 +953,30 @@ def verify_bundle(
         if isinstance(value, Mapping)
     ]
     generation_provenance_ready = (
-        manifest.get("version") in {"8.0", "9.0", BUNDLE_VERSION}
+        supports_bundle_feature(str(manifest.get("version")), "generation")
         and len(generation_values) == len(items)
         and all(valid_generation_provenance(value) for value in generation_values)
         and len(generation_seeds) == len(set(generation_seeds))
     )
     container_rollout_ready = (
-        manifest.get("version") in {"9.0", BUNDLE_VERSION}
+        supports_bundle_feature(str(manifest.get("version")), "container_rollout")
         and bool(items)
         and verified_container_rollouts == len(items)
     )
     container_reward_calibration_ready = (
-        manifest.get("version") == BUNDLE_VERSION
+        supports_bundle_feature(
+            str(manifest.get("version")), "reward_calibration"
+        )
         and bool(items)
         and verified_container_reward_calibrations == len(items)
     )
     provider_identity_ready = (
-        manifest.get("version") == BUNDLE_VERSION
+        supports_bundle_feature(str(manifest.get("version")), "provider_binding")
         and bool(items)
         and verified_provider_bindings == len(items)
     )
     task_lineage_ready = (
-        manifest.get("version") == BUNDLE_VERSION
+        supports_bundle_feature(str(manifest.get("version")), "task_lineage")
         and bool(items)
         and verified_task_lineages == len(items)
     )
@@ -1022,19 +1057,19 @@ def verify_bundle(
     }
     version = manifest.get("version")
     versioned_card_composition = True
-    if version in {"6.0", "7.0", "8.0", "9.0", BUNDLE_VERSION}:
+    if supports_bundle_feature(str(version), "splits"):
         versioned_card_composition = (
             card_composition.get("splits") == expected_split_counts
             and card_composition.get("category_splits") == expected_category_splits
         )
-    if version in {"7.0", "8.0", "9.0", BUNDLE_VERSION}:
+    if supports_bundle_feature(str(version), "families"):
         versioned_card_composition = versioned_card_composition and (
             card_composition.get("task_families") == expected_family_count
             and card_composition.get("near_duplicate_items")
                 == len(items) - expected_family_count
             and card_composition.get("cross_split_family_overlap") == 0
         )
-    if version in {"8.0", "9.0", BUNDLE_VERSION}:
+    if supports_bundle_feature(str(version), "generation"):
         versioned_card_composition = versioned_card_composition and (
             card_composition.get("task_generation") == {
                 "configured_models": dict(
@@ -1050,7 +1085,7 @@ def verify_bundle(
                 "responses": expected_generation_responses,
             }
         )
-    if version in {"9.0", BUNDLE_VERSION}:
+    if supports_bundle_feature(str(version), "container_rollout"):
         versioned_card_composition = versioned_card_composition and (
             card_composition.get("runtime_execution") == {
                 "modes": dict(sorted(expected_runtime_modes.items())),
@@ -1060,7 +1095,7 @@ def verify_bundle(
                 "unique_container_images": len(expected_container_images),
             }
         )
-    if version == BUNDLE_VERSION:
+    if supports_bundle_feature(str(version), "reward_calibration"):
         versioned_card_composition = versioned_card_composition and (
             card_composition.get("reward_calibration_execution") == {
                 "modes": dict(sorted(expected_reward_runtime_modes.items())),
@@ -1075,7 +1110,8 @@ def verify_bundle(
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "1.6" if manifest.get("version") == BUNDLE_VERSION
+            "1.7" if manifest.get("version") == BUNDLE_VERSION
+            else "1.6" if manifest.get("version") == "10.0"
             else "1.5" if manifest.get("version") == "9.0"
             else "1.4" if manifest.get("version") == "8.0"
             else "1.3" if manifest.get("version") == "7.0"
@@ -1096,7 +1132,8 @@ def verify_bundle(
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
             manifest.get("version") not in {
-                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", BUNDLE_VERSION,
+                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0",
+                BUNDLE_VERSION,
             }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
         )
@@ -1131,7 +1168,9 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     attestation = manifest.get("attestation")
     trusted_attestation = (
-        manifest.get("version") in {"5.0", "6.0", "7.0", "8.0", "9.0", BUNDLE_VERSION}
+        manifest.get("version") in {
+            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", BUNDLE_VERSION,
+        }
         and trusted_public_key is not None
         and verify_file(
             root / BUNDLE_MANIFEST,
