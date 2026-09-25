@@ -64,7 +64,10 @@ def audit_rollout_privacy(rollout: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "version": "1.0",
         "eligible_for_policy_training_export": (
-            marker and not scan["credential_findings"] and not forbidden
+            marker
+            and not scan["credential_findings"]
+            and not scan["pii_findings"]
+            and not forbidden
         ),
         "material_visibility_version": rollout.get("material_visibility_version"),
         "policy_visible_fields": [

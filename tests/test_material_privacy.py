@@ -45,6 +45,14 @@ class MaterialPrivacyTest(unittest.TestCase):
         self.assertTrue(report["credential_findings"])
         self.assertNotIn(secret, str(report))
 
+    def test_pii_generated_during_rollout_is_not_exportable(self):
+        report = audit_rollout_privacy(self.rollout({
+            "status": 200,
+            "user_query": "email me at fixture@example.test",
+        }))
+        self.assertFalse(report["eligible_for_policy_training_export"])
+        self.assertEqual(report["pii_findings"][0]["kind"], "email")
+
     def test_hidden_control_key_in_visible_observation_is_rejected(self):
         rollout = self.rollout()
         rollout["episodes"][0]["transitions"][0]["observation"] = {
