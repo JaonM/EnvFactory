@@ -43,6 +43,9 @@ Pilot 通过只表示可以进入更大规模认证，
   一条成功证据；`--rollout-min-success-rate` 可提高该门槛。生产留出集默认使用 10 次 episode 和
   `--holdout-rollout-success-rate 0.6666666666666666`。
 - live 模式的最终 10 分由离线可执行证据占 9 分、真实 rollout 占 1 分组成；任何 live 硬失败仍直接取消训练资格，不能依靠离线高分抵消。
+- live rollout 通过后会以 `SANDBOX_EVALUATOR_MOCK=0` 执行奖励反事实校准，写入
+  `agentic_training_value_live.json`。真实 evaluator 的成功轨迹、失败轨迹、无工具、错参数、跳步、乱序和
+  噪声轨迹不满足奖励分离时，样本仍不合格；离线 mock 报告不能替代该证据。
 - `--build-timeout`、`--generation-timeout`、`--score-timeout`、`--rollout-timeout` 分阶段限时，超时清理进程组。
 - `--max-total-seconds` 默认 259200，只累计实验进程的活跃执行时间；正常暂停不消耗预算。`runtime_state.json` 保存累计活跃时间和运行状态。质量循环不再因“停滞”或固定 20 轮提前结束；显式设置正数 `--max-rounds` 才启用轮数预算。基础设施超时属于异常中止而非质量收敛。
 - 同一个实验目录只允许一个运行进程；每个任务完成即原子保存。相同命令重启可恢复，不重复执行已经完成的任务；未完成构建使用新的 attempt 目录。中断的生成不会自动重新抽样，缺失任务计为失败。
@@ -65,7 +68,10 @@ CLI 从项目 `.env` 加载环境变量；独立沙箱/容器应由启动器注�
 
 Agent 只获得题面、公开工具及观测，使用 JSON 动作协议自主调用工具或回复用户；不读取成功答案、奖励规则和隐藏业务状态。User Simulator 使用真实 LLM，协议失败的 fallback 会单独标记并阻止 live 验证通过。
 
-保存工具结果、用户交互、奖励、状态变化及调用用量；检查无操作高奖励、重复奖励不稳定，以及 stateful 目标不满足却得到高奖励。模型没有完成任务记录为缺少成功证据，不直接断言环境有错。
+保存 transition schema v2：每一步包含完整公开模型输入、原始输出、解析动作、工具/User Simulator 结果、
+前后观察、奖励、terminated/truncated 和调用用量；同时保留 HTTP trace 与 replay。轨迹绑定任务哈希、
+沙箱可执行输入摘要、模型及 provider 摘要。检查无操作高奖励、重复奖励不稳定，以及 stateful 目标不满足
+却得到高奖励。模型没有完成任务记录为缺少成功证据，不直接断言环境有错。
 
 开发阶段的默认 live 门要求至少一条成功轨迹、全部轨迹无已检测环境问题且无 LLM fallback；
 发布留出集将成功率门提高到至少 2/3，并要求轨迹池同时包含成功和失败样本。

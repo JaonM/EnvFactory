@@ -9,12 +9,20 @@ does not claim that an RL algorithm will improve a policy.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import math
 from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping
+
+from env_factory.material_artifacts import (
+    digest_json,
+    evidence_artifact_digests,
+    portable_artifact_digest,
+    portable_artifact_digests,
+)
 
 
 Z_95 = 1.959963984540054
@@ -26,39 +34,15 @@ USER_OUTCOMES = {
 NEGATIVE_COUNTERFACTUALS = (
     "goal_failure", "no_tools", "noise_selection", "reordered_tools",
 )
-PORTABLE_ROOT_SUFFIXES = {".py", ".sh", ".json", ".md", ".txt"}
-PORTABLE_DIRECTORIES = ("tests", "data", ".outer_conformance")
 
 
 def load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def digest_json(value: Any) -> str:
-    rendered = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.sha256(rendered).hexdigest()
-
-
 def artifact_digests(root: Path) -> dict[str, str]:
-    """Hash only portable training-environment inputs, never logs or runtime DBs."""
-    paths = [
-        path for path in root.iterdir()
-        if path.is_file()
-        and path.name != "live_rollout.json"
-        and (path.name == "Dockerfile" or path.suffix in PORTABLE_ROOT_SUFFIXES)
-    ]
-    for directory in PORTABLE_DIRECTORIES:
-        paths.extend(
-            path for path in (root / directory).rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts
-            and path.suffix not in {".pyc", ".sqlite", ".sqlite3", ".db", ".log"}
-        )
-    return {
-        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted(set(paths))
-    }
+    """Backward-compatible public helper used by existing report consumers."""
+    return portable_artifact_digests(root)
 
 
 def wilson_lower(successes: int, total: int, *, z: float = Z_95) -> float:
@@ -172,6 +156,21 @@ def complete_episode(episode: Mapping[str, Any]) -> bool:
             for item in transitions
         )
     )
+    if transition_schema_complete:
+        markers = [
+            bool(item["terminated"] or item["truncated"]) for item in transitions
+        ]
+        transition_schema_complete = (
+            [item["step"] for item in transitions] == list(range(len(transitions)))
+            and not any(markers[:-1])
+            and markers[-1]
+            and not (transitions[-1]["terminated"] and transitions[-1]["truncated"])
+            and (
+                (episode.get("termination") == "step_budget" and transitions[-1]["truncated"])
+                or (episode.get("termination") != "step_budget" and transitions[-1]["terminated"])
+            )
+            and transitions[-1]["reward"] == episode.get("final_reward")
+        )
     return (
         transition_schema_complete
         and isinstance(episode.get("seed"), int)
@@ -204,9 +203,109 @@ def valid_user_turn(step: Mapping[str, Any]) -> bool:
         and isinstance(result.get("user_query"), str)
         and bool(result["user_query"].strip())
         and isinstance(result.get("should_end"), bool)
+        and result.get("match_status") in {"matched", "unmatched", "ambiguous"}
         and result.get("outcome_category") in USER_OUTCOMES
         and isinstance(result.get("reason_code"), str)
+        and (
+            not result.get("should_end")
+            or isinstance(result.get("termination_reason"), str)
+        )
     )
+
+
+def category_mix(results: Iterable[Mapping[str, Any]], policy: Mapping[str, Any]) -> dict[str, Any]:
+    values = list(results)
+    total = len(values)
+    counts = Counter(str(item.get("category", "unknown")) for item in values)
+    shares = {name: count / total if total else 0.0 for name, count in counts.items()}
+    minimums = policy.get("min_category_shares", {})
+    passed = total > 0 and all(
+        shares.get(str(name), 0.0) >= float(minimum)
+        for name, minimum in minimums.items()
+    )
+    maximums = policy.get("max_category_shares", {})
+    passed = passed and all(
+        shares.get(str(name), 0.0) <= float(maximum)
+        for name, maximum in maximums.items()
+    )
+    return {"counts": dict(counts), "shares": shares, "passed": passed}
+
+
+def valid_rollout_provenance(item: Mapping[str, Any]) -> bool:
+    live = item.get("live_rollout")
+    task_path = Path(str(item.get("task_path", "")))
+    root = Path(str(item.get("output", "")))
+    if not isinstance(live, Mapping) or not task_path.is_file() or not root.is_dir():
+        return False
+    try:
+        task_sha = hashlib.sha256(task_path.read_bytes()).hexdigest()
+        artifact_sha = portable_artifact_digest(root)
+    except OSError:
+        return False
+    return (
+        live.get("schema_version") == "2.0"
+        and live.get("task_sha256") == task_sha
+        and live.get("sandbox_artifacts_digest") == artifact_sha
+        and isinstance(live.get("agent_model"), str) and bool(live["agent_model"])
+        and isinstance(live.get("runtime_model"), str) and bool(live["runtime_model"])
+        and all(
+            isinstance(live.get(name), str) and len(live[name]) == 64
+            for name in ("agent_provider_sha256", "runtime_provider_sha256")
+        )
+    )
+
+
+def fresh_holdout_evidence(
+    holdouts: Iterable[Mapping[str, Any]], policy: Mapping[str, Any]
+) -> dict[str, Any]:
+    batches = list(holdouts)
+    batch_ids = [item.get("holdout_batch") for item in batches]
+    seen_seeds: set[int] = set()
+    seen_tasks: set[str] = set()
+    details = []
+    all_fresh = (
+        len(batches) >= policy["min_holdout_batches"]
+        and all(isinstance(item, int) for item in batch_ids)
+        and len(set(batch_ids)) == len(batch_ids)
+    )
+    for batch in batches:
+        results = [
+            job.get("result", {}) for job in batch.get("jobs", [])
+            if isinstance(job, Mapping)
+        ]
+        seeds = [item.get("sample_seed") for item in results]
+        digests = []
+        for item in results:
+            path = Path(str(item.get("task_path", "")))
+            try:
+                digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
+            except OSError:
+                continue
+        batch_fresh = (
+            len(results) >= policy["min_tasks"]
+            and len(digests) >= policy["min_tasks"]
+            and all(isinstance(seed, int) for seed in seeds)
+            and len(set(seeds)) == len(seeds)
+            and seen_seeds.isdisjoint(seeds)
+            and len(set(digests)) == len(digests)
+            and seen_tasks.isdisjoint(digests)
+            and batch.get("summary", {}).get("fresh_tasks_verified") is True
+        )
+        details.append({
+            "batch": batch.get("holdout_batch"),
+            "requests": len(results),
+            "materialized": len(digests),
+            "fresh": batch_fresh,
+        })
+        all_fresh = all_fresh and batch_fresh
+        seen_seeds.update(seed for seed in seeds if isinstance(seed, int))
+        seen_tasks.update(digests)
+    return {
+        "verified": all_fresh,
+        "unique_seeds": len(seen_seeds),
+        "unique_tasks": len(seen_tasks),
+        "batches": details,
+    }
 
 
 def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, Any]:
@@ -219,6 +318,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
     jobs = [job for holdout in holdouts for job in holdout.get("jobs", [])]
     results = [job.get("result", {}) for job in jobs if isinstance(job, Mapping)]
     total = len(results)
+    holdout_freshness = fresh_holdout_evidence(holdouts, policy)
     generated = [item for item in results if Path(str(item.get("task_path", ""))).is_file()]
     task_good = [
         item for item in results
@@ -290,14 +390,27 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         if isinstance(step, Mapping) and step.get("path") == "/v1/user_simulator"
     ]
     valid_user_turns = sum(valid_user_turn(step) for step in user_turns)
+    user_outcomes = Counter(
+        str(step.get("result", {}).get("outcome_category"))
+        for step in user_turns if valid_user_turn(step)
+    )
+    interactive_outcomes = {
+        "information_required", "user_correction", "user_rejection",
+        "agent_off_topic", "agent_premature_completion", "unrecognized",
+    }
     rollout_coverage = all(
         len(item.get("live_rollout", {}).get("episodes", []))
         >= policy["min_episodes_per_qualified_sandbox"]
         for item in qualified
     ) and bool(qualified)
+    rollout_provenance = bool(qualified) and all(
+        valid_rollout_provenance(item) for item in qualified
+    )
 
     readiness_reports = [_artifact(item, "training_readiness.json") for item in qualified]
-    agentic_reports = [_artifact(item, "agentic_training_value.json") for item in qualified]
+    agentic_reports = [
+        _artifact(item, "agentic_training_value_live.json") for item in qualified
+    ]
     runtime_integrity = bool(readiness_reports) and all(
         report.get("training_ready") is True
         and report.get("evidence", {}).get("determinism") is True
@@ -309,7 +422,9 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         for report in readiness_reports
     )
     tool_and_reward_integrity = bool(agentic_reports) and all(
-        report.get("curriculum_training_ready") is True for report in agentic_reports
+        report.get("curriculum_training_ready") is True
+        and report.get("validation_mode") == "live_evaluator"
+        for report in agentic_reports
     )
     counterfactuals = _counterfactual_counts(agentic_reports)
     false_positive_rate = (
@@ -356,6 +471,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         task_rate = len(batch_task_good) / batch_total if batch_total else 0.0
         build_rate = len(batch_built) / len(batch_task_good) if batch_task_good else 0.0
         e2e_rate = len(batch_qualified) / batch_total if batch_total else 0.0
+        batch_mix = category_mix(batch_results, policy)
         batch_passed = (
             batch_generated >= policy["min_tasks"]
             and batch.get("summary", {}).get("fresh_tasks_verified") is True
@@ -370,6 +486,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
                 >= policy["min_end_to_end_ci95_lower"]
             and bool(batch_categories)
             and all(rate >= policy["min_category_rate"] for rate in batch_categories.values())
+            and batch_mix["passed"]
         )
         batch_measurements.append({
             "batch": batch.get("holdout_batch"),
@@ -382,6 +499,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
             "end_to_end_rate": e2e_rate,
             "end_to_end_ci95_lower": wilson_lower(len(batch_qualified), batch_total),
             "by_category": batch_categories,
+            "category_mix": batch_mix,
             "passed": batch_passed,
         })
     material_items = []
@@ -401,6 +519,9 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
             "sandbox_root": str(Path(str(item.get("output", ""))).resolve()),
             "sandbox_evidence_fingerprint": fingerprint,
             "sandbox_artifacts_sha256": artifact_digests(
+                Path(str(item.get("output", "")))
+            ),
+            "sandbox_evidence_sha256": evidence_artifact_digests(
                 Path(str(item.get("output", "")))
             ),
             "category": str(item.get("category", "unknown")),
@@ -432,6 +553,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "training_ready": len(qualified),
         **rates,
         "by_category": category_counts,
+        "category_mix": category_mix(results, policy),
         "exact_duplicate_rate": exact_duplicate_rate,
         "near_duplicate_rate": near_duplicate_rate(task_documents),
         "live_sandboxes": len(live_reports),
@@ -444,21 +566,21 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "environment_error_rate": environment_errors / len(episodes) if episodes else 1.0,
         "llm_fallbacks": fallbacks,
         "rollout_coverage": rollout_coverage,
+        "rollout_provenance": rollout_provenance,
         "trajectory_schema_complete": bool(episodes) and complete_episodes == len(episodes),
         "user_simulator_calls": len(user_turns),
         "user_simulator_valid_calls": valid_user_turns,
         "user_simulator_protocol_rate": (
             valid_user_turns / len(user_turns) if user_turns else 0.0
         ),
+        "user_simulator_outcomes": dict(user_outcomes),
         "runtime_integrity": runtime_integrity,
         "tool_and_reward_integrity": tool_and_reward_integrity,
         "reward_counterfactuals": counterfactuals,
         "reward_false_positive_rate": false_positive_rate,
         "reward_false_negative_rate": false_negative_rate,
-        "fresh_holdout_verified": bool(holdouts) and all(
-            item.get("summary", {}).get("fresh_tasks_verified") is True
-            for item in holdouts
-        ),
+        "fresh_holdout_verified": holdout_freshness["verified"],
+        "fresh_holdout_evidence": holdout_freshness,
         "holdout_batches": batch_measurements,
         "material_manifest_items": len(material_items),
     }
@@ -488,14 +610,21 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "category_floor": bool(category_counts) and all(
             item["rate"] >= policy["min_category_rate"] for item in category_counts.values()
         ),
+        "category_mix": measurements["category_mix"]["passed"],
         "exact_deduplication": exact_duplicate_rate == 0,
         "near_deduplication": measurements["near_duplicate_rate"] <= policy["max_near_duplicate_rate"],
         "rollout_coverage": rollout_coverage and len(episodes) >= policy["min_total_episodes"],
+        "rollout_provenance": rollout_provenance,
         "trajectory_schema": measurements["trajectory_schema_complete"],
         "user_simulator_protocol": (
             bool(user_turns)
             and measurements["user_simulator_protocol_rate"]
             >= policy["min_user_simulator_protocol_rate"]
+        ),
+        "user_simulator_outcome_coverage": (
+            len(user_outcomes) >= policy["min_user_outcome_categories"]
+            and bool(set(user_outcomes) & {"goal_satisfied", "user_acceptance"})
+            and bool(set(user_outcomes) & interactive_outcomes)
         ),
         "trajectory_diversity": successes > 0 and successes < len(episodes),
         "environment_integrity": (
@@ -510,6 +639,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
             and isinstance(material_manifest.get("evaluator_source_digest"), str)
             and bool(material_manifest["evaluator_source_digest"])
             and all(item.get("sandbox_artifacts_sha256") for item in material_items)
+            and all(item.get("sandbox_evidence_sha256") for item in material_items)
         ),
         "reward_false_positive_rate": false_positive_rate <= policy["max_reward_false_positive_rate"],
         "reward_false_negative_rate": false_negative_rate <= policy["max_reward_false_negative_rate"],
@@ -549,6 +679,13 @@ def default_policy() -> dict[str, Any]:
         "max_reward_false_positive_rate": 0.005,
         "max_reward_false_negative_rate": 0.02,
         "min_user_simulator_protocol_rate": 0.995,
+        "min_user_outcome_categories": 3,
+        "min_category_shares": {
+            "direct_response": 0.10,
+            "simple_agentic": 0.20,
+            "multi_step_agentic": 0.35,
+        },
+        "max_category_shares": {"direct_response": 0.30},
     }
 
 

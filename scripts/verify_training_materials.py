@@ -9,34 +9,11 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-
-PORTABLE_ROOT_SUFFIXES = {".py", ".sh", ".json", ".md", ".txt"}
-PORTABLE_DIRECTORIES = ("tests", "data", ".outer_conformance")
-
-
-def digest_json(value: Any) -> str:
-    return hashlib.sha256(json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")).hexdigest()
-
-
-def portable_artifact_digests(root: Path) -> dict[str, str]:
-    paths = [
-        path for path in root.iterdir()
-        if path.is_file()
-        and path.name != "live_rollout.json"
-        and (path.name == "Dockerfile" or path.suffix in PORTABLE_ROOT_SUFFIXES)
-    ]
-    for directory in PORTABLE_DIRECTORIES:
-        paths.extend(
-            path for path in (root / directory).rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts
-            and path.suffix not in {".pyc", ".sqlite", ".sqlite3", ".db", ".log"}
-        )
-    return {
-        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted(set(paths))
-    }
+from env_factory.material_artifacts import (
+    digest_json,
+    evidence_artifact_digests,
+    portable_artifact_digests,
+)
 
 
 def verify_artifact_digests(root: Path, expected: Mapping[str, Any]) -> list[str]:
@@ -76,12 +53,17 @@ def verify(
         failures.append({"gate": "manifest_schema", "message": "items must be non-empty"})
         items = []
     seen = set()
+    seen_roots = set()
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
             failures.append({"gate": "manifest_schema", "item": index})
             continue
         task = Path(str(item.get("task_path", "")))
         root = Path(str(item.get("sandbox_root", "")))
+        resolved_root = str(root.resolve())
+        if resolved_root in seen_roots:
+            failures.append({"gate": "duplicate_sandbox_root", "item": index})
+        seen_roots.add(resolved_root)
         try:
             task_digest = hashlib.sha256(task.read_bytes()).hexdigest()
         except OSError as exc:
@@ -121,6 +103,16 @@ def verify(
                 continue
             if actual_fingerprint != expected_fingerprint:
                 failures.append({"gate": "sandbox_digest", "item": index})
+        evidence_hashes = item.get("sandbox_evidence_sha256")
+        if manifest.get("version") == "2.0" and not (
+            isinstance(evidence_hashes, Mapping) and evidence_hashes
+        ):
+            failures.append({"gate": "manifest_schema", "item": index,
+                             "message": "v2 item needs sandbox_evidence_sha256"})
+        elif isinstance(evidence_hashes, Mapping):
+            actual_evidence = evidence_artifact_digests(root)
+            if dict(evidence_hashes) != actual_evidence:
+                failures.append({"gate": "sandbox_evidence_digest", "item": index})
         if expected_fingerprint in seen:
             failures.append({"gate": "duplicate_sandbox_identity", "item": index})
         seen.add(expected_fingerprint)

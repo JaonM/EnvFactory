@@ -14,15 +14,22 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 条件沙箱构建良品率不低于 90%，Wilson 95% 置信区间下界不低于 85%。
 - 端到端训练就绪率不低于 85%，Wilson 95% 置信区间下界不低于 80%。
 - 每个出现的训练类别端到端合格率不低于 75%。
+- 三个留出批次分别保持训练构成骨架：`direct_response` 不少于 10% 且不高于 30%，
+  `simple_agentic` 不少于 20%，`multi_step_agentic` 不少于 35%；未知或失败路由仍进入分母。
 - 精确重复率为 0，近似重复率不高于 5%。
 - 每个合格沙箱至少 10 个真实 rollout，三个批次累计至少 7500 个 episode；轨迹池同时包含成功和失败。
 - 每个 episode 必须使用 transition schema v2，逐步保存模型输入、原始输出、解析动作、公开观察、
   工具或 User Simulator 结果、下一观察、奖励以及 terminated/truncated 标记；仅有 HTTP trace 不合格。
 - episode 环境错误率不高于 0.1%，LLM fallback 为 0。
 - User Simulator 调用协议有效率不低于 99.5%，并且至少产生一条真实用户响应证据。
+- 真实 User Simulator 轨迹至少覆盖 3 类结果，同时包含成功/接受类结果和需要继续交互或恢复的结果，
+  防止只验证“用户永远接受”的退化模拟器。
 - 每个合格沙箱的固定 seed reset、episode 隔离、replay 稳定性、隐藏字段扫描和确定性验证全部通过。
 - 工具契约、真实业务结果、mutation resistance 和奖励反事实全部通过。
 - 奖励假阳性率不高于 0.5%，假阴性率不高于 2%。
+- 奖励反事实必须使用生产配置的真实 evaluator 重跑；mock 报告只用于离线构建测试，不能进入生产认证。
+- 每份 rollout 保存任务 SHA-256、沙箱可执行输入摘要、Agent/User/Judge 模型及 provider 摘要；认证时重新
+  计算并拒绝把其他任务或沙箱的轨迹挂接到当前样本。
 
 认证采用比率和置信区间双门禁，避免小样本的高点估计被误认为稳定良品率。任务生成失败仍计入
 总请求分母；沙箱构建率以通过任务门禁的任务为条件分母；端到端率使用所有请求作为分母。
