@@ -95,7 +95,8 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 
 生产认证还会原子生成 `training_materials_bundle/`。该目录不保留本机绝对路径，按内容身份保存每个
 环境的任务、运行时代码、业务数据、验收证据和 `live_rollout.json`，并生成 `transitions.jsonl` 与
-`bundle_manifest.json`。JSONL 每行是一条可重建的 schema v2 transition，并携带任务、类别、episode、
+`bundle_manifest.json`。Bundle v3 同时包含去除本机路径的 `certification.json` 和机器可读
+`dataset_card.json`。JSONL 每行是一条可重建的 schema v2 transition，并携带任务、类别、episode、
 Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bundle_sha256` 再次校验；导出失败或包校验
 失败时，即使此前统计门禁通过，也不会产生 `production_prepared_for_agentic_rl`。
 
@@ -104,6 +105,12 @@ Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bun
 输出的一致性、observation 链、reward、usage 以及 terminated/truncated 终止语义，防止只重算文件哈希
 就让语义损坏的轨迹通过。JSONL 由固定字段白名单投影产生；完整 trainer-only 证据仍保存在对应环境目录，
 并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。
+
+数据集卡记录任务类别、模型组合、同模型评估数量、episode 成败和 transition 数量，并明确只适合重建
+沙箱、验证数据适配器、收集新鲜 on-policy rollout 和准备 policy-visible 输入。它显式禁止把本认证解释为
+RL 收敛、训练后提升、跨模型泛化或任意离线 RL 算法兼容性证明。EnvFactory 不替组织声明数据分发权利；
+便携包默认为 `internal_only_until_legal_and_security_review`。验证器从实际文件重新计算数据集卡统计，单纯
+重写卡片并更新哈希不能改变这些边界。
 
 导入前执行：
 

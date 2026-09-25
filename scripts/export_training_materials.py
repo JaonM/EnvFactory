@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import importlib.util
 import json
@@ -20,6 +21,8 @@ from env_factory.trajectory_schema import episode_errors, policy_transition
 
 BUNDLE_MANIFEST = "bundle_manifest.json"
 TRANSITIONS_FILE = "transitions.jsonl"
+CERTIFICATION_FILE = "certification.json"
+DATASET_CARD_FILE = "dataset_card.json"
 
 
 def file_sha256(path: Path) -> str:
@@ -40,6 +43,91 @@ def _copy_verified(source: Path, destination: Path, expected: str) -> None:
     shutil.copyfile(source, destination)
     if file_sha256(destination) != expected:
         raise ValueError(f"copied digest mismatch: {destination}")
+
+
+def _portable_certification(certification: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep release claims and measurements without machine-local artifact paths."""
+    source = certification.get("materials_manifest", {})
+    return {
+        "version": "1.0",
+        "certification": certification.get("certification"),
+        "scope": certification.get("scope"),
+        "certified": certification.get("certified"),
+        "does_not_certify": certification.get("does_not_certify", []),
+        "policy": certification.get("policy", {}),
+        "measurements": certification.get("measurements", {}),
+        "gates": certification.get("gates", {}),
+        "failed_gates": certification.get("failed_gates", []),
+        "source_dataset_sha256": source.get("dataset_sha256"),
+        "evaluator_source_digest": source.get("evaluator_source_digest"),
+    }
+
+
+def _dataset_card(
+    certification: Mapping[str, Any],
+    *,
+    source_dataset_sha256: Any,
+    items: list[Mapping[str, Any]],
+    transition_count: int,
+    model_pairs: Counter[tuple[str, str]],
+    successful_episodes: int,
+    episode_count: int,
+) -> dict[str, Any]:
+    categories = Counter(str(item.get("category")) for item in items)
+    same_model_items = sum(
+        count for (agent, runtime), count in model_pairs.items() if agent == runtime
+    )
+    limitations = list(certification.get("does_not_certify", []))
+    limitations.extend([
+        "offline_rl_algorithm_compatibility",
+        "data_license_or_distribution_rights",
+        "absence_of_same_model_evaluation_bias",
+    ])
+    return {
+        "version": "1.0",
+        "kind": "agentic_rl_pretraining_material_dataset_card",
+        "source_dataset_sha256": source_dataset_sha256,
+        "certification": {
+            "name": certification.get("certification"),
+            "scope": certification.get("scope"),
+            "certified": certification.get("certified") is True,
+        },
+        "intended_uses": [
+            "reconstruct_agentic_sandbox_environments",
+            "validate_rl_data_adapters",
+            "collect_fresh_on_policy_rollouts",
+            "prepare_policy_visible_transition_inputs",
+        ],
+        "prohibited_interpretations": sorted(set(limitations)),
+        "distribution_status": "internal_only_until_legal_and_security_review",
+        "license_status": "not_asserted_by_envfactory",
+        "composition": {
+            "items": len(items),
+            "transitions": transition_count,
+            "episodes": episode_count,
+            "successful_episodes": successful_episodes,
+            "failed_episodes": episode_count - successful_episodes,
+            "categories": dict(sorted(categories.items())),
+            "model_pairs": [
+                {"agent_model": pair[0], "runtime_model": pair[1], "items": count}
+                for pair, count in sorted(model_pairs.items())
+            ],
+            "same_model_pair_items": same_model_items,
+        },
+        "data_boundary": {
+            "origin": "model_generated_synthetic",
+            "contains_real_user_data": False,
+            "policy_transitions": TRANSITIONS_FILE,
+            "trainer_only_evidence": "environments/*/live_rollout.json",
+            "visibility_contract": "bundle_manifest.json#transition_visibility",
+        },
+        "consumer_requirements": [
+            "verify_bundle_before_use",
+            "do_not_feed_trainer_only_evidence_to_the_policy",
+            "use_fresh_rollouts_for_algorithms_requiring_on_policy_data",
+            "perform_organization_specific_legal_security_and_model_risk_review",
+        ],
+    }
 
 
 def _transition_records(
@@ -117,6 +205,9 @@ def _export_bundle_uncommitted(
     exported_items = []
     seen_item_ids = set()
     transition_count = 0
+    episode_count = 0
+    successful_episodes = 0
+    model_pairs: Counter[tuple[str, str]] = Counter()
     with transition_path.open("w", encoding="utf-8", newline="\n") as stream:
         for item in source_manifest.get("items", []):
             if not isinstance(item, Mapping):
@@ -155,6 +246,16 @@ def _export_bundle_uncommitted(
                     record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 ) + "\n")
             transition_count += len(records)
+            episodes = rollout.get("episodes", [])
+            episode_count += len(episodes)
+            successful_episodes += sum(
+                episode.get("agent_success") is True
+                for episode in episodes if isinstance(episode, Mapping)
+            )
+            model_pairs[(
+                str(rollout.get("agent_model", "")),
+                str(rollout.get("runtime_model", "")),
+            )] += 1
             exported_items.append({
                 "item_id": item_id,
                 "category": item["category"],
@@ -166,18 +267,41 @@ def _export_bundle_uncommitted(
                 "files_sha256": copied,
             })
 
+    portable_certification = _portable_certification(certification)
+    (output / CERTIFICATION_FILE).write_text(
+        json.dumps(portable_certification, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n",
+    )
+    card = _dataset_card(
+        certification,
+        source_dataset_sha256=source_manifest.get("dataset_sha256"),
+        items=exported_items,
+        transition_count=transition_count,
+        model_pairs=model_pairs,
+        successful_episodes=successful_episodes,
+        episode_count=episode_count,
+    )
+    (output / DATASET_CARD_FILE).write_text(
+        json.dumps(card, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n",
+    )
+
     files = {
         str(path.relative_to(output)): file_sha256(path)
         for path in sorted(output.rglob("*"))
         if path.is_file() and path.name != BUNDLE_MANIFEST
     }
     manifest = {
-        "version": "2.0",
+        "version": "3.0",
         "kind": "portable_agentic_rl_training_materials",
         "source_dataset_sha256": source_manifest.get("dataset_sha256"),
         "items": exported_items,
         "item_count": len(exported_items),
         "transition_count": transition_count,
+        "episode_count": episode_count,
+        "successful_episodes": successful_episodes,
+        "certification_file": CERTIFICATION_FILE,
+        "dataset_card_file": DATASET_CARD_FILE,
         "transition_visibility": {
             "version": "1.0",
             "policy_projection": "env_factory.trajectory_schema.policy_transition",
@@ -203,7 +327,7 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     if manifest.get("bundle_sha256") != digest_json(unsigned):
         failures.append("bundle_digest")
     if (
-        manifest.get("version") != "2.0"
+        manifest.get("version") != "3.0"
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
         or not isinstance(manifest.get("source_dataset_sha256"), str)
         or len(manifest["source_dataset_sha256"]) != 64
@@ -226,6 +350,50 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     }
     if not isinstance(expected, Mapping) or expected_files != actual:
         failures.append("bundle_files")
+    try:
+        certification_relative = _safe_relative(
+            str(manifest.get("certification_file", ""))
+        )
+        if certification_relative != Path(CERTIFICATION_FILE):
+            raise ValueError("unexpected certification path")
+        portable_certification = json.loads(
+            (root / certification_relative).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
+        portable_certification = {}
+        failures.append("portable_certification")
+    required_limitations = {
+        "rl_training_convergence",
+        "post_training_policy_improvement",
+        "cross_model_generalization",
+    }
+    if not (
+        isinstance(portable_certification, Mapping)
+        and portable_certification.get("version") == "1.0"
+        and portable_certification.get("certification")
+            == "production_prepared_for_agentic_rl"
+        and portable_certification.get("scope") == "pre_training_material_readiness"
+        and portable_certification.get("certified") is True
+        and portable_certification.get("failed_gates") == []
+        and portable_certification.get("source_dataset_sha256")
+            == manifest.get("source_dataset_sha256")
+        and required_limitations
+            <= set(portable_certification.get("does_not_certify", []))
+        and isinstance(portable_certification.get("gates"), Mapping)
+        and portable_certification["gates"]
+        and all(value is True for value in portable_certification["gates"].values())
+    ):
+        failures.append("portable_certification")
+    try:
+        card_relative = _safe_relative(str(manifest.get("dataset_card_file", "")))
+        if card_relative != Path(DATASET_CARD_FILE):
+            raise ValueError("unexpected dataset card path")
+        dataset_card = json.loads(
+            (root / card_relative).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
+        dataset_card = {}
+        failures.append("dataset_card")
     transition_path = root / TRANSITIONS_FILE
     records = []
     try:
@@ -238,6 +406,10 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         items = []
     expected_records = []
     seen_item_ids = set()
+    verified_episode_count = 0
+    verified_successes = 0
+    verified_categories: Counter[str] = Counter()
+    verified_model_pairs: Counter[tuple[str, str]] = Counter()
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
             failures.append("bundle_items")
@@ -285,6 +457,17 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         if item.get("transition_count") != len(projected):
             failures.append("item_transition_count")
         expected_records.extend(projected)
+        episodes = rollout.get("episodes", [])
+        verified_episode_count += len(episodes)
+        verified_successes += sum(
+            episode.get("agent_success") is True
+            for episode in episodes if isinstance(episode, Mapping)
+        )
+        verified_categories[str(item.get("category"))] += 1
+        verified_model_pairs[(
+            str(rollout.get("agent_model", "")),
+            str(rollout.get("runtime_model", "")),
+        )] += 1
     if records != expected_records:
         failures.append("transition_projection")
     if (
@@ -294,6 +477,58 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         failures.append("bundle_counts")
     if manifest.get("item_count", 0) <= 0 or manifest.get("transition_count", 0) <= 0:
         failures.append("empty_bundle")
+    card_composition = dataset_card.get("composition", {}) if isinstance(
+        dataset_card, Mapping
+    ) else {}
+    expected_model_pairs = [
+        {"agent_model": pair[0], "runtime_model": pair[1], "items": count}
+        for pair, count in sorted(verified_model_pairs.items())
+    ]
+    verified_same_model_items = sum(
+        count for (agent, runtime), count in verified_model_pairs.items()
+        if agent == runtime
+    )
+    card_limits = set(dataset_card.get("prohibited_interpretations", [])) if isinstance(
+        dataset_card, Mapping
+    ) else set()
+    if not (
+        isinstance(dataset_card, Mapping)
+        and dataset_card.get("version") == "1.0"
+        and dataset_card.get("kind") == "agentic_rl_pretraining_material_dataset_card"
+        and dataset_card.get("source_dataset_sha256")
+            == manifest.get("source_dataset_sha256")
+        and dataset_card.get("certification", {}).get("certified") is True
+        and dataset_card.get("distribution_status")
+            == "internal_only_until_legal_and_security_review"
+        and dataset_card.get("license_status") == "not_asserted_by_envfactory"
+        and card_composition.get("items") == len(items)
+        and card_composition.get("transitions") == len(records)
+        and card_composition.get("episodes") == verified_episode_count
+        and card_composition.get("successful_episodes") == verified_successes
+        and card_composition.get("failed_episodes")
+            == verified_episode_count - verified_successes
+        and card_composition.get("categories")
+            == dict(sorted(verified_categories.items()))
+        and card_composition.get("model_pairs") == expected_model_pairs
+        and card_composition.get("same_model_pair_items")
+            == verified_same_model_items
+        and required_limitations <= card_limits
+        and "offline_rl_algorithm_compatibility" in card_limits
+        and dataset_card.get("data_boundary", {}).get("policy_transitions")
+            == TRANSITIONS_FILE
+        and dataset_card.get("data_boundary", {}).get("origin")
+            == "model_generated_synthetic"
+        and dataset_card.get("data_boundary", {}).get("contains_real_user_data")
+            is False
+        and "do_not_feed_trainer_only_evidence_to_the_policy"
+            in dataset_card.get("consumer_requirements", [])
+    ):
+        failures.append("dataset_card")
+    if (
+        manifest.get("episode_count") != verified_episode_count
+        or manifest.get("successful_episodes") != verified_successes
+    ):
+        failures.append("bundle_episode_counts")
     return {
         "verified": not failures,
         "bundle_sha256": manifest.get("bundle_sha256"),

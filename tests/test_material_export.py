@@ -92,7 +92,18 @@ class MaterialExportTest(unittest.TestCase):
         }
         manifest["dataset_sha256"] = digest_json(manifest)
         certification = {
+            "certification": "production_prepared_for_agentic_rl",
+            "scope": "pre_training_material_readiness",
             "certified": True,
+            "does_not_certify": [
+                "rl_training_convergence",
+                "post_training_policy_improvement",
+                "cross_model_generalization",
+            ],
+            "policy": {"score_threshold": 8.0},
+            "measurements": {"training_ready": 1},
+            "gates": {"fixture": True},
+            "failed_gates": [],
             "material_verification": {"verified": True},
             "materials_manifest": manifest,
         }
@@ -112,6 +123,16 @@ class MaterialExportTest(unittest.TestCase):
             self.assertEqual(record["episode_final_reward"], 1.0)
             self.assertEqual(record["agent_usage"], {})
             self.assertNotIn("trainer_metadata", record["transition"])
+            card = json.loads((bundle / "dataset_card.json").read_text())
+            self.assertEqual(card["composition"]["items"], 1)
+            self.assertEqual(card["composition"]["transitions"], 1)
+            self.assertEqual(
+                card["distribution_status"],
+                "internal_only_until_legal_and_security_review",
+            )
+            portable = json.loads((bundle / "certification.json").read_text())
+            self.assertNotIn("materials_manifest", portable)
+            self.assertTrue(portable["certified"])
             copied_app = next((bundle / "environments").glob("*/app.py"))
             copied_app.write_text("# tampered\n")
             changed = exporter.verify_bundle(bundle)
@@ -138,6 +159,27 @@ class MaterialExportTest(unittest.TestCase):
             report = exporter.verify_bundle(bundle)
             self.assertFalse(report["verified"])
             self.assertIn("transition_projection", report["failed_gates"])
+
+    def test_bundle_verifier_rejects_rehashed_misleading_dataset_card(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            card_path = bundle / "dataset_card.json"
+            card = json.loads(card_path.read_text())
+            card["composition"]["transitions"] = 999
+            card["license_status"] = "public_domain"
+            card_path.write_text(json.dumps(card))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files_sha256"]["dataset_card.json"] = exporter.file_sha256(card_path)
+            unsigned = {key: value for key, value in manifest.items() if key != "bundle_sha256"}
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertIn("dataset_card", report["failed_gates"])
 
     def test_uncertified_report_cannot_be_exported(self):
         with tempfile.TemporaryDirectory() as directory:
