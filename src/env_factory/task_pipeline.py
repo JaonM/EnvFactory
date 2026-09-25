@@ -544,7 +544,7 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
         # 2d. Check cross-table consistency and return actual business records.
             consistency = self._call(
             "environment_data_consistency",
-            "检查并修正完整初始业务表数据，校验主键唯一、外键存在、字段类型、必填字段、业务关系和任务覆盖度。stateful 任务的 rows 是每个 episode reset 后的执行前基线，不是任务完成后的最终状态；任务明确要求从旧值改为新值时，基线必须包含旧值且不得提前包含目标终态。任务要求唯一推荐、排序、合规判断或首选结论时，数据必须提供唯一且可追溯的决定性证据；不得同时保留多个等价候选却在预期答案中武断指定其中一个。所有结论所引用的数值、属性和理由必须与 rows 精确一致。返回修正后的 data_tables 与 records。",
+            "检查并修正完整初始业务表数据，校验主键唯一、外键存在、字段类型、必填字段、业务关系和任务覆盖度。必须跨表复核冗余汇总字段：数量、总额、当前状态、有效对象数等若可由明细表计算，必须与明细状态以及日期/季度等时间边界一致；不能一张表声明对象已关闭或失效，另一张较晚快照仍把它计入当前总数。stateful 任务的 rows 是每个 episode reset 后的执行前基线，不是任务完成后的最终状态；任务明确要求从旧值改为新值时，基线必须包含旧值且不得提前包含目标终态。任务要求唯一推荐、排序、合规判断或首选结论时，数据必须提供唯一且可追溯的决定性证据；不得同时保留多个等价候选却在预期答案中武断指定其中一个。所有结论所引用的数值、属性和理由必须与 rows 精确一致。返回修正后的 data_tables 与 records。",
             {"task_description": description, "entities": entity_plan["entities"], "tables": data_tables,
              "output": {"data_tables": data_tables, "records": []}},
         )
@@ -558,7 +558,7 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
             for grounding_attempt in range(1, self.retries + 1):
                 audit = self._call(
                     "environment_data_grounding_audit",
-                    "独立审查业务数据是否足以完成任务。task_supported 表示 rows 覆盖任务所需事实；decision_determinate 表示任务要求唯一推荐、排序、合规判断或首选结论时，数据存在唯一且可追溯的决定性证据，没有多个等价候选；facts_consistent 表示输入事实彼此不矛盾，且预期结论可由 rows 直接读取或通过题面明确规则确定性计算得到。不得因为 rows 未预先存储汇总值、对比表、计算结果或最终答案而判 false；这些应由 Agent 调用工具后推导。只有原始事实矛盾、缺少计算所需输入或预期结论无法由数据推导时才判 false。若任务不要求唯一决策，decision_determinate 应为 true。issues 必须具体说明问题。",
+                    "独立审查业务数据是否足以完成任务。task_supported 表示 rows 覆盖任务所需事实；decision_determinate 表示任务要求唯一推荐、排序、合规判断或首选结论时，数据存在唯一且可追溯的决定性证据，没有多个等价候选；facts_consistent 表示输入事实彼此不矛盾，且预期结论可由 rows 直接读取或通过题面明确规则确定性计算得到。逐表重算可验证的 count、total、current、active 等冗余汇总，并结合日期、季度、关闭/失效状态检查跨表时间一致性；明细与汇总不一致必须判 false。不得因为 rows 未预先存储汇总值、对比表、计算结果或最终答案而判 false；这些应由 Agent 调用工具后推导。只有原始事实矛盾、缺少计算所需输入或预期结论无法由数据推导时才判 false。若任务不要求唯一决策，decision_determinate 应为 true。issues 必须具体说明问题。",
                     {
                         "task_description": description,
                         "data_tables": data_tables,
@@ -602,7 +602,7 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
                         break
                     repaired = self._call(
                         "environment_data_consistency.repair",
-                        "根据独立 grounding 审计问题和确定性校验错误修正表结构与 rows。必须保持主键、外键和字段类型合法，数据内容必须直接覆盖 task_description 中的任务主题和 required_grounding_keywords。stateful 任务必须保留执行前基线：从旧值改为新值时 rows 必须含旧值、不得提前含目标终态。并让推荐、排序、合规判断或首选结论具有唯一、可追溯且数值一致的证据。返回完整 data_tables 与 records。",
+                        "根据独立 grounding 审计问题和确定性校验错误修正表结构与 rows。必须保持主键、外键和字段类型合法，数据内容必须直接覆盖 task_description 中的任务主题和 required_grounding_keywords。跨表冗余数量、总额、当前/有效状态必须与明细行及其时间边界一致；优先删除非必要冗余汇总，保留时必须能从明细确定性复算。stateful 任务必须保留执行前基线：从旧值改为新值时 rows 必须含旧值、不得提前含目标终态。并让推荐、排序、合规判断或首选结论具有唯一、可追溯且数值一致的证据。返回完整 data_tables 与 records。",
                         {
                             "task_description": description,
                             "data_tables": data_tables,

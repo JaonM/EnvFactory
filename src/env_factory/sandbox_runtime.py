@@ -1504,6 +1504,7 @@ class ContractUserSimulator:
             "script_id": script_id, "profile_id": profile_id,
             "state_id": script.get("initial_state"), "variables": copy.deepcopy(script.get("variables", {})),
             "recovery_count": 0, "termination_reason": None,
+            "conversation_prefix": [],
         })
 
     @staticmethod
@@ -1557,6 +1558,24 @@ class ContractUserSimulator:
         if not isinstance(state, dict):
             self.reset()
             state = self.episode_store.get_state(self.STATE_KEY)
+        normalized_messages = [
+            {"role": str(item["role"]), "content": str(item["content"])}
+            for item in messages
+        ]
+        expected_prefix = state.get("conversation_prefix", [])
+        if not isinstance(expected_prefix, list):
+            expected_prefix = []
+        if (
+            not normalized_messages
+            or normalized_messages[:len(expected_prefix)] != expected_prefix
+            or len(normalized_messages) <= len(expected_prefix)
+            or normalized_messages[-1]["role"] != "assistant"
+        ):
+            raise SandboxError(
+                "INCOMPLETE_CONVERSATION",
+                "messages must contain the complete ordered conversation and a new assistant turn",
+                409,
+            )
         script = self.scripts.get(str(state.get("script_id")), {})
         profile = self.profiles.get(str(state.get("profile_id")), {})
         if state.get("termination_reason"):
@@ -1659,6 +1678,10 @@ class ContractUserSimulator:
         result.pop("transition_id", None)
         state["turn_index"] = index + 1
         state["memory"] = [*state.get("memory", []), {"messages": list(messages), "result": result}]
+        state["conversation_prefix"] = [
+            *normalized_messages,
+            {"role": "user", "content": result["user_query"]},
+        ]
         self.episode_store.set_state(self.STATE_KEY, state)
         self.episode_store.event("user_turn", {"messages": list(messages), "used_fallback": used_fallback}, result)
         return result

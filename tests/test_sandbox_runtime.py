@@ -310,6 +310,33 @@ class SandboxRuntimeTest(unittest.TestCase):
             self.assertEqual(state["recovery_count"], 1)
             self.assertFalse(result["should_end"])
             self.assertEqual(result["match_status"], "ambiguous")
+
+    def test_contract_user_simulator_rejects_truncated_conversation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite3")
+            episode = store.reset(episode_id="conversation", seed=1)
+            simulator = ContractUserSimulator(
+                store, profiles=[{"profile_id": "p1"}], scripts=[{
+                    "script_id": "s1", "initial_state": "start", "variables": {},
+                    "recovery_policy": {"max_recoveries": 3},
+                    "states": [{"state_id": "start", "terminal": False}],
+                    "transitions": [],
+                }], renderer=lambda _: {
+                    "user_query": "请继续。", "match_status": "unmatched",
+                    "outcome_category": "unrecognized", "reason_code": "retry",
+                },
+            )
+            simulator.reset(episode)
+            first = [{"role": "assistant", "content": "第一次回复"}]
+            simulator.turn(first)
+            with self.assertRaisesRegex(SandboxError, "complete ordered conversation"):
+                simulator.turn([{"role": "assistant", "content": "第二次回复"}])
+            complete = [
+                *first,
+                {"role": "user", "content": "请继续。"},
+                {"role": "assistant", "content": "第二次回复"},
+            ]
+            self.assertEqual(simulator.turn(complete)["user_query"], "请继续。")
     def test_acceptance_scenario_runner_captures_and_reuses_values(self):
         calls = []
         def call(method, path, body, headers):
