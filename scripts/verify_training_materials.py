@@ -14,6 +14,7 @@ from env_factory.material_artifacts import (
     evidence_artifact_digests,
     portable_artifact_digests,
 )
+from env_factory.execution_provenance import valid_execution_provenance
 
 
 def verify_artifact_digests(root: Path, expected: Mapping[str, Any]) -> list[str]:
@@ -48,6 +49,13 @@ def verify(
     base = {key: value for key, value in manifest.items() if key != "dataset_sha256"}
     if manifest.get("dataset_sha256") != digest_json(base):
         failures.append({"gate": "dataset_digest", "message": "manifest digest changed"})
+    if manifest.get("version") == "2.0" and not valid_execution_provenance(
+        manifest.get("execution_provenance")
+    ):
+        failures.append({
+            "gate": "execution_provenance",
+            "message": "v2 manifest needs a valid execution environment snapshot",
+        })
     items = manifest.get("items")
     if not isinstance(items, list) or not items:
         failures.append({"gate": "manifest_schema", "message": "items must be non-empty"})

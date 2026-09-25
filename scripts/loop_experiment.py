@@ -17,6 +17,11 @@ import time
 import threading
 import uuid
 
+from env_factory.execution_provenance import (
+    collect_execution_provenance,
+    verify_execution_provenance,
+)
+
 MODEL = "gpt-5.6-luna"
 ACTIVE_PROCESSES = set()
 PROCESS_LOCK = threading.Lock()
@@ -804,6 +809,7 @@ def main():
     config = {key: value for key, value in vars(args).items() if key not in {"project", "output", "task_root", "task_ids"}}
     config.update(project=str(project), task_paths=list(map(str, paths)), model=MODEL,
                   source_digest=source_digest(project), input_digests=[input_digest(path) for path in paths],
+                  execution_provenance=collect_execution_provenance(project),
                   generation_model=os.getenv("LLM_MODEL"), runtime_model=os.getenv("SANDBOX_LLM_MODEL") or os.getenv("LLM_MODEL"),
                   provider_digest=hashlib.sha256(json.dumps([os.getenv("LLM_BASE_URL"), os.getenv("SANDBOX_LLM_BASE_URL")]).encode()).hexdigest())
     signal.signal(signal.SIGINT, interrupt)
@@ -842,8 +848,17 @@ def main():
         reports = []
         streak = 0
         for number in round_numbers(args.max_rounds):
-            if source_digest(project) != config["source_digest"] or [input_digest(path) for path in paths] != config["input_digests"]:
-                parser.error("code/inputs changed during experiment; start a new --output")
+            if (
+                source_digest(project) != config["source_digest"]
+                or [input_digest(path) for path in paths] != config["input_digests"]
+                or not verify_execution_provenance(
+                    project, config["execution_provenance"]
+                )["verified"]
+            ):
+                parser.error(
+                    "code/inputs/execution environment changed during experiment; "
+                    "start a new --output"
+                )
             path = root / f"round-{number:02d}/round_report.json"
             report = json.loads(path.read_text()) if path.exists() else {"round": number, "state": "running"}
             if report["state"] != "complete":
@@ -916,7 +931,7 @@ def main():
                     )
                     policy = default_policy()
                     policy["score_threshold"] = args.threshold
-                    certification = certify(history, policy)
+                    certification = certify(history, policy, project=project)
                     from verify_training_materials import verify
                     certification = attach_artifact_verification(
                         certification,

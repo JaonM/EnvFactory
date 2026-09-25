@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from env_factory.material_artifacts import digest_json
 from env_factory.material_privacy import audit_rollout_privacy
 from env_factory.trajectory_schema import episode_errors, policy_transition
+from env_factory.execution_provenance import valid_execution_provenance
 
 
 BUNDLE_MANIFEST = "bundle_manifest.json"
@@ -60,6 +61,7 @@ def _portable_certification(certification: Mapping[str, Any]) -> dict[str, Any]:
         "failed_gates": certification.get("failed_gates", []),
         "source_dataset_sha256": source.get("dataset_sha256"),
         "evaluator_source_digest": source.get("evaluator_source_digest"),
+        "execution_provenance": source.get("execution_provenance"),
     }
 
 
@@ -101,6 +103,9 @@ def _dataset_card(
         "prohibited_interpretations": sorted(set(limitations)),
         "distribution_status": "internal_only_until_legal_and_security_review",
         "license_status": "not_asserted_by_envfactory",
+        "build_environment": certification.get("materials_manifest", {}).get(
+            "execution_provenance"
+        ),
         "composition": {
             "items": len(items),
             "transitions": transition_count,
@@ -295,6 +300,9 @@ def _export_bundle_uncommitted(
         "version": "3.0",
         "kind": "portable_agentic_rl_training_materials",
         "source_dataset_sha256": source_manifest.get("dataset_sha256"),
+        "execution_provenance_sha256": digest_json(
+            source_manifest.get("execution_provenance")
+        ),
         "items": exported_items,
         "item_count": len(exported_items),
         "transition_count": transition_count,
@@ -377,6 +385,11 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         and portable_certification.get("failed_gates") == []
         and portable_certification.get("source_dataset_sha256")
             == manifest.get("source_dataset_sha256")
+        and digest_json(portable_certification.get("execution_provenance"))
+            == manifest.get("execution_provenance_sha256")
+        and valid_execution_provenance(
+            portable_certification.get("execution_provenance")
+        )
         and required_limitations
             <= set(portable_certification.get("does_not_certify", []))
         and isinstance(portable_certification.get("gates"), Mapping)
@@ -497,6 +510,10 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         and dataset_card.get("kind") == "agentic_rl_pretraining_material_dataset_card"
         and dataset_card.get("source_dataset_sha256")
             == manifest.get("source_dataset_sha256")
+        and dataset_card.get("build_environment")
+            == portable_certification.get("execution_provenance")
+        and digest_json(dataset_card.get("build_environment"))
+            == manifest.get("execution_provenance_sha256")
         and dataset_card.get("certification", {}).get("certified") is True
         and dataset_card.get("distribution_status")
             == "internal_only_until_legal_and_security_review"

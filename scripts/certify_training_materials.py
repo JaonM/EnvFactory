@@ -33,6 +33,7 @@ from env_factory.data_governance import (
     scan_payloads,
 )
 from env_factory.container_provenance import verify_container_provenance
+from env_factory.execution_provenance import verify_execution_provenance
 
 
 Z_95 = 1.959963984540054
@@ -296,7 +297,12 @@ def fresh_holdout_evidence(
     }
 
 
-def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, Any]:
+def certify(
+    history: Mapping[str, Any], policy: Mapping[str, Any], *, project: Path | None = None
+) -> dict[str, Any]:
+    project = project or Path(__file__).resolve().parents[1]
+    recorded_execution = history.get("config", {}).get("execution_provenance")
+    execution_verification = verify_execution_provenance(project, recorded_execution)
     raw_holdouts = history.get("holdouts")
     if isinstance(raw_holdouts, list) and raw_holdouts:
         holdouts = [item for item in raw_holdouts if isinstance(item, Mapping)]
@@ -553,6 +559,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "version": "2.0",
         "kind": "agentic_rl_pretraining_materials",
         "evaluator_source_digest": history.get("config", {}).get("source_digest"),
+        "execution_provenance": recorded_execution,
         "items": material_items,
     }
     material_manifest["dataset_sha256"] = digest_json(material_manifest)
@@ -628,6 +635,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "fresh_holdout_evidence": holdout_freshness,
         "holdout_batches": batch_measurements,
         "material_manifest_items": len(material_items),
+        "execution_environment": execution_verification,
     }
 
     gates = {
@@ -683,6 +691,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
             "all_verified"
         ],
         "trajectory_privacy": measurements["trajectory_privacy"]["all_verified"],
+        "execution_environment": execution_verification["verified"],
         "material_identity": (
             len(material_items) == len(qualified)
             and len(material_fingerprints) == len(set(material_fingerprints))
@@ -780,7 +789,9 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--bundle-output", type=Path)
     args = parser.parse_args()
-    report = certify(load(args.history.resolve()), default_policy())
+    report = certify(
+        load(args.history.resolve()), default_policy(), project=args.project.resolve()
+    )
     from verify_training_materials import verify
     report = attach_artifact_verification(
         report, verify(report["materials_manifest"], args.project.resolve())

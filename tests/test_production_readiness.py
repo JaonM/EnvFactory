@@ -4,6 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from env_factory.execution_provenance import collect_execution_provenance
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -210,7 +212,12 @@ class ProductionReadinessTest(unittest.TestCase):
             certifier.audit_rollout_privacy(representative)
         ))
         return {
-            "config": {"source_digest": "evaluator-source-v1"},
+            "config": {
+                "source_digest": "evaluator-source-v1",
+                "execution_provenance": certifier.verify_execution_provenance(
+                    ROOT, {}
+                )["current"],
+            },
             "holdout": holdouts[0], "holdouts": holdouts,
         }
 
@@ -232,6 +239,7 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertTrue(report["gates"]["data_governance"])
             self.assertTrue(report["gates"]["container_reproducibility"])
             self.assertTrue(report["gates"]["trajectory_privacy"])
+            self.assertTrue(report["gates"]["execution_environment"])
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
             self.assertEqual(report["materials_manifest"]["version"], "2.0")
             self.assertEqual(
@@ -239,6 +247,15 @@ class ProductionReadinessTest(unittest.TestCase):
                 "evaluator-source-v1",
             )
             self.assertEqual(len(report["materials_manifest"]["dataset_sha256"]), 64)
+
+    def test_execution_environment_drift_breaks_certification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            history["config"]["execution_provenance"]["python"]["version"] = "0.0"
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["execution_environment"])
+            self.assertIn("execution_environment", report["failed_gates"])
 
     def test_pilot_sized_holdout_cannot_claim_production_certification(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -458,7 +475,9 @@ class ProductionReadinessTest(unittest.TestCase):
             }
             manifest = {
                 "version": "2.0", "kind": "agentic_rl_pretraining_materials",
-                "evaluator_source_digest": "old-evaluator", "items": [item],
+                "evaluator_source_digest": "old-evaluator",
+                "execution_provenance": collect_execution_provenance(ROOT),
+                "items": [item],
             }
             manifest["dataset_sha256"] = verifier.digest_json(manifest)
             self.assertTrue(verifier.verify(manifest, ROOT)["verified"])

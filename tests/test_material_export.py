@@ -10,6 +10,7 @@ from env_factory.material_artifacts import (
     evidence_artifact_digests,
     portable_artifact_digests,
 )
+from env_factory.execution_provenance import collect_execution_provenance
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,6 +89,7 @@ class MaterialExportTest(unittest.TestCase):
             "version": "2.0",
             "kind": "agentic_rl_pretraining_materials",
             "evaluator_source_digest": "source",
+            "execution_provenance": collect_execution_provenance(ROOT),
             "items": [item],
         }
         manifest["dataset_sha256"] = digest_json(manifest)
@@ -133,6 +135,15 @@ class MaterialExportTest(unittest.TestCase):
             portable = json.loads((bundle / "certification.json").read_text())
             self.assertNotIn("materials_manifest", portable)
             self.assertTrue(portable["certified"])
+            self.assertEqual(
+                card["build_environment"], portable["execution_provenance"]
+            )
+            self.assertEqual(
+                json.loads((bundle / "bundle_manifest.json").read_text())[
+                    "execution_provenance_sha256"
+                ],
+                digest_json(card["build_environment"]),
+            )
             copied_app = next((bundle / "environments").glob("*/app.py"))
             copied_app.write_text("# tampered\n")
             changed = exporter.verify_bundle(bundle)
@@ -175,6 +186,31 @@ class MaterialExportTest(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text())
             manifest["files_sha256"]["dataset_card.json"] = exporter.file_sha256(card_path)
             unsigned = {key: value for key, value in manifest.items() if key != "bundle_sha256"}
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertIn("dataset_card", report["failed_gates"])
+
+    def test_bundle_verifier_rejects_rehashed_environment_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            card_path = bundle / "dataset_card.json"
+            card = json.loads(card_path.read_text())
+            card["build_environment"]["python"]["version"] = "0.0"
+            card_path.write_text(json.dumps(card))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files_sha256"]["dataset_card.json"] = exporter.file_sha256(
+                card_path
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
             manifest["bundle_sha256"] = digest_json(unsigned)
             manifest_path.write_text(json.dumps(manifest))
             report = exporter.verify_bundle(bundle)
