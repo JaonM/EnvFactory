@@ -38,6 +38,7 @@ from env_factory.task_similarity import near_duplicate_rate, task_partition_isol
 from env_factory.generation_provenance import generation_provenance_snapshot
 from env_factory.runtime_provenance import valid_container_rollout_execution
 from env_factory.sandbox_scoring import valid_score_report
+from env_factory.task_quality import score_file
 
 
 Z_95 = 1.959963984540054
@@ -371,6 +372,41 @@ def certify(
     holdout_freshness = fresh_holdout_evidence(holdouts, policy)
     partition_isolation = partition_isolation_evidence(history, holdouts)
     generated = [item for item in results if Path(str(item.get("task_path", ""))).is_file()]
+    verified_task_scores: set[int] = set()
+    task_score_failures = []
+    for item in results:
+        claimed = item.get("task_score")
+        if not isinstance(claimed, Mapping):
+            continue
+        task_path = Path(str(item.get("task_path", "")))
+        try:
+            expected = score_file(
+                task_path, min_score=float(policy["score_threshold"])
+            ).to_dict()
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            expected = None
+        # The source path is operational metadata and may change when a frozen
+        # experiment is relocated. Every semantic score field must still match.
+        claimed_semantics = {key: value for key, value in claimed.items() if key != "path"}
+        expected_semantics = (
+            {key: value for key, value in expected.items() if key != "path"}
+            if isinstance(expected, Mapping) else None
+        )
+        category_matches = (
+            isinstance(expected, Mapping)
+            and item.get("category") == expected.get("training_category")
+        )
+        if (
+            expected_semantics is not None
+            and digest_json(claimed_semantics) == digest_json(expected_semantics)
+            and category_matches
+        ):
+            verified_task_scores.add(id(item))
+        elif (
+            claimed.get("eligible") is True
+            and claimed.get("score", 0) >= policy["score_threshold"]
+        ):
+            task_score_failures.append(str(task_path))
     verified_sandbox_scores: set[int] = set()
     sandbox_score_failures = []
     for item in results:
@@ -408,7 +444,8 @@ def certify(
             sandbox_score_failures.append(str(item.get("task_path", "")))
     def task_passes(item: Mapping[str, Any]) -> bool:
         return (
-            item.get("task_score", {}).get("eligible") is True
+            id(item) in verified_task_scores
+            and item.get("task_score", {}).get("eligible") is True
             and item.get("task_score", {}).get("score", 0)
             >= policy["score_threshold"]
         )
@@ -444,6 +481,7 @@ def certify(
         for item in results
     )
     qualification_lineage = lineage_violations == 0
+    task_score_provenance = not task_score_failures
     sandbox_score_provenance = not sandbox_score_failures
     rates = {
         "generation_completion": len(generated) / total if total else 0.0,
@@ -736,6 +774,10 @@ def certify(
         "task_qualified": len(task_good),
         "sandbox_built": len(built),
         "training_ready": len(qualified),
+        "task_score_provenance": {
+            "verified": len(verified_task_scores),
+            "failures": len(task_score_failures),
+        },
         "qualification_lineage": {
             "verified": qualification_lineage,
             "violations": lineage_violations,
@@ -835,6 +877,7 @@ def certify(
         ),
         "fresh_holdout": measurements["fresh_holdout_verified"],
         "holdout_partition_isolation": partition_isolation["isolated"],
+        "task_score_provenance": task_score_provenance,
         "qualification_lineage": qualification_lineage,
         "sandbox_score_provenance": sandbox_score_provenance,
         "task_good_yield": (

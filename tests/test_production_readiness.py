@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from env_factory.sandbox_scoring import evidence_fingerprint
+from env_factory.task_quality import score_file
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,6 +23,110 @@ verifier = load_script("verify_training_materials")
 
 
 class ProductionReadinessTest(unittest.TestCase):
+    @staticmethod
+    def fixture_task(category: str, description: str) -> dict:
+        task = {
+            "training_category": "simple_agentic",
+            "task": description,
+            "task_intent": "recommend",
+            "complexity": "standard",
+            "requirements": {"output_format": "markdown"},
+            "environment_plan": {"mode": "reference_data"},
+            "actions": [
+                {"name": "读取库存"}, {"name": "筛选候选"},
+                {"name": "比较候选"}, {"name": "形成建议"},
+            ],
+            "tools": [
+                {"function": {"name": "read_inventory"}},
+                {"function": {"name": "get_weather"}},
+            ],
+            "noise_tools": [{"name": "get_weather", "category": "unrelated"}],
+            "metrics": [
+                {"id": "process_read", "category": "process", "type": "hybrid", "evaluator": {}},
+                {"id": "outcome", "category": "outcome", "type": "model-based", "evaluator": {}},
+                {"id": "noise", "category": "penalty", "type": "rule-based", "evaluator": {}},
+            ],
+            "metric_implementations": [
+                {"metric_id": "process_read"}, {"metric_id": "noise"},
+            ],
+            "reward_formula": {"score_range": [-1, 1]},
+            "acceptance_contract": {
+                "executable_scenarios": [
+                    {"kind": "goal_success", "steps": [{
+                        "operation": "tool_call", "tool_name": "read_inventory",
+                        "arguments": {"category": "办公设备"},
+                    }]},
+                    {"kind": "goal_failure"}, {"kind": "noise_selection"},
+                ],
+                "mutation_tests": [{"id": "constant_reward"}],
+            },
+            "task_readiness": {"ready": True, "warnings": []},
+            "task_spec": {
+                "version": "1.0", "task_contract": {},
+                "training_contract": {
+                    "category": "simple_agentic", "environment_archetype": "single_read",
+                },
+                "environment_contract": {"mode": "reference_data", "archetype": "single_read"},
+                "tool_contracts": [{"name": "read_inventory", "role": "business"}],
+                "capability_dag": {"nodes": ["read_inventory"], "edges": []},
+                "goal_contract": {"expected_delta": []},
+            },
+            "artifacts": {"data_manifest": {"data_governance": {
+                "origin": "model_generated_synthetic",
+                "contains_real_user_data": False,
+                "intended_use": "agentic_rl_training_material",
+            }}},
+        }
+        if category == "direct_response":
+            task["training_category"] = category
+            task["environment_plan"] = {"mode": "stateless"}
+            task["tools"] = [task["tools"][1]]
+            task["acceptance_contract"]["executable_scenarios"] = [
+                {"kind": "goal_success", "steps": [{"operation": "respond"}]},
+                {"kind": "goal_failure"}, {"kind": "noise_selection"},
+            ]
+            task["task_spec"] = {
+                "version": "1.0", "task_contract": {},
+                "training_contract": {"category": category, "environment_archetype": "text_only"},
+                "environment_contract": {"mode": "stateless", "archetype": "text_only"},
+                "tool_contracts": [{"name": "get_weather", "role": "noise"}],
+                "capability_dag": {"nodes": [], "edges": []},
+                "goal_contract": {"expected_delta": []},
+            }
+        elif category == "multi_step_agentic":
+            task["training_category"] = category
+            task["tools"].insert(1, {"function": {"name": "rank_inventory"}})
+            task["acceptance_contract"]["executable_scenarios"][0]["steps"] = [
+                {
+                    "operation": "tool_call", "tool_name": "read_inventory",
+                    "arguments": {"category": "办公设备"},
+                    "capture": {"inventory": "$.items"},
+                },
+                {
+                    "operation": "tool_call", "tool_name": "rank_inventory",
+                    "arguments": {"items": {"$ref": "inventory"}},
+                },
+            ]
+            task["task_spec"] = {
+                "version": "1.0", "task_contract": {},
+                "training_contract": {"category": category, "environment_archetype": "multi_read_join"},
+                "environment_contract": {"mode": "reference_data", "archetype": "multi_read_join"},
+                "tool_contracts": [
+                    {"name": "read_inventory", "role": "business"},
+                    {"name": "rank_inventory", "role": "business"},
+                    {"name": "get_weather", "role": "noise"},
+                ],
+                "capability_dag": {
+                    "nodes": ["read_inventory", "rank_inventory"],
+                    "edges": [{
+                        "from_tool": "read_inventory", "to_tool": "rank_inventory",
+                        "via": "inventory",
+                    }],
+                },
+                "goal_contract": {"expected_delta": []},
+            }
+        return task
+
     def make_history(self, root: Path, *, count: int = 300, batches: int = 3):
         evidence = root / "evidence"
         evidence.mkdir()
@@ -151,15 +256,8 @@ class ProductionReadinessTest(unittest.TestCase):
                 description = __import__("hashlib").sha256(
                     f"task-{global_index}".encode()
                 ).hexdigest().translate(str.maketrans("0123456789", "ghijklmnop"))
-                task.write_text(json.dumps({
-                    "task": description,
-                    "training_category": category,
-                    "artifacts": {"data_manifest": {"data_governance": {
-                        "origin": "model_generated_synthetic",
-                        "contains_real_user_data": False,
-                        "intended_use": "agentic_rl_training_material",
-                    }}},
-                }))
+                task.write_text(json.dumps(self.fixture_task(category, description)))
+                task_score = score_file(task, min_score=8.0).to_dict()
                 sample_seed = global_index + 1000
                 sample_manifest = root / f"sample-{global_index}.json"
                 sample_manifest.write_text(json.dumps({
@@ -290,7 +388,7 @@ class ProductionReadinessTest(unittest.TestCase):
                     "sample_seed": sample_seed,
                     "sample_manifest": str(sample_manifest),
                     "category": category,
-                    "task_score": {"eligible": True, "score": 9},
+                    "task_score": task_score,
                     "sandbox_score": sandbox_report,
                     "score": 9, "passed": True,
                     "live_rollout": {
@@ -366,7 +464,9 @@ class ProductionReadinessTest(unittest.TestCase):
 
     def test_production_profile_can_pass_complete_pretraining_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
-            history = self.make_history(Path(directory))
+            # Exercise the authoritative on-disk representation: tuples in a
+            # freshly computed score report become lists after JSON storage.
+            history = json.loads(json.dumps(self.make_history(Path(directory))))
             report = certifier.certify(history, certifier.default_policy())
             self.assertTrue(report["certified"], report["failed_gates"])
             self.assertEqual(report["scope"], "pre_training_material_readiness")
@@ -562,6 +662,21 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["gates"]["sandbox_score_provenance"])
             self.assertEqual(
                 report["measurements"]["sandbox_score_provenance"],
+                {"verified": 899, "failures": 1},
+            )
+
+    def test_task_score_and_category_are_recomputed_from_frozen_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            result["task_score"] = dict(result["task_score"])
+            result["task_score"]["score"] = 9.5
+            result["category"] = "multi_step_agentic"
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["task_score_provenance"])
+            self.assertEqual(
+                report["measurements"]["task_score_provenance"],
                 {"verified": 899, "failures": 1},
             )
 
