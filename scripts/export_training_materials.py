@@ -45,6 +45,10 @@ from env_factory.production_preflight import (
     REQUIRED_CHECKS,
     valid_production_preflight,
 )
+from env_factory.portable_metadata import (
+    audit_portable_metadata,
+    sanitize_portable_metadata,
+)
 
 
 def file_sha256(path: Path) -> str:
@@ -77,7 +81,9 @@ def _portable_certification(certification: Mapping[str, Any]) -> dict[str, Any]:
         "certified": certification.get("certified"),
         "does_not_certify": certification.get("does_not_certify", []),
         "policy": certification.get("policy", {}),
-        "measurements": certification.get("measurements", {}),
+        "measurements": sanitize_portable_metadata(
+            certification.get("measurements", {})
+        ),
         "gates": certification.get("gates", {}),
         "failed_gates": certification.get("failed_gates", []),
         "source_dataset_sha256": source.get("dataset_sha256"),
@@ -503,6 +509,11 @@ def _export_bundle_uncommitted(
             })
 
     portable_certification = _portable_certification(certification)
+    portable_metadata_privacy = audit_portable_metadata(portable_certification)
+    if not portable_metadata_privacy["safe"]:
+        raise ValueError(
+            "portable certification contains non-portable or sensitive metadata"
+        )
     (output / CERTIFICATION_FILE).write_text(
         json.dumps(portable_certification, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8", newline="\n",
@@ -654,6 +665,11 @@ def verify_bundle(
     preflight_model_evidence = preflight_checks.get(
         "model_configuration", {}
     ).get("evidence", {})
+    portable_metadata_privacy = audit_portable_metadata(
+        portable_certification
+    )
+    if not portable_metadata_privacy["safe"]:
+        failures.append("portable_metadata_privacy")
     required_limitations = {
         "rl_training_execution",
         "downstream_training_system_compatibility",
@@ -1308,6 +1324,7 @@ def verify_bundle(
         "task_lineage_ready": task_lineage_ready,
         "production_preflight_ready": production_preflight_ready,
         "preflight_provider_bindings": verified_preflight_provider_bindings,
+        "metadata_privacy_ready": portable_metadata_privacy["safe"],
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None

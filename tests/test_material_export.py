@@ -390,6 +390,38 @@ class MaterialExportTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "user_simulator_terminal"):
                 exporter._transition_records("fixture", item, rollout)
 
+    def test_export_redacts_machine_local_measurement_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            certification["measurements"]["diagnostic"] = {
+                "task_path": "/Users/person/private/task.json",
+                "message": "/private/tmp/build-attempt",
+            }
+            bundle = root / "bundle"
+            report = exporter.export_bundle(certification, bundle, ROOT)
+            self.assertTrue(report["metadata_privacy_ready"])
+            portable = json.loads((bundle / "certification.json").read_text())
+            diagnostic = portable["measurements"]["diagnostic"]
+            self.assertNotIn("task_path", diagnostic)
+            self.assertEqual(
+                diagnostic["message"], "<redacted-local-path>"
+            )
+
+    def test_export_rejects_credential_in_portable_measurements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            certification["measurements"]["diagnostic"] = (
+                "sk-abcdefghijklmnopqrstuvwxyz123456"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "non-portable or sensitive metadata"
+            ):
+                exporter.export_bundle(
+                    certification, root / "bundle", ROOT
+                )
+
     def test_v12_verifier_rejects_rehashed_missing_preflight_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -451,6 +483,34 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["verified"])
             self.assertFalse(report["production_preflight_ready"])
             self.assertIn("preflight_provider_binding", report["failed_gates"])
+
+    def test_v12_verifier_rejects_rehashed_local_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            certification_path = bundle / "certification.json"
+            portable = json.loads(certification_path.read_text())
+            portable["measurements"]["diagnostic"] = {
+                "sandbox_root": "/Users/person/private/sandbox"
+            }
+            certification_path.write_text(json.dumps(portable))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files_sha256"]["certification.json"] = (
+                exporter.file_sha256(certification_path)
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["metadata_privacy_ready"])
+            self.assertIn("portable_metadata_privacy", report["failed_gates"])
 
     def test_bundle_verifier_rejects_semantically_rewritten_transition_jsonl(self):
         with tempfile.TemporaryDirectory() as directory:

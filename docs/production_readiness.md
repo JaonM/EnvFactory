@@ -197,6 +197,8 @@ provider、容器奖励校准和 task lineage 契约验证，但缺少 v12 的 p
 
 v12 验证器还会把 preflight 的 generation、Rollout Agent、User/Judge 三个 provider 分别与每个环境中的
 生成 provenance 和 `data_governance.json` 交叉核对；三个各自格式合法但来自不同实验的身份不能拼成合格包。
+导出器会移除 measurements 中的路径字段、把残留绝对路径替换为稳定占位符，并扫描便携认证元数据中的
+凭证与 PII 模式；验证器会独立重扫，即使同步重算普通文件哈希也不能把宿主路径、凭证或 PII 混入训练素材包。
 
 生产发布还要求使用组织持有的 Ed25519 私钥对最终 `bundle_manifest.json` 生成 detached signature，并由
 显式指定的受信任公钥复验。报告和包中只保存公钥 SHA-256 身份，不保存私钥、私钥路径或公钥内容。

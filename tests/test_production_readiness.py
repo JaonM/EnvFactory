@@ -1293,6 +1293,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "provider_identity_ready": True,
             "task_lineage_ready": True,
             "production_preflight_ready": True,
+            "metadata_privacy_ready": True,
             "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
@@ -1309,6 +1310,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "provider_identity_ready": True,
             "task_lineage_ready": True,
             "production_preflight_ready": True,
+            "metadata_privacy_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])
