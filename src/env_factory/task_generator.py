@@ -12,7 +12,11 @@ from .graph_builder import Neo4jGraphStore
 from .knowledge_graph import SceneNode, TaskType
 from .llm import LLMClient
 from .task import Task
-from .task_pipeline import HIGH_STAKES_MARKERS, TaskGenerationPipeline
+from .task_pipeline import (
+    HIGH_STAKES_CHEMICAL_MARKERS,
+    HIGH_STAKES_MARKERS,
+    TaskGenerationPipeline,
+)
 from .task_routing import select_training_intent
 
 logger = logging.getLogger(__name__)
@@ -73,19 +77,15 @@ class TaskGenerator:
         llm: LLMClient,
         *,
         user_script_count: int = 3,
-        sessions_per_script: int = 2,
-        minimum_dialogue_turns: int = 4,
-        maximum_dialogue_turns: int = 12,
         noise_tool_max: int = 3,
+        available_environment_modes: tuple[str, ...] | None = None,
     ) -> None:
         self.store = store
         self.llm = llm
+        self.available_environment_modes = available_environment_modes
         self.pipeline = TaskGenerationPipeline(
             llm,
             script_count=user_script_count,
-            sessions_per_script=sessions_per_script,
-            minimum_dialogue_turns=minimum_dialogue_turns,
-            maximum_dialogue_turns=maximum_dialogue_turns,
             noise_tool_max=noise_tool_max,
         )
 
@@ -97,19 +97,21 @@ class TaskGenerator:
         artifact_dir: str | Path | None = None,
         task_intent: str | None = None,
         training_category: str = "multi_step_agentic",
+        seed: int | None = None,
     ) -> Task:
         """Generate one task using a random path length between 0 and ``hops``."""
 
         if hops < 0:
             raise ValueError("hops must not be negative")
         started = time.perf_counter()
-        selected_hops = random.randint(0, hops)
-        path = self.store.random_scene_event_path(selected_hops)
+        rng = random.Random(seed) if seed is not None else random
+        selected_hops = rng.randint(0, hops)
+        path = self.store.random_scene_event_path(selected_hops, rng=rng)
         if not path and selected_hops > 0:
             # Sparse graphs may not contain a path at the initially selected
             # depth. Try shorter paths so batch generation remains productive.
             for fallback_hops in range(selected_hops - 1, -1, -1):
-                path = self.store.random_scene_event_path(fallback_hops, attempts=3)
+                path = self.store.random_scene_event_path(fallback_hops, attempts=3, rng=rng)
                 if path:
                     logger.info(
                         "路径跳数降级：请求=%d，实际=%d",
@@ -120,15 +122,15 @@ class TaskGenerator:
         if not path:
             logger.warning("任务路径抽取失败：请求跳数=%d，实际跳数=%d", hops, selected_hops)
             raise TaskGenerationError(f"no Scene node or path found for {selected_hops} hops")
-        keywords = self._keywords(path)
+        keywords = self._keywords(path, rng=rng)
         if not keywords:
             logger.warning(
                 "路径关键词全部被质量过滤：实际跳数=%d 节点=%s",
                 selected_hops, [node.name for node in path],
             )
             for keyword_retry in range(1, 4):
-                path = self.store.random_scene_event_path(selected_hops, attempts=3)
-                keywords = self._keywords(path) if path else ()
+                path = self.store.random_scene_event_path(selected_hops, attempts=3, rng=rng)
+                keywords = self._keywords(path, rng=rng) if path else ()
                 if keywords:
                     logger.info(
                         "低质量关键词路径重采样成功：attempt=%d keywords=%s",
@@ -146,13 +148,13 @@ class TaskGenerator:
             keywords,
             time.perf_counter() - started,
         )
-        selected_type = self._select_task_type(task_type)
-        selected_style = task_style or random.choice(self.STYLES)
+        selected_type = self._select_task_type(task_type, rng=rng)
+        selected_style = task_style or rng.choice(self.STYLES)
         if selected_style not in self.STYLES:
             raise ValueError(f"unsupported task_style: {selected_style}")
         if task_intent is not None and task_intent not in self.INTENTS:
             raise ValueError(f"unsupported task_intent: {task_intent}")
-        selected_intent = select_training_intent(training_category, task_intent)
+        selected_intent = select_training_intent(training_category, task_intent, rng=rng)
         artifacts = self.pipeline.generate(
             keywords=list(keywords),
             task_type=selected_type.value,
@@ -161,6 +163,8 @@ class TaskGenerator:
             graph_context={"hops": selected_hops, "nodes": [node.name for node in path]},
             artifact_dir=artifact_dir,
             training_category=training_category,
+            rng=rng,
+            available_environment_modes=self.available_environment_modes,
         )
         if artifacts.get("complexity") not in {"simple", "standard", "complex"}:
             raise TaskGenerationError("task description returned an invalid complexity")
@@ -171,9 +175,12 @@ class TaskGenerator:
         )
 
     @staticmethod
-    def _select_task_type(task_type: TaskType | str | None) -> TaskType:
+    def _select_task_type(
+        task_type: TaskType | str | None, *, rng: random.Random | None = None
+    ) -> TaskType:
+        random_source = rng or random
         if task_type is None:
-            return random.choice(tuple(TaskType))
+            return random_source.choice(tuple(TaskType))
         if isinstance(task_type, TaskType):
             return task_type
         try:
@@ -183,13 +190,16 @@ class TaskGenerator:
             if not values or any(not value for value in values):
                 raise ValueError
             selected_types = tuple(dict.fromkeys(TaskType(value) for value in values))
-            return random.choice(selected_types)
+            return random_source.choice(selected_types)
         except ValueError as exc:
             allowed = ", ".join(item.value for item in TaskType)
             raise ValueError(f"unsupported task_type {task_type!r}; expected comma-separated values from: {allowed}") from exc
 
     @staticmethod
-    def _keywords(path: tuple[SceneNode, ...]) -> tuple[str, ...]:
+    def _keywords(
+        path: tuple[SceneNode, ...], *, rng: random.Random | None = None
+    ) -> tuple[str, ...]:
+        random_source = rng or random
         keywords: list[str] = []
         for scene in path:
             candidates = [
@@ -197,7 +207,7 @@ class TaskGenerator:
                 if (normalized := TaskGenerator._normalize_keyword(word)) is not None
             ]
             if candidates:
-                keywords.append(random.choice(candidates))
+                keywords.append(random_source.choice(candidates))
             else:
                 logger.info(
                     "过滤低质量 Scene 关键词：scene=%s candidates=%s",
@@ -221,7 +231,7 @@ class TaskGenerator:
                 re.search(rf"\b{re.escape(marker.casefold())}\b", folded) is not None
                 if marker.isascii() else marker.casefold() in folded
             )
-            for marker in HIGH_STAKES_MARKERS
+            for marker in (*HIGH_STAKES_MARKERS, *HIGH_STAKES_CHEMICAL_MARKERS)
         ):
             return None
         if re.search(r"[\x00-\x1f\x7f\ufffd]", keyword):

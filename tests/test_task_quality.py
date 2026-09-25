@@ -1,8 +1,9 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from env_factory.task_quality import discover_task_files, error_report, score_task
+from env_factory.task_quality import discover_task_files, error_report, score_file, score_task
 
 
 def valid_task():
@@ -27,7 +28,10 @@ def valid_task():
             {"id": "outcome", "category": "outcome", "type": "model-based", "evaluator": {}},
             {"id": "noise", "category": "penalty", "type": "rule-based", "evaluator": {}},
         ],
-        "metric_implementations": [{"metric_id": "noise"}],
+        "metric_implementations": [
+            {"metric_id": "process_read"},
+            {"metric_id": "noise"},
+        ],
         "reward_formula": {"score_range": [-1, 1]},
         "acceptance_contract": {
             "executable_scenarios": [
@@ -58,11 +62,119 @@ def valid_task():
 
 
 class TaskQualityTest(unittest.TestCase):
+    def _write_manifest_task(self, root: Path, *, child_parent_id: int) -> Path:
+        task = valid_task()
+        task["artifacts"] = {"data_manifest": {
+            "version": "1.0", "environment_mode": "reference_data", "root": ".",
+            "tables": [
+                {"table_name": "parent", "schema_file": "schemas/parent.json",
+                 "rows_file": "rows/parent.jsonl"},
+                {"table_name": "child", "schema_file": "schemas/child.json",
+                 "rows_file": "rows/child.jsonl"},
+            ],
+        }}
+        (root / "schemas").mkdir(parents=True)
+        (root / "rows").mkdir()
+        (root / "schemas" / "parent.json").write_text(json.dumps({
+            "table_name": "parent",
+            "columns": [{"name": "id", "type": "INTEGER", "nullable": False}],
+            "primary_key": ["id"], "foreign_keys": [], "indexes": [], "constraints": [],
+        }), encoding="utf-8")
+        (root / "schemas" / "child.json").write_text(json.dumps({
+            "table_name": "child",
+            "columns": [
+                {"name": "id", "type": "INTEGER", "nullable": False},
+                {"name": "parent_id", "type": "INTEGER", "nullable": False},
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [{
+                "column": "parent_id", "references_table": "parent", "references_column": "id",
+            }],
+            "indexes": [], "constraints": ["parent_id > 0"],
+        }), encoding="utf-8")
+        (root / "rows" / "parent.jsonl").write_text('{"id": 1}\n', encoding="utf-8")
+        (root / "rows" / "child.jsonl").write_text(
+            json.dumps({"id": 10, "parent_id": child_parent_id}) + "\n", encoding="utf-8"
+        )
+        task_path = root / "task.json"
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        return task_path
+
+    def test_score_file_accepts_data_valid_under_shared_persistence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = score_file(self._write_manifest_task(Path(directory), child_parent_id=1))
+        self.assertTrue(report.eligible)
+
+    def test_score_file_rejects_data_invalid_under_shared_persistence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = score_file(self._write_manifest_task(Path(directory), child_parent_id=99))
+        self.assertFalse(report.eligible)
+        self.assertEqual(report.tier, "rejected")
+        self.assertTrue(any("共享持久化契约" in item for item in report.eligibility_failures))
+
+    def test_score_file_rejects_stale_declared_data_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_manifest_task(Path(directory), child_parent_id=1)
+            task = json.loads(path.read_text(encoding="utf-8"))
+            task["acceptance_contract"]["fixtures"] = {"initial_data_hash": "stale"}
+            path.write_text(json.dumps(task), encoding="utf-8")
+            report = score_file(path)
+        self.assertFalse(report.eligible)
+        self.assertTrue(any("initial_data_hash mismatch" in item
+                            for item in report.eligibility_failures))
+
+    def test_stateful_mutation_without_goal_assertion_is_ineligible(self):
+        task = valid_task()
+        task["task_intent"] = "modify"
+        task["environment_plan"] = {"mode": "stateful"}
+        task["tool_implementations"] = [{
+            "tool_name": "update_export", "operation": "update",
+            "table": "exports", "changes": {"code": "code"},
+        }]
+        task["task_spec"]["goal_contract"] = {"row_predicates": []}
+        report = score_task(task)
+        self.assertFalse(report.eligible)
+        self.assertTrue(any("状态目标与变更工具不闭合" in item
+                            for item in report.eligibility_failures))
+
+    def test_stateful_mutation_with_goal_assertion_is_closed(self):
+        task = valid_task()
+        task["task_intent"] = "modify"
+        task["environment_plan"] = {"mode": "stateful"}
+        task["tool_implementations"] = [{
+            "tool_name": "read_inventory", "operation": "update",
+            "table": "inventory", "changes": {"quantity": "quantity"},
+        }]
+        task["task_spec"]["goal_contract"] = {"row_predicates": [{
+            "table": "inventory", "where": {"id": "i1"},
+            "values": {"quantity": 3}, "count": 1,
+        }]}
+        report = score_task(task)
+        self.assertFalse(any("状态目标与变更工具不闭合" in item
+                             for item in report.eligibility_failures))
+
+    def test_mutation_with_deferred_business_truth_is_ineligible(self):
+        task = valid_task()
+        task["task_intent"] = "modify"
+        task["task"] = "修改记录，但新商品编码暂时没想好，请先问我"
+        report = score_task(task)
+        self.assertFalse(report.eligible)
+        self.assertIn("关键业务真值依赖未定义的后续用户回复",
+                      report.eligibility_failures)
+
     def test_complete_agentic_task_passes(self):
         report = score_task(valid_task(), min_score=8)
         self.assertTrue(report.passed)
         self.assertEqual(report.score, 10)
         self.assertEqual(report.tier, "high_value")
+
+    def test_agentic_process_reward_requires_deterministic_implementation(self):
+        task = valid_task()
+        task["metric_implementations"] = [{"metric_id": "noise"}]
+        report = score_task(task)
+        self.assertFalse(report.eligible)
+        self.assertTrue(any("过程奖励缺少可复现实现" in item
+                            for item in report.eligibility_failures))
 
     def test_simple_no_tool_task_is_rejected(self):
         task = valid_task()
@@ -128,6 +240,14 @@ class TaskQualityTest(unittest.TestCase):
         self.assertFalse(report.eligible)
         self.assertEqual(report.tier, "rejected")
 
+    def test_referenced_public_material_must_be_delivered(self):
+        task = valid_task()
+        task["task"] = "请根据用户提供的产品说明查询库存并给出建议"
+        task["public_input"] = {"initial_user_message": task["task"], "materials": []}
+        report = score_task(task)
+        self.assertFalse(report.eligible)
+        self.assertIn("public_input 缺少题面引用的实际输入材料", report.eligibility_failures)
+
     def test_intent_label_does_not_override_agentic_evidence(self):
         task = valid_task()
         task["task_intent"] = "explain"
@@ -135,9 +255,10 @@ class TaskQualityTest(unittest.TestCase):
         self.assertTrue(report.passed)
         self.assertEqual(report.tier, "high_value")
 
-    def test_cross_domain_action_and_metric_drift_is_hard_capped(self):
+    def test_cross_domain_vocabulary_does_not_change_structural_score(self):
         task = valid_task()
-        task["task"] = "根据语言学规则判断日语是否属于多式综合语"
+        baseline = score_task(task)
+        task["task"] = "根据语言服务需求和城市资料选择学习交流目的地"
         task["actions"] = [
             {"name": "读取参考数据"},
             {"name": "比较候选城市气候"},
@@ -145,8 +266,8 @@ class TaskQualityTest(unittest.TestCase):
         ]
         task["metrics"][1]["id"] = "outcome_city_selection"
         report = score_task(task)
-        self.assertFalse(report.eligible)
-        self.assertIn("训练资格失败：任务、动作、工具或奖励发生跨领域语义漂移", report.findings)
+        self.assertEqual(report.score, baseline.score)
+        self.assertEqual(report.eligible, baseline.eligible)
 
     def test_unknown_task_domain_does_not_trigger_false_cross_domain_cap(self):
         task = valid_task()
@@ -159,13 +280,14 @@ class TaskQualityTest(unittest.TestCase):
         report = score_task(task)
         self.assertNotIn("训练资格失败：任务、动作、工具或奖励发生跨领域语义漂移", report.findings)
 
-    def test_requirements_domain_conflict_is_hard_capped(self):
+    def test_wildlife_trip_requirements_are_not_a_domain_conflict(self):
         task = valid_task()
+        baseline = score_task(task)
         task["task"] = "从藏羚羊和雪豹中推荐一个自然观察目标动物"
         task["requirements"] = {"rule": "按照候选地点的车程和门票筛选目的地"}
         report = score_task(task)
-        self.assertFalse(report.eligible)
-        self.assertTrue(any("requirements 与任务描述发生领域冲突" in item for item in report.findings))
+        self.assertEqual(report.score, baseline.score)
+        self.assertEqual(report.eligible, baseline.eligible)
 
     def test_discover_tasks_is_incremental_layout_aware(self):
         with tempfile.TemporaryDirectory() as directory:

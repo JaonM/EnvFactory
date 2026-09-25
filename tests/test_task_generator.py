@@ -11,7 +11,7 @@ from env_factory.task_pipeline import TaskGenerationPipeline
 
 
 class FakeStore:
-    def random_scene_event_path(self, hops):
+    def random_scene_event_path(self, hops, *, attempts=8, rng=None):
         self.hops = hops
         if hops == 0:
             return (SceneNode("买衣服", ("购买服装",)),)
@@ -67,7 +67,7 @@ class TaskGeneratorTest(unittest.TestCase):
                 "penalty": 0.0, "once": True, "rubric": "检查工具调用结果", "weight": 1.0,
             }],
             "data_models": [], "media_fixtures": [], "truth_bindings": [],
-            "user_profiles": [], "user_scripts": [], "dialogue_sessions": [],
+            "user_profiles": [], "user_scripts": [],
             "actions": [], "tools": [], "tool_bindings": [],
             "observation_schema": {}, "reward_formula": {}, "termination": [],
         }
@@ -91,7 +91,23 @@ class TaskGeneratorTest(unittest.TestCase):
 
         self.assertEqual(store.hops, 0)
         self.assertEqual(captured["keywords"], ["买衣服"])
+        self.assertIsNone(captured["available_environment_modes"])
         self.assertEqual(task.desc, "帮我买一件合适尺码的衣服")
+
+    def test_available_environment_modes_are_forwarded_to_pipeline(self):
+        captured = {}
+        with patch.object(
+            TaskGenerationPipeline, "generate",
+            side_effect=lambda **kwargs: captured.update(kwargs) or self._pipeline_artifacts(),
+        ):
+            TaskGenerator(
+                FakeStore(), FakeLLM(),
+                available_environment_modes=("stateless", "reference_data", "stateful"),
+            ).generate(0, TaskType.EVENT, seed=7)
+        self.assertEqual(
+            captured["available_environment_modes"],
+            ("stateless", "reference_data", "stateful"),
+        )
 
     def test_generate_uses_path_keywords(self):
         store = FakeStore()
@@ -156,7 +172,7 @@ class TaskGeneratorTest(unittest.TestCase):
         class ResamplingStore:
             calls = 0
 
-            def random_scene_event_path(self, hops, attempts=8):
+            def random_scene_event_path(self, hops, attempts=8, rng=None):
                 self.calls += 1
                 if self.calls == 1:
                     return (SceneNode("数据"),)

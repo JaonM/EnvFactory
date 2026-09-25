@@ -4,39 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
-
-
-DOMAIN_MARKER_GROUPS: dict[str, tuple[str, ...]] = {
-    "city": ("城市", "候选城市", "气候", "降水", "博物馆", "地铁", "行政区"),
-    "language": ("日语", "阿依努语", "多式综合语", "词汇", "语法", "语言学"),
-    "clothing": ("服装", "衣物", "面料", "纤维", "手表", "表带", "鞋", "尺码"),
-    "food": ("菜", "菜系", "食材", "烹饪", "餐厅", "营养", "火锅"),
-    "device": ("设备", "服务器", "日志", "故障", "传感器", "网络", "路由器"),
-    "commerce": ("商品", "库存", "采购", "订单", "价格", "供应", "预算"),
-    "chemistry": ("化学", "溶剂", "树脂", "化合物", "甲醇", "乙醇", "丙酮"),
-    "medical": ("医疗", "诊断", "症状", "用药", "疾病", "疼痛"),
-    "legal": ("法律", "法规", "合规", "政策", "税务", "证券"),
-    "event": ("活动", "签到", "日程", "会议", "读书会", "参与者"),
-    "wildlife": ("动物", "藏羚羊", "雪豹", "野生", "自然观察"),
-    "travel": ("候选地点", "目的地", "车程", "门票", "出行", "景点"),
-}
-
-CONTRADICTORY_DOMAIN_PAIRS = {
-    frozenset(("language", "city")),
-    frozenset(("language", "commerce")),
-    frozenset(("language", "device")),
-    frozenset(("wildlife", "travel")),
-    frozenset(("food", "device")),
-    frozenset(("clothing", "medical")),
-}
-
-HIGH_VALUE_INTENTS = {
-    "compare", "recommend", "decide", "diagnose", "troubleshoot", "monitor",
-    "plan", "audit", "validate", "execute", "schedule", "simulate",
-}
 
 
 @dataclass(frozen=True)
@@ -69,6 +40,31 @@ class TaskQualityReport:
         return value
 
 
+def _reject(report: TaskQualityReport, finding: str) -> TaskQualityReport:
+    """Preserve the descriptive score while hard-gating an invalid artifact."""
+    return TaskQualityReport(
+        report.task_id, report.path, report.score, False, "rejected",
+        report.dimensions, report.findings + (finding,), report.training_category,
+        report.agentic_level, report.tool_policy_target, False,
+        report.eligibility_failures + (finding,),
+    )
+
+
+def _manifest_root(task_root: Path, manifest: dict[str, Any]) -> Path:
+    """Resolve manifests before and after a task directory is made portable."""
+    declared = Path(str(manifest.get("root", ".")))
+    if declared.is_absolute():
+        return declared
+    referenced = [
+        item.get("schema_file") or item.get("rows_file")
+        for item in _objects(manifest.get("tables"))
+    ]
+    if any(isinstance(name, str) and (task_root / name).is_file() for name in referenced):
+        return task_root
+    candidates = (task_root / declared, Path.cwd() / declared)
+    return next((candidate for candidate in candidates if candidate.is_dir()), candidates[0])
+
+
 def _objects(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
@@ -86,19 +82,48 @@ def _dimension(maximum: float, deductions: Iterable[tuple[float, str]]) -> Quali
     )
 
 
-def _domain_labels(value: Any) -> set[str]:
-    text = _text(value)
-    return {
-        label for label, markers in DOMAIN_MARKER_GROUPS.items()
-        if any(marker in text for marker in markers)
-    }
+def _stateful_goal_tool_issues(task: dict[str, Any]) -> list[str]:
+    """Return deterministic goal/mutation closure failures for stateful tasks."""
+    if task.get("environment_plan", {}).get("mode") != "stateful":
+        return []
+    task_spec = task.get("task_spec")
+    goal = task_spec.get("goal_contract", {}) if isinstance(task_spec, dict) else {}
+    predicates = _objects(goal.get("row_predicates"))
+    by_table: dict[str, list[dict[str, Any]]] = {}
+    for predicate in predicates:
+        table = predicate.get("table")
+        if isinstance(table, str) and table:
+            by_table.setdefault(table, []).append(predicate)
+
+    issues: list[str] = []
+    mutation_tables: set[str] = set()
+    for implementation in _objects(task.get("tool_implementations")):
+        operation = implementation.get("operation")
+        if operation not in {"insert", "update", "delete"}:
+            continue
+        table = implementation.get("table")
+        tool_name = implementation.get("tool_name")
+        if isinstance(table, str):
+            mutation_tables.add(table)
+        if not isinstance(table, str) or not by_table.get(table):
+            issues.append(f"变更工具 {tool_name} 的表 {table} 没有最终状态断言")
+    for table in sorted(set(by_table) - mutation_tables):
+        issues.append(f"目标表 {table} 没有声明式变更工具实现")
+    return issues
 
 
-def _conflicting_domains(task_domains: set[str], candidate_domains: set[str]) -> set[str]:
-    return {
-        candidate for candidate in candidate_domains - task_domains
-        if any(frozenset((task_domain, candidate)) in CONTRADICTORY_DOMAIN_PAIRS for task_domain in task_domains)
-    }
+def _defers_business_truth(task: dict[str, Any]) -> bool:
+    if task.get("task_intent") not in {"modify", "execute", "schedule"}:
+        return False
+    corpus = _text({
+        key: task.get(key)
+        for key in ("task", "requirements", "public_input", "actions", "environment")
+    })
+    return any(marker in corpus for marker in (
+        "暂时没想好", "先问我", "稍后提供", "之后提供", "待我提供",
+        "需要向用户询问", "询问正确", "ask me", "provide later",
+        "to be provided",
+    ))
 
 
 def score_task(task: dict[str, Any], *, task_id: str = "task", path: str = "", min_score: float = 8.0) -> TaskQualityReport:
@@ -110,6 +135,8 @@ def score_task(task: dict[str, Any], *, task_id: str = "task", path: str = "", m
         if key not in {"runtime_interface", "media_truth_mode"}
     }
     mode = task.get("environment_plan", {}).get("mode")
+    public_input = task.get("public_input") if isinstance(task.get("public_input"), dict) else {}
+    public_materials = _objects(public_input.get("materials"))
     actions = _objects(task.get("actions"))
     tools = _objects(task.get("tools"))
     noise = _objects(task.get("noise_tools"))
@@ -139,18 +166,6 @@ def score_task(task: dict[str, Any], *, task_id: str = "task", path: str = "", m
         training_category = "multi_step_agentic"
     agentic_level, tool_policy_target = category_profiles[training_category]
     corpus = _text({"task": task_text, "requirements": semantic_requirements})
-    statement_domains = _domain_labels(task_text)
-    requirement_domains = _domain_labels(semantic_requirements)
-    task_domains = statement_domains | requirement_domains
-    requirement_conflicts = _conflicting_domains(statement_domains, requirement_domains)
-    action_domains = _domain_labels(actions)
-    metric_domains = _domain_labels(metrics)
-    business_tools = [
-        tool for tool in tools
-        if str(tool.get("function", {}).get("name")) in business_names
-    ]
-    tool_domains = _domain_labels(business_tools)
-
     contract_deductions: list[tuple[float, str]] = []
     if len(task_text) < 16:
         contract_deductions.append((0.6, "任务描述过短，目标或边界可能不完整"))
@@ -162,8 +177,9 @@ def score_task(task: dict[str, Any], *, task_id: str = "task", path: str = "", m
         contract_deductions.append((0.4, "complexity 无效"))
     if any(marker in corpus for marker in ("待补充", "自行假设", "相关信息等", "视情况")):
         contract_deductions.append((0.4, "任务契约包含模糊或未决输入"))
-    if requirement_conflicts:
-        contract_deductions.append((1.2, "requirements 与任务描述发生领域冲突：" + ", ".join(sorted(requirement_conflicts))))
+    deferred_business_truth = _defers_business_truth(task)
+    if deferred_business_truth:
+        contract_deductions.append((1.2, "状态任务把关键业务真值推迟到未定义的后续用户回复"))
 
     challenge_deductions: list[tuple[float, str]] = []
     if task.get("complexity") == "simple" and training_category == "multi_step_agentic":
@@ -193,26 +209,22 @@ def score_task(task: dict[str, Any], *, task_id: str = "task", path: str = "", m
         alignment_deductions.append((0.8, "数据环境没有业务数据访问工具"))
     if mode == "external_capability" and not business_names:
         alignment_deductions.append((0.8, "外部能力任务没有业务查询工具"))
+    references_public_material = re.search(
+        r"(?:以下|下列|上述|这段|这些|给定|提供|附上|附件).{0,12}"
+        r"(?:文本|资料|数据|列表|清单|内容|说明|笔记|记录|规格|描述|选项)",
+        corpus,
+    ) is not None
+    concrete_public_materials = [
+        item for item in public_materials
+        if isinstance(item.get("content"), str) and len(item["content"].strip()) >= 8
+    ]
+    if references_public_material and not concrete_public_materials:
+        alignment_deductions.append((1.2, "任务引用了未交付给 Agent 的公开材料"))
     if len(noise_names) != len(noise) or not noise_names <= tool_names:
         alignment_deductions.append((0.6, "噪声工具元数据与工具定义不一致"))
-    action_text = _text(actions)
-    for marker in ("生活成本", "预算排序", "评分排序"):
-        if marker in action_text and marker not in corpus:
-            alignment_deductions.append((0.5, f"动作引入任务外约束：{marker}"))
-            break
-    # Domain comparison is only authoritative when the task itself maps to at
-    # least one known domain. Otherwise a generic word such as "商品" in a
-    # legitimate tool description would create a false cross-domain verdict.
-    imported_action_domains = _conflicting_domains(task_domains, action_domains)
-    if imported_action_domains:
-        alignment_deductions.append((1.2, "动作引入任务外领域：" + ", ".join(sorted(imported_action_domains))))
-    imported_metric_domains = _conflicting_domains(task_domains, metric_domains)
-    if imported_metric_domains:
-        alignment_deductions.append((0.8, "奖励指标评估了任务外领域：" + ", ".join(sorted(imported_metric_domains))))
-    imported_tool_domains = _conflicting_domains(task_domains, tool_domains)
-    if imported_tool_domains:
-        alignment_deductions.append((0.8, "业务工具属于任务外领域：" + ", ".join(sorted(imported_tool_domains))))
-
+    stateful_goal_issues = _stateful_goal_tool_issues(task)
+    if stateful_goal_issues:
+        alignment_deductions.append((1.5, "状态目标与变更工具未形成可验证闭环"))
     reward_deductions: list[tuple[float, str]] = []
     categories = {str(metric.get("category")) for metric in metrics}
     if "outcome" not in categories:
@@ -224,9 +236,15 @@ def score_task(task: dict[str, Any], *, task_id: str = "task", path: str = "", m
     rule_metric_ids = {
         str(metric.get("id")) for metric in metrics if metric.get("type") == "rule-based"
     }
+    process_metric_ids = {
+        str(metric.get("id")) for metric in metrics if metric.get("category") == "process"
+    }
     implemented_ids = {str(item.get("metric_id")) for item in implementations}
     if rule_metric_ids - implemented_ids:
         reward_deductions.append((0.5, "部分 rule-based 指标缺少声明式实现"))
+    unimplemented_process = process_metric_ids - implemented_ids
+    if unimplemented_process:
+        reward_deductions.append((1.0, "过程奖励依赖运行时猜测，缺少确定性工具调用实现"))
     formula = task.get("reward_formula")
     if not isinstance(formula, dict) or formula.get("score_range") != [-1, 1]:
         reward_deductions.append((0.6, "奖励公式或范围不完整"))
@@ -317,8 +335,18 @@ def score_task(task: dict[str, Any], *, task_id: str = "task", path: str = "", m
         eligibility_failures.append("环境模式与任务输入边界冲突")
     if bad_success_fixture:
         eligibility_failures.append("成功轨迹不能作为真实 Agentic 训练正样本")
-    if requirement_conflicts or imported_action_domains or imported_metric_domains or imported_tool_domains:
-        eligibility_failures.append("任务、动作、工具或奖励发生跨领域语义漂移")
+    if references_public_material and not concrete_public_materials:
+        eligibility_failures.append("public_input 缺少题面引用的实际输入材料")
+    if deferred_business_truth:
+        eligibility_failures.append("关键业务真值依赖未定义的后续用户回复")
+    if stateful_goal_issues:
+        eligibility_failures.append(
+            "状态目标与变更工具不闭合：" + "；".join(stateful_goal_issues)
+        )
+    if unimplemented_process:
+        eligibility_failures.append(
+            "过程奖励缺少可复现实现：" + ", ".join(sorted(unimplemented_process))
+        )
     task_spec = task.get("task_spec")
     if not isinstance(task_spec, dict):
         eligibility_failures.append("缺少可编译的 task_spec IR")
@@ -339,10 +367,6 @@ def score_task(task: dict[str, Any], *, task_id: str = "task", path: str = "", m
         and score >= 9.0
         and not category_gate_failed
         and not bad_success_fixture
-        and not requirement_conflicts
-        and not imported_action_domains
-        and not imported_metric_domains
-        and not imported_tool_domains
     )
     tier = "high_value" if high_value else ("usable" if passed else "rejected")
     return TaskQualityReport(
@@ -358,30 +382,36 @@ def score_file(path: Path, *, min_score: float = 8.0) -> TaskQualityReport:
         raise ValueError(f"{path}: task artifact must be a JSON object")
     task_id = path.parent.name if path.name == "task.json" else path.stem
     report = score_task(data, task_id=task_id, path=str(path), min_score=min_score)
-    manifest = data.get("artifacts", {}).get("data_manifest", {})
-    declared_root = Path(str(manifest.get("root", ".")))
-    root = declared_root if declared_root.is_absolute() else path.parent / declared_root
-    if not root.is_dir() and declared_root.is_dir():
-        root = declared_root
-    tables = []
-    for table in _objects(manifest.get("tables")):
-        schema_path = root / table["schema_file"]
-        rows_path = root / table["rows_file"]
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        tables.append({**schema, "table_name": table["table_name"], "rows": rows})
+    artifacts = data.get("artifacts") if isinstance(data.get("artifacts"), dict) else {}
+    manifest = artifacts.get("data_manifest") if isinstance(artifacts, dict) else None
+    tables: list[dict[str, Any]] = []
+    if isinstance(manifest, dict) and isinstance(manifest.get("tables"), list):
+        root = _manifest_root(path.parent, manifest)
+        try:
+            from .sandbox_runtime import EpisodeStore, ManifestDataStore, SandboxError
+            with tempfile.TemporaryDirectory(prefix="envfactory-quality-") as directory:
+                store = ManifestDataStore(
+                    manifest, root, EpisodeStore(Path(directory) / "episodes.sqlite3")
+                )
+                tables = [
+                    {**store.schemas[name], "table_name": name, "rows": rows}
+                    for name, rows in store.baseline.items()
+                ]
+                acceptance = data.get("acceptance_contract")
+                fixtures = acceptance.get("fixtures") if isinstance(acceptance, dict) else None
+                declared_hash = fixtures.get("initial_data_hash") if isinstance(fixtures, dict) else None
+                if isinstance(declared_hash, str) and declared_hash != store.data_hash:
+                    raise ValueError(
+                        f"initial_data_hash mismatch: declared={declared_hash} actual={store.data_hash}"
+                    )
+        except (SandboxError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            return _reject(report, f"业务数据不满足共享持久化契约：{exc}")
     if isinstance(data.get("task_spec"), dict):
         from .task_spec import validate_task_spec
         try:
             validate_task_spec(data["task_spec"], data_tables=tables)
         except ValueError as exc:
-            finding = f"任务实际数据不满足 TaskSpec：{exc}"
-            return TaskQualityReport(
-                report.task_id, report.path, report.score, False, "rejected",
-                report.dimensions, report.findings + (finding,), report.training_category,
-                report.agentic_level, report.tool_policy_target, False,
-                report.eligibility_failures + (finding,),
-            )
+            return _reject(report, f"任务实际数据不满足 TaskSpec：{exc}")
     # New write values and runtime $refs need not occur in the initial rows.
     # Their semantics are verified by execution, not field-name membership.
     return report

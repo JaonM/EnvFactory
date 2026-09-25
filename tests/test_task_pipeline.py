@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -5,6 +6,7 @@ from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
+from env_factory.sandbox_runtime import sha256_json
 from env_factory.task_pipeline import PipelineGenerationError, TaskGenerationPipeline
 
 
@@ -26,40 +28,6 @@ class StageRetryTest(unittest.TestCase):
             result = pipeline._call("some_stage", "prompt", {"output": {}})
         self.assertTrue(result["value"])
         sleep.assert_called_once()
-
-    def test_even_turn_limit_is_recorded_as_bounded_completion(self):
-        class FakeLLM:
-            def complete(self, prompt, **kwargs):
-                if "transition_id" in prompt:
-                    return SimpleNamespace(content=json.dumps({
-                        "message": "请继续说明", "transition_id": "continue",
-                    }))
-                return SimpleNamespace(content=json.dumps({"message": "这是回答"}))
-
-        pipeline = TaskGenerationPipeline(
-            FakeLLM(), minimum_dialogue_turns=2, maximum_dialogue_turns=4,
-        )
-        result = pipeline._simulate_dialogue_session(
-            description={"task": "解释概念"},
-            environment={},
-            profile={"profile_id": "profile-1"},
-            script={
-                "script_id": "script-1", "initial_state": "asking",
-                "states": [
-                    {"state_id": "asking", "user_behavior": "继续追问", "terminal": False},
-                    {"state_id": "done", "user_behavior": "结束", "terminal": True},
-                ],
-                "transitions": [
-                    {"transition_id": "continue", "from_state": "asking", "to_state": "asking", "condition": "继续", "should_end": False, "updates": {}},
-                    {"transition_id": "finish", "from_state": "asking", "to_state": "done", "condition": "完成", "should_end": True, "updates": {}},
-                ],
-            },
-            script_id="script-1",
-            session_id="script-1-session-1",
-        )
-        self.assertEqual(result["termination_reason"], "bounded_completion")
-        self.assertTrue(result["user_end_flags"][-1])
-        self.assertEqual(result["turn_count"], 4)
 
     def test_task_description_shape_error_is_retried_with_feedback(self):
         class FakeLLM:
@@ -91,28 +59,6 @@ class StageRetryTest(unittest.TestCase):
         self.assertEqual(len(llm.calls), 2)
         self.assertIn("previous_validation_error", llm.calls[1][0])
 
-    def test_user_dialogue_shape_error_is_retried_with_feedback(self):
-        class FakeLLM:
-            def __init__(self):
-                self.calls = []
-
-            def complete(self, prompt, **kwargs):
-                self.calls.append((prompt, kwargs))
-                if len(self.calls) == 1:
-                    return SimpleNamespace(content=json.dumps({"message": "继续说明"}))
-                return SimpleNamespace(content=json.dumps({"message": "现在可以结束了", "transition_id": "finish"}))
-
-        llm = FakeLLM()
-        pipeline = TaskGenerationPipeline(llm, retries=2)
-        result = pipeline._call(
-            "dialogue_sessions.script-1-session-1.user.1",
-            "模拟用户",
-            {"output": {"message": "string", "transition_id": "transition-id"}},
-        )
-        self.assertEqual(result["transition_id"], "finish")
-        self.assertEqual(len(llm.calls), 2)
-        self.assertIn("transition_id must be a string", llm.calls[1][0])
-
     def test_table_data_json_error_is_retried_with_compact_rows_contract(self):
         class FakeLLM:
             def __init__(self):
@@ -134,6 +80,38 @@ class StageRetryTest(unittest.TestCase):
         self.assertEqual(result["rows"][0]["name"], "工坊")
         self.assertEqual(len(llm.calls), 2)
         self.assertIn("rows 数组", llm.calls[1][1]["system_prompt"])
+
+
+class PublicInputContractTest(unittest.TestCase):
+    def test_rejects_referenced_but_missing_material(self):
+        description = {
+            "task": "请总结用户提供的产品说明",
+            "context": ["用户已提供产品说明"],
+            "requirements": {"input_modalities": ["text"]},
+        }
+        public_input = TaskGenerationPipeline._normalize_public_input(description)
+        with self.assertRaisesRegex(PipelineGenerationError, "missing the concrete material"):
+            TaskGenerationPipeline._validate_public_input(
+                task_description=description,
+                public_input=public_input,
+                environment_mode="stateless",
+            )
+
+    def test_accepts_concrete_material(self):
+        description = {
+            "task": "请总结以下产品说明",
+            "public_input": {"initial_user_message": "请总结材料", "materials": [{
+                "name": "说明", "mime_type": "text/plain",
+                "content": "鞋底采用天然橡胶，适合室内木地板使用。",
+            }]},
+        }
+        public_input = TaskGenerationPipeline._normalize_public_input(description)
+        TaskGenerationPipeline._validate_public_input(
+            task_description=description,
+            public_input=public_input,
+            environment_mode="stateless",
+        )
+        self.assertEqual(public_input["materials"][0]["name"], "说明")
 
 
 class BusinessDataArtifactsTest(unittest.TestCase):
@@ -184,6 +162,110 @@ class BusinessDataArtifactsTest(unittest.TestCase):
 
 
 class AgentActionContractTest(unittest.TestCase):
+    def test_stateful_task_rejects_deferred_business_truth(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "future user reply"):
+            TaskGenerationPipeline._validate_no_deferred_business_truth({
+                "task": "更新商品记录，新商品编码暂时没想好，请先问我",
+                "requirements": {},
+            }, "modify")
+
+    def test_stateful_task_accepts_authoritative_replacement_value(self):
+        TaskGenerationPipeline._validate_no_deferred_business_truth({
+            "task": "把商品编码更新为 SKU-2026-09",
+            "requirements": {"new_product_code": "SKU-2026-09"},
+        }, "modify")
+
+    def test_stateful_task_ignores_optional_clarification_outside_goal(self):
+        TaskGenerationPipeline._validate_no_deferred_business_truth({
+            "task": "把商品编码更新为 SKU-2026-09",
+            "goal": "记录保存 SKU-2026-09",
+            "requirements": {"presentation": "格式不清时需要向用户询问"},
+        }, "modify")
+
+    def test_goal_tool_coverage_rejects_unasserted_mutation_table(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "no declarative mutation|does not assert"):
+            TaskGenerationPipeline._validate_goal_tool_coverage(
+                semantic_goal={"row_predicates": [{
+                    "table": "notes", "where": {"id": "n1"},
+                    "values": {"name": "correct"}, "count": 1,
+                }]},
+                tool_implementations=[{
+                    "tool_name": "update_export", "operation": "update",
+                    "table": "exports", "changes": {"code": "code"},
+                }],
+            )
+
+    def test_goal_tool_coverage_accepts_asserted_mutation_table(self):
+        TaskGenerationPipeline._validate_goal_tool_coverage(
+            semantic_goal={"row_predicates": [{
+                "table": "exports", "where": {"id": "e1"},
+                "values": {"code": "SKU-2"}, "count": 1,
+            }]},
+            tool_implementations=[{
+                "tool_name": "update_export", "operation": "update",
+                "table": "exports", "changes": {"code": "code"},
+            }],
+        )
+
+    def test_goal_tool_coverage_rejects_goal_without_mutation(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "no declarative mutation"):
+            TaskGenerationPipeline._validate_goal_tool_coverage(
+                semantic_goal={"row_predicates": [{
+                    "table": "inventory", "where": {"id": "i1"},
+                    "values": {"quantity": 3}, "count": 1,
+                }]},
+                tool_implementations=[{
+                    "tool_name": "read_inventory", "operation": "select",
+                    "table": "inventory", "result_field": "records",
+                }],
+            )
+
+    def test_deterministic_stateful_update_compilation(self):
+        tools = [{"function": {
+            "name": "update_inventory", "description": "更新库存数量",
+            "parameters": {"properties": {
+                "item_id": {"type": "string"}, "quantity": {"type": "number"},
+            }},
+        }}]
+        tables = [{"table_name": "inventory", "columns": [
+            {"name": "item_id", "type": "VARCHAR(32)"},
+            {"name": "quantity", "type": "DECIMAL(10,2)"},
+        ]}]
+        result = TaskGenerationPipeline._complete_stateful_tool_implementations(
+            implementations=[], tools=tools, tables=tables,
+            semantic_goal={"row_predicates": [{
+                "table": "inventory", "where": {"item_id": "i1"},
+                "values": {"quantity": 3}, "count": 1,
+            }]},
+        )
+        self.assertEqual(result, [{
+            "tool_name": "update_inventory", "operation": "update",
+            "table": "inventory", "selector": {"item_id": "item_id"},
+            "changes": {"quantity": "quantity"}, "result_field": "records",
+        }])
+
+    def test_deterministic_stateful_update_compiles_unique_parameter_aliases(self):
+        tools = [{"function": {
+            "name": "update_product", "description": "更新商品状态",
+            "parameters": {"properties": {
+                "product_name": {"type": "string"},
+                "new_status": {"type": "string"},
+            }},
+        }}]
+        tables = [{"table_name": "product", "columns": [
+            {"name": "name", "type": "VARCHAR(64)"},
+            {"name": "status", "type": "VARCHAR(32)"},
+        ]}]
+        result = TaskGenerationPipeline._complete_stateful_tool_implementations(
+            implementations=[], tools=tools, tables=tables,
+            semantic_goal={"row_predicates": [{
+                "table": "product", "where": {"name": "A"},
+                "values": {"status": "active"}, "count": 1,
+            }]},
+        )
+        self.assertEqual(result[0]["selector"], {"product_name": "name"})
+        self.assertEqual(result[0]["changes"], {"new_status": "status"})
+
     def test_file_deliverable_detection(self):
         self.assertTrue(TaskGenerationPipeline._requires_file_deliverable({
             "task": "生成可打印的工作坊流程表",
@@ -376,6 +458,56 @@ class AgentActionContractTest(unittest.TestCase):
         self.assertEqual(plan["mode"], "stateless")
         self.assertFalse(plan["requires_business_data"])
 
+    def test_agentic_route_aligns_stateless_query_to_reference_data(self):
+        plan = TaskGenerationPipeline._align_environment_plan_with_route(
+            {"mode": "stateless", "requires_business_data": False,
+             "requires_persistence": False, "reason": "model noise"},
+            route_plan={"environment_operations": [
+                {"action_name": "lookup_record", "purpose": "read hidden fact", "dependencies": []},
+            ]},
+            task_intent="query",
+            supported_modes={"stateless", "reference_data", "stateful"},
+        )
+        self.assertEqual(plan["mode"], "reference_data")
+        self.assertTrue(plan["requires_business_data"])
+        self.assertFalse(plan["requires_persistence"])
+
+    def test_agentic_route_aligns_mutation_to_stateful(self):
+        plan = TaskGenerationPipeline._align_environment_plan_with_route(
+            {"mode": "stateless", "requires_business_data": False,
+             "requires_persistence": False, "reason": "model noise"},
+            route_plan={"environment_operations": [
+                {"action_name": "update_record", "purpose": "persist change", "dependencies": []},
+            ]},
+            task_intent="modify",
+            supported_modes={"stateless", "reference_data", "stateful"},
+        )
+        self.assertEqual(plan["mode"], "stateful")
+        self.assertTrue(plan["requires_persistence"])
+
+    def test_agentic_route_rejects_missing_required_environment_mode(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "route requires environment mode"):
+            TaskGenerationPipeline._align_environment_plan_with_route(
+                {"mode": "stateless", "requires_business_data": False,
+                 "requires_persistence": False, "reason": "model noise"},
+                route_plan={"environment_operations": [
+                    {"action_name": "update_record", "purpose": "persist change", "dependencies": []},
+                ]},
+                task_intent="execute",
+                supported_modes={"stateless", "reference_data"},
+            )
+
+    def test_metric_runtime_semantics_accepts_structured_expected_value(self):
+        TaskGenerationPipeline._validate_metric_runtime_semantics(
+            metrics=[{"id": "outcome", "category": "outcome"}],
+            metric_implementations=[{
+                "metric_id": "outcome", "source": "business_state",
+                "operator": "equals", "expected": {"status": "complete"},
+                "score_mapping": {"pass": 1, "fail": 0},
+            }],
+            noise_tools=[],
+        )
+
     def test_environment_plan_gives_training_plans_reference_evidence(self):
         plan = TaskGenerationPipeline._resolve_environment_plan(
             {"mode": "stateless", "reason": "直接规划"},
@@ -399,19 +531,6 @@ class AgentActionContractTest(unittest.TestCase):
             "低风险任务",
         )
 
-    def test_fixture_conversation_excludes_agent_claims(self):
-        selected = TaskGenerationPipeline._select_fixture_conversation([{
-            "turns": [
-                {"role": "user", "content": "预算 100 元"},
-                {"role": "agent", "content": "产品 A 价格 80 元"},
-                {"role": "user", "content": "优先耐用"},
-            ]
-        }])
-        self.assertEqual(selected, [
-            {"role": "user", "content": "预算 100 元"},
-            {"role": "user", "content": "优先耐用"},
-        ])
-
     def test_task_scope_rejects_chain_of_thought(self):
         with self.assertRaisesRegex(PipelineGenerationError, "chain-of-thought"):
             TaskGenerationPipeline._validate_task_generation_scope(
@@ -434,6 +553,17 @@ class AgentActionContractTest(unittest.TestCase):
         with self.assertRaisesRegex(PipelineGenerationError, "authoritative source"):
             TaskGenerationPipeline._validate_task_generation_scope(
                 {"task": "解释癌症与冠状病毒感染的已知关联"}, graph_context={}
+            )
+
+    def test_task_scope_does_not_treat_ordinary_chemical_fact_as_high_stakes(self):
+        TaskGenerationPipeline._validate_task_generation_scope(
+            {"task": "把乙醇的密度记录整理成表格"}, graph_context={}
+        )
+
+    def test_task_scope_treats_chemical_safety_decision_as_high_stakes(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "authoritative source"):
+            TaskGenerationPipeline._validate_task_generation_scope(
+                {"task": "判断乙醇操作是否安全并给出防护建议"}, graph_context={}
             )
 
     def test_data_environment_gets_a_read_action_fallback(self):
@@ -486,6 +616,19 @@ class AgentActionContractTest(unittest.TestCase):
         for index, script in enumerate(scripts):
             TaskGenerationPipeline._validate_user_script_state_machine(script, index)
 
+    def test_user_simulation_manifest_contains_only_runtime_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = TaskGenerationPipeline._materialize_user_simulation(
+                [{"profile_id": "profile-1"}],
+                [{"script_id": "script-1"}],
+                root,
+            )
+            self.assertEqual(manifest["version"], "3.0")
+            self.assertNotIn("sessions", manifest)
+            self.assertTrue((root / manifest["profiles_file"]).is_file())
+            self.assertTrue((root / manifest["scripts_file"]).is_file())
+
     def test_stateful_baseline_must_preserve_explicit_old_value(self):
         description = {"task": "请把商品场景从“景观建筑”更正为“服装”。"}
         with self.assertRaisesRegex(PipelineGenerationError, "precondition"):
@@ -533,32 +676,6 @@ class AgentActionContractTest(unittest.TestCase):
                     {"transition_id": "finish", "outcome_category": "user_acceptance", "from_state": "clarify", "to_state": "done", "condition": "完成", "should_end": True, "updates": {}},
                 ],
             }, 0)
-
-    def test_dialogue_closure_detection(self):
-        self.assertTrue(TaskGenerationPipeline._looks_like_dialogue_closure("好的，就这样，谢谢！"))
-        self.assertTrue(TaskGenerationPipeline._looks_like_dialogue_closure("确认，结束对话。"))
-        self.assertTrue(TaskGenerationPipeline._looks_like_dialogue_closure("完美，谢谢！"))
-        self.assertFalse(TaskGenerationPipeline._looks_like_dialogue_closure("好的，请继续解释这个问题"))
-
-    def test_success_fixture_conversation_excludes_withdrawn_request(self):
-        withdrawn = {"turns": [
-            {"role": "user", "content": "请帮我整理原文"},
-            {"role": "agent", "content": "请提供原文"},
-            {"role": "user", "content": "今天先不弄了，改天再说"},
-        ]}
-        active = {"turns": [
-            {"role": "user", "content": "请整理这段原文：甲乙丙"},
-            {"role": "agent", "content": "好的"},
-            {"role": "user", "content": "请用 Markdown 表格"},
-        ]}
-        selected = TaskGenerationPipeline._select_fixture_conversation([withdrawn, active])
-        self.assertEqual(selected[-1]["content"], "请用 Markdown 表格")
-
-    def test_success_fixture_conversation_is_empty_when_all_requests_withdrawn(self):
-        selected = TaskGenerationPipeline._select_fixture_conversation([{
-            "turns": [{"role": "user", "content": "先不做了，取消"}],
-        }])
-        self.assertEqual(selected, [])
 
     def test_metric_constraints_must_come_from_task(self):
         metric = {
@@ -610,6 +727,119 @@ class AgentActionContractTest(unittest.TestCase):
         with self.assertRaises(PipelineGenerationError):
             TaskGenerationPipeline._validate_capability_plan(capabilities[:2], actions)
 
+    def test_capability_dependency_aliases_are_canonicalized(self):
+        actions = [
+            {"name": "查询订单", "action_id": "lookup"},
+            {"name": "更新订单"},
+        ]
+        capabilities = [
+            {"action_name": "查询订单", "kind": "environment_operation",
+             "requires_tool": True, "dependencies": [], "reason": "读取状态"},
+            {"action_name": "更新订单", "kind": "environment_operation",
+             "requires_tool": True, "dependencies": ["step_1", "lookup"],
+             "reason": "使用查询结果更新状态"},
+        ]
+        normalized = TaskGenerationPipeline._normalize_capability_dependencies(
+            capabilities, actions=actions
+        )
+        self.assertEqual(normalized[1]["dependencies"], ["查询订单"])
+        TaskGenerationPipeline._validate_capability_plan(
+            normalized,
+            actions,
+            environment_mode="stateful",
+            has_business_data=True,
+            training_category="multi_step_agentic",
+        )
+
+    def test_route_plan_defines_multi_step_environment_chain(self):
+        route_plan = {"environment_operations": [
+            {"action_name": "查询订单", "purpose": "读取订单", "dependencies": []},
+            {"action_name": "更新订单", "purpose": "根据查询结果更新订单",
+             "dependencies": ["查询订单"]},
+        ]}
+        TaskGenerationPipeline._validate_route_plan(
+            route_plan, "multi_step_agentic"
+        )
+        with self.assertRaisesRegex(PipelineGenerationError, "dependent"):
+            TaskGenerationPipeline._validate_route_plan(
+                {"environment_operations": [route_plan["environment_operations"][0]]},
+                "multi_step_agentic",
+            )
+        with self.assertRaisesRegex(PipelineGenerationError, "earlier actions"):
+            TaskGenerationPipeline._validate_route_plan({
+                "environment_operations": [{
+                    "action_name": "更新订单", "purpose": "更新",
+                    "dependencies": ["查询订单"],
+                }]
+            }, "simple_agentic")
+
+    def test_route_plan_is_projected_onto_capabilities(self):
+        route_plan = {"environment_operations": [
+            {"action_name": "查询订单", "purpose": "读取订单", "dependencies": []},
+            {"action_name": "更新订单", "purpose": "更新订单",
+             "dependencies": ["查询订单"]},
+        ]}
+        capabilities = [
+            {"action_name": "查询订单", "kind": "agent_reasoning",
+             "requires_tool": False, "dependencies": [], "reason": "错误分类"},
+            {"action_name": "更新订单", "kind": "agent_reasoning",
+             "requires_tool": False, "dependencies": [], "reason": "错误分类"},
+        ]
+        normalized = TaskGenerationPipeline._apply_route_capability_contract(
+            capabilities, route_plan=route_plan
+        )
+        self.assertTrue(all(item["requires_tool"] for item in normalized))
+        self.assertEqual(normalized[1]["dependencies"], ["查询订单"])
+
+    def test_agentic_route_rejects_task_fully_solved_by_public_input(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "fully solvable from public user input"):
+            TaskGenerationPipeline._validate_route_input_boundary({
+                "task": "基于用户提供的销售数据计算三种价格下的利润",
+                "public_input": {
+                    "initial_user_message": "这是完整销售数据，请计算利润。",
+                    "materials": [{"name": "sales.json", "content": '{"sales": 10}'}],
+                },
+            }, "multi_step_agentic")
+
+    def test_agentic_route_allows_public_identifier_for_private_lookup(self):
+        TaskGenerationPipeline._validate_route_input_boundary({
+            "task": "根据用户给出的订单号查询内部订单记录并更新状态",
+            "public_input": {"initial_user_message": "请处理订单 ORD-1", "materials": []},
+        }, "multi_step_agentic")
+
+    def test_agentic_route_allows_public_material_with_private_catalog_dependency(self):
+        TaskGenerationPipeline._validate_route_input_boundary({
+            "task": "基于用户提供的采购清单匹配内部库存目录",
+            "public_input": {"initial_user_message": "请基于以下提供的清单完成匹配"},
+            "route_plan": {"environment_operations": [{
+                "action_name": "query_internal_inventory",
+                "purpose": "查询内部库存数据库",
+                "dependencies": [],
+            }]},
+        }, "multi_step_agentic")
+
+    def test_route_actions_must_be_preserved_by_decomposition(self):
+        with self.assertRaisesRegex(PipelineGenerationError, "更新订单"):
+            TaskGenerationPipeline._validate_route_action_coverage(
+                [{"name": "查询订单"}],
+                route_plan={"environment_operations": [
+                    {"action_name": "查询订单"}, {"action_name": "更新订单"},
+                ]},
+            )
+
+    def test_unknown_capability_dependency_is_not_silently_discarded(self):
+        actions = [{"name": "查询订单"}]
+        capabilities = [{
+            "action_name": "查询订单", "kind": "environment_operation",
+            "requires_tool": True, "dependencies": ["invented-step"],
+            "reason": "读取状态",
+        }]
+        normalized = TaskGenerationPipeline._normalize_capability_dependencies(
+            capabilities, actions=actions
+        )
+        with self.assertRaisesRegex(PipelineGenerationError, "known action names"):
+            TaskGenerationPipeline._validate_capability_plan(normalized, actions)
+
     def test_data_backed_capability_plan_requires_data_access_tool(self):
         actions = [{"name": "读取面粉属性"}, {"name": "生成回答"}]
         capabilities = [
@@ -641,16 +871,11 @@ class AgentActionContractTest(unittest.TestCase):
                 "issues": ["要求替换时价，但没有提供权威价格"],
             })
 
-    def test_task_description_consistency_rejects_cross_task_list_contract(self):
-        with self.assertRaisesRegex(PipelineGenerationError, "different deliverable"):
-            TaskGenerationPipeline._validate_task_description_consistency({
-                "task": "给出红豆薏米水的煎煮步骤、火候和时间",
-                "requirements": {
-                    "categories": ["蔬菜", "主食"],
-                    "sort_within_category": "按拼音排序",
-                    "output_format": "购物清单",
-                },
-            })
+    def test_recipe_shopping_list_is_not_a_domain_conflict(self):
+        TaskGenerationPipeline._validate_task_description_consistency({
+            "task": "按食谱生成采购购物清单",
+            "requirements": {"categories": ["食材"], "output_format": "购物清单"},
+        })
 
     def test_task_description_consistency_accepts_matching_list_contract(self):
         TaskGenerationPipeline._validate_task_description_consistency({
@@ -661,16 +886,11 @@ class AgentActionContractTest(unittest.TestCase):
             },
         })
 
-    def test_task_description_consistency_rejects_coding_activity_contract(self):
-        with self.assertRaisesRegex(PipelineGenerationError, "event activity contract"):
-            TaskGenerationPipeline._validate_task_description_consistency({
-                "task": "制定癌细胞模型的代码实现计划",
-                "requirements": {
-                    "deliverable": "活动方案文档",
-                    "platform": "通用视频会议工具",
-                    "include": ["参与规则", "人员分工"],
-                },
-            })
+    def test_coding_event_management_is_allowed(self):
+        TaskGenerationPipeline._validate_task_description_consistency({
+            "task": "编写视频会议日程管理脚本",
+            "requirements": {"input": "活动方案和人员分工", "output": "日程"},
+        })
 
     def test_action_alignment_audit_rejects_cross_task_drift(self):
         with self.assertRaisesRegex(PipelineGenerationError, "not task-aligned"):
@@ -697,16 +917,11 @@ class AgentActionContractTest(unittest.TestCase):
                 keywords=["美国东岸"],
             )
 
-    def test_action_grounding_rejects_partial_match_with_imported_domain(self):
-        with self.assertRaisesRegex(PipelineGenerationError, "cross-task domain"):
-            TaskGenerationPipeline._validate_action_grounding(
-                [
-                    {"name": "识别维生素D学习目标", "description": "确认学习范围"},
-                    {"name": "设计场地布置", "description": "安排活动场地布置和宣传方式"},
-                ],
-                task_description={"task": "制定维生素D基础信息学习计划"},
-                keywords=["维生素D"],
-            )
+    def test_related_action_concepts_need_not_be_literal_in_task(self):
+        TaskGenerationPipeline._validate_action_grounding(
+            [{"name": "设计活动场地布置", "description": "为读书活动安排场地布置和宣传方式"}],
+            task_description={"task": "组织读书活动"}, keywords=["读书活动"],
+        )
 
     def test_action_grounding_does_not_accept_keyword_echo_in_inputs(self):
         with self.assertRaisesRegex(PipelineGenerationError, "task-specific keyword"):
@@ -747,37 +962,32 @@ class AgentActionContractTest(unittest.TestCase):
                 keywords=["襟边"],
             )
 
-    def test_task_description_rejects_cross_domain_requirements(self):
-        with self.assertRaisesRegex(PipelineGenerationError, "different business domains"):
-            TaskGenerationPipeline._validate_task_description_consistency({
-                "task": "模拟记录手脚颤抖症状的程序",
-                "requirements": {
-                    "input_format": "商品名称、单价和月销量",
-                    "output_format": "输出折扣率和总收入",
-                },
-            })
+    def test_cross_domain_requirements_are_left_to_semantic_audit(self):
+        TaskGenerationPipeline._validate_task_description_consistency({
+            "task": "制作食品冷藏设备监控程序",
+            "requirements": {"input_format": "食材保鲜条件与设备日志", "output_format": "告警"},
+        })
 
-    def test_task_description_rejects_ungrounded_mandarin_stress_labels(self):
-        with self.assertRaisesRegex(PipelineGenerationError, "explicit rule"):
-            TaskGenerationPipeline._validate_task_description_consistency({
-                "task": "按普通话读音拆成音节并标出主重音和次重音",
-                "requirements": {"output_format": "Markdown表格"},
-            })
+    def test_grounding_evidence_is_required_independently_of_domain(self):
+        for issue in ("分类规则缺失", "价格来源缺失", "状态变更目标缺失"):
+            with self.assertRaisesRegex(PipelineGenerationError, "not grounded"):
+                TaskGenerationPipeline._validate_task_grounding_audit({
+                    "self_contained": False, "no_unprovided_facts": False,
+                    "expected_result_derivable": False, "internally_consistent": True,
+                    "issues": [issue],
+                })
 
-    def test_task_description_rejects_absurd_cross_domain_comparison(self):
-        with self.assertRaisesRegex(PipelineGenerationError, "unrelated food and architecture"):
-            TaskGenerationPipeline._validate_task_description_consistency({
-                "task_intent": "compare",
-                "task": "比较火腿罐头和城市街墙界面的地方特产呈现方式",
-                "requirements": {},
-            })
+    def test_cross_domain_comparison_is_not_rejected_by_keywords(self):
+        TaskGenerationPipeline._validate_task_description_consistency({
+            "task_intent": "compare",
+            "task": "比较地方食材包装和城市建筑中的相同纹样",
+            "requirements": {"input": "用户提供的纹样描述", "criteria": "按相同分类规则比较"},
+        })
 
-    def test_task_description_requires_visible_candidate_input(self):
-        with self.assertRaisesRegex(PipelineGenerationError, "candidate list"):
-            TaskGenerationPipeline._validate_task_description_consistency({
-                "task": "推荐三本适合普通读者的书",
-                "requirements": {"candidate_list_required": True},
-            })
+    def test_task_description_structure_remains_validated(self):
+        for value in (None, {"task": ""}, {"task": "选择候选项", "requirements": []}):
+            with self.assertRaises(PipelineGenerationError):
+                TaskGenerationPipeline._validate_task_description_consistency(value)
 
     def test_reasoning_request_is_normalized_to_concise_rationale(self):
         normalized = TaskGenerationPipeline._normalize_reasoning_request({
@@ -789,10 +999,8 @@ class AgentActionContractTest(unittest.TestCase):
         self.assertNotIn("推理过程", text)
         self.assertNotIn("show your reasoning", text)
 
-    def test_deterministic_diagnose_fallback_is_concrete(self):
-        task = TaskGenerationPipeline._deterministic_low_risk_task("diagnose")
-        self.assertIn("故障现象", task["task"])
-        self.assertIn("验证步骤", task["task"])
+    def test_no_fixed_topic_fallback_is_exposed(self):
+        self.assertFalse(hasattr(TaskGenerationPipeline, "_deterministic_low_risk_task"))
 
     def test_executable_scenario_accepts_null_capture_as_empty(self):
         TaskGenerationPipeline._validate_executable_scenarios(
@@ -949,11 +1157,20 @@ class AgentActionContractTest(unittest.TestCase):
         )
         self.assertEqual([item["id"] for item in retained], ["valid"])
 
-    def test_deterministic_low_risk_task_preserves_intent(self):
-        task = TaskGenerationPipeline._deterministic_low_risk_task("calculate")
-        self.assertEqual(task["task_intent"], "calculate")
-        self.assertIn("用户提供", task["task"])
-        TaskGenerationPipeline._validate_task_generation_scope(task, graph_context={})
+    def test_exhausted_grounding_is_not_replaced_with_a_template(self):
+        pipeline = TaskGenerationPipeline(SimpleNamespace(), retries=1)
+        description = {"task": "按未提供的规则分类输入记录", "task_intent": "classify",
+                       "complexity": "simple", "requirements": {},
+                       "route_plan": {"environment_operations": []}}
+        audit = {"self_contained": False, "no_unprovided_facts": False,
+                 "expected_result_derivable": False, "internally_consistent": True,
+                 "issues": ["分类规则缺失"]}
+        with patch.object(pipeline, "_call", side_effect=[description, audit]) as call:
+            with self.assertRaisesRegex(PipelineGenerationError, "not grounded"):
+                pipeline.generate(keywords=["记录"], task_type="QA", style="standard",
+                                  task_intent="classify", graph_context={}, training_category="direct_response")
+        self.assertEqual([args.args[0] for args in call.call_args_list],
+                         ["task_description", "task_description_grounding_audit"])
 
     def test_reference_data_outcome_is_normalized_to_response_judge(self):
         metrics = [{
@@ -1086,6 +1303,23 @@ class OpenAIToolArtifactTest(unittest.TestCase):
         }
         TaskGenerationPipeline._validate_noise_tool_safety([tool])
 
+    def test_schema_derived_noise_fixture_maps_every_parameter(self):
+        rows, mapping = TaskGenerationPipeline._build_noise_fixture({
+            "name": "lookup_unrelated_catalog",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "查询词"},
+                    "limit": {"type": "integer", "description": "数量"},
+                },
+                "required": ["query"],
+            },
+        })
+        self.assertEqual(mapping, {"query": "query", "limit": "limit"})
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(set(mapping.values()) <= set(row) for row in rows))
+        self.assertNotEqual(rows[0]["query"], rows[1]["query"])
+
     def test_noise_tool_description_cannot_hide_external_side_effect(self):
         tool = {
             "type": "function",
@@ -1098,13 +1332,8 @@ class OpenAIToolArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(PipelineGenerationError, "side effect"):
             TaskGenerationPipeline._validate_noise_tool_safety([tool])
 
-    def test_fallback_noise_tool_avoids_business_tool_name_collision(self):
-        tool, metadata = TaskGenerationPipeline._fallback_noise_tool(
-            occupied_names={"roll_virtual_die"}
-        )
-        self.assertEqual(tool["function"]["name"], "roll_virtual_die_2")
-        self.assertEqual(metadata["name"], "roll_virtual_die_2")
-        TaskGenerationPipeline._validate_tools([tool])
+    def test_noise_has_no_fixed_dice_fallback(self):
+        self.assertFalse(hasattr(TaskGenerationPipeline, "_fallback_noise_tool"))
 
     def test_placeholder_tool_name_is_rejected(self):
         tool = {
@@ -1166,6 +1395,11 @@ class OpenAIToolArtifactTest(unittest.TestCase):
         with self.assertRaises(PipelineGenerationError):
             TaskGenerationPipeline._validate_tool_implementations(
                 [dict(specs[0], table="missing")], tools=tools, tables=tables
+            )
+        with self.assertRaises(PipelineGenerationError):
+            TaskGenerationPipeline._validate_tool_implementations(
+                [dict(specs[0], projection=[{"column": "id"}])],
+                tools=tools, tables=tables,
             )
 
     def test_materialize_tools_writes_only_standard_tool_array(self):
@@ -1385,6 +1619,66 @@ class RewardContractTest(unittest.TestCase):
             tools=tools, noise_tools=[], training_category="multi_step_agentic",
         )
 
+    def test_success_scenario_must_cover_each_state_goal_predicate(self):
+        goal = {"row_predicates": [
+            {"table": "notes", "where": {"id": "n1"}, "values": {"label": "a"}, "count": 1},
+            {"table": "notes", "where": {"id": "n2"}, "values": {"label": "b"}, "count": 1},
+        ]}
+        implementations = [{
+            "tool_name": "update_note", "operation": "update", "table": "notes",
+            "selector": {"id": "id"}, "changes": {"label": "label"},
+        }]
+        scenario = {"steps": [
+            {"operation": "tool_call", "tool_name": "update_note",
+             "arguments": {"id": "n1", "label": "a"}},
+        ]}
+        with self.assertRaisesRegex(PipelineGenerationError, r"row_predicates\[1\]"):
+            TaskGenerationPipeline._validate_success_scenario_goal_coverage(
+                scenario, semantic_goal=goal, tool_implementations=implementations,
+            )
+        scenario["steps"].append({
+            "operation": "tool_call", "tool_name": "update_note",
+            "arguments": {"id": "n2", "label": "b"},
+        })
+        TaskGenerationPipeline._validate_success_scenario_goal_coverage(
+            scenario, semantic_goal=goal, tool_implementations=implementations,
+        )
+
+    def test_declarative_business_tool_must_consume_every_public_parameter(self):
+        tool = {"type": "function", "function": {
+            "name": "query_notes", "description": "查询笔记", "parameters": {
+                "type": "object", "properties": {
+                    "category": {"type": "string"},
+                    "columns": {"type": "array", "items": {"type": "string"}},
+                }, "required": ["category", "columns"],
+            },
+        }}
+        spec = {"tool_name": "query_notes", "operation": "select", "table": "notes",
+                "filters": [{"argument": "category", "column": "category", "operator": "eq"}],
+                "projection": ["id"], "result_field": "records"}
+        with self.assertRaisesRegex(PipelineGenerationError, "ignored"):
+            TaskGenerationPipeline._validate_business_tool_semantics(
+                tools=[tool], implementations=[spec],
+            )
+        tool["function"]["parameters"]["properties"].pop("columns")
+        tool["function"]["parameters"]["required"].remove("columns")
+        TaskGenerationPipeline._validate_business_tool_semantics(
+            tools=[tool], implementations=[spec],
+        )
+
+    def test_plain_select_cannot_claim_calculation_semantics(self):
+        tool = {"type": "function", "function": {
+            "name": "calculate_average", "description": "计算平均值", "parameters": {
+                "type": "object", "properties": {}, "required": [],
+            },
+        }}
+        spec = {"tool_name": "calculate_average", "operation": "select", "table": "values",
+                "filters": [], "projection": ["value"], "result_field": "records"}
+        with self.assertRaisesRegex(PipelineGenerationError, "overclaims"):
+            TaskGenerationPipeline._validate_business_tool_semantics(
+                tools=[tool], implementations=[spec],
+            )
+
     def test_executable_scenario_identity_is_normalized(self):
         scenarios = TaskGenerationPipeline._normalize_executable_scenarios([
             {"scenario_id": "runtime_reset_replay", "steps": []},
@@ -1415,6 +1709,47 @@ class RewardContractTest(unittest.TestCase):
         success = next(item for item in scenarios if item["kind"] == "goal_success")
         self.assertIn("agent_response", [step["operation"] for step in success["steps"]])
 
+    def test_deterministic_baseline_expands_mutations_for_each_goal_row(self):
+        tools = [
+            {"type": "function", "function": {
+                "name": "query_notes", "description": "查询", "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                },
+            }},
+            {"type": "function", "function": {
+                "name": "update_note", "description": "更新", "parameters": {
+                    "type": "object", "properties": {
+                        "id": {"type": "string"}, "label": {"type": "string"},
+                    }, "required": ["id", "label"],
+                },
+            }},
+        ]
+        implementations = [
+            {"tool_name": "query_notes", "operation": "select", "table": "notes",
+             "projection": ["id", "label"], "result_field": "records"},
+            {"tool_name": "update_note", "operation": "update", "table": "notes",
+             "selector": {"id": "id"}, "changes": {"label": "label"},
+             "result_field": "records"},
+        ]
+        goal = {"row_predicates": [
+            {"table": "notes", "where": {"id": "n1"}, "values": {"label": "a"}, "count": 1},
+            {"table": "notes", "where": {"id": "n2"}, "values": {"label": "b"}, "count": 1},
+        ]}
+        scenarios = TaskGenerationPipeline._build_business_scenario_baseline(
+            task_description={"expected_result": "更新完成"}, tools=tools,
+            noise_tools=[], tool_implementations=implementations,
+            semantic_goal=goal, training_category="multi_step_agentic",
+        )
+        success = next(item for item in scenarios if item["kind"] == "goal_success")
+        updates = [step for step in success["steps"] if step.get("tool_name") == "update_note"]
+        self.assertEqual(len(updates), 2)
+        self.assertEqual(updates[1]["arguments"], {"id": "n2", "label": "b"})
+        TaskGenerationPipeline._validate_executable_scenarios(
+            scenarios, tools=tools, noise_tools=[],
+            training_category="multi_step_agentic",
+            tool_implementations=implementations, semantic_goal=goal,
+        )
+
     def test_business_scenario_fixture_uses_real_rows_and_nonempty_arrays(self):
         schema = {
             "type": "object",
@@ -1443,6 +1778,94 @@ class RewardContractTest(unittest.TestCase):
         self.assertEqual(arguments["reference_data"], "material_category")
         TaskGenerationPipeline._validate_executable_scenarios(
             scenarios, tools=tools, noise_tools=[]
+        )
+
+    def test_business_scenario_argument_repair_uses_validated_fixture_values(self):
+        tools = [{"type": "function", "function": {
+            "name": "lookup", "description": "查询", "parameters": {
+                "type": "object", "properties": {
+                    "summary_id": {"type": "string"},
+                    "topics": {"type": "array", "items": {"type": "string"}},
+                }, "required": ["summary_id", "topics"],
+                "additionalProperties": False,
+            },
+        }}]
+        baseline = TaskGenerationPipeline._build_business_scenario_baseline(
+            task_description={"expected_result": "完成查询"}, tools=tools,
+            noise_tools=[], data_tables=[{
+                "table_name": "summary",
+                "rows": [{"summary_id": "summary-1", "topic": "出口统计"}],
+            }],
+        )
+        repaired = TaskGenerationPipeline._repair_business_scenario_arguments(
+            [{"kind": "goal_success", "steps": [{
+                "operation": "tool_call", "tool_name": "lookup",
+                "arguments": {"summary_id": "", "topics": []},
+            }]}],
+            baseline=baseline, tools=tools,
+        )
+        arguments = repaired[0]["steps"][0]["arguments"]
+        self.assertEqual(arguments["summary_id"], "summary-1")
+        self.assertTrue(arguments["topics"])
+
+    def test_business_scenario_argument_repair_preserves_capture_reference(self):
+        tools = [{"type": "function", "function": {
+            "name": "update", "description": "更新", "parameters": {
+                "type": "object", "properties": {
+                    "record": {"type": "object", "properties": {
+                        "id": {"type": "string"},
+                    }, "required": ["id"]},
+                }, "required": ["record"],
+            },
+        }}]
+        baseline = TaskGenerationPipeline._build_business_scenario_baseline(
+            task_description={"expected_result": "完成更新"}, tools=tools,
+            noise_tools=[],
+        )
+        repaired = TaskGenerationPipeline._repair_business_scenario_arguments(
+            [{"kind": "goal_success", "steps": [{
+                "operation": "tool_call", "tool_name": "update",
+                "arguments": {"record": {"$ref": "selected_record"}},
+            }]}],
+            baseline=baseline, tools=tools,
+        )
+        self.assertEqual(
+            repaired[0]["steps"][0]["arguments"]["record"],
+            {"$ref": "selected_record"},
+        )
+
+    def test_multi_step_baseline_compiles_fixture_backed_dependency(self):
+        tools = [
+            {"type": "function", "function": {
+                "name": "query_summary", "description": "查询摘要", "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                },
+            }},
+            {"type": "function", "function": {
+                "name": "update_summary", "description": "更新摘要", "parameters": {
+                    "type": "object", "properties": {
+                        "summary_id": {"type": "string", "description": "摘要标识"},
+                    }, "required": ["summary_id"],
+                },
+            }},
+        ]
+        scenarios = TaskGenerationPipeline._build_business_scenario_baseline(
+            task_description={"expected_result": "完成更新"}, tools=tools,
+            noise_tools=[], training_category="multi_step_agentic",
+            tool_implementations=[{
+                "tool_name": "query_summary", "operation": "select",
+                "result_field": "records", "projection": ["summary_id"],
+            }],
+        )
+        success = next(item for item in scenarios if item["kind"] == "goal_success")
+        calls = [step for step in success["steps"] if step["operation"] == "tool_call"]
+        self.assertEqual(calls[0]["capture"], {"upstream_summary_id": "$.records[0].summary_id"})
+        self.assertEqual(
+            calls[1]["arguments"]["summary_id"], {"$ref": "upstream_summary_id"}
+        )
+        TaskGenerationPipeline._validate_executable_scenarios(
+            scenarios, tools=tools, noise_tools=[],
+            training_category="multi_step_agentic",
         )
 
     def test_goal_success_rejects_empty_required_array_and_placeholder(self):
@@ -1483,6 +1906,67 @@ class RewardContractTest(unittest.TestCase):
             TaskGenerationPipeline._validate_metric_implementations(
                 [dict(specs[0], operator="python_eval")], metrics
             )
+
+    def test_process_metric_compiles_from_success_scenario(self):
+        metrics = [{
+            "id": "write", "category": "process", "type": "hybrid",
+            "score_range": [0, 1], "target_action": "save_item",
+            "evaluator": {"kind": "hybrid_tool_call"},
+        }]
+        scenarios = [{
+            "kind": "goal_success", "steps": [
+                {"operation": "tool_call", "tool_name": "find_item", "arguments": {},
+                 "capture": {"item_id": "$.records[0].id"}},
+                {"operation": "tool_call", "tool_name": "update_item",
+                 "arguments": {"id": {"$ref": "item_id"}, "quantity": 5}},
+            ],
+        }]
+        specs = TaskGenerationPipeline._compile_process_metric_implementations(
+            metrics=metrics,
+            metric_implementations=[],
+            business_scenarios=scenarios,
+            tool_bindings=[{"action_name": "save_item", "tool_name": "update_item"}],
+        )
+        self.assertEqual(specs[0]["operator"], "contains_tool_call")
+        self.assertEqual(specs[0]["expected"]["arguments"]["id"], {"$ref": "item_id"})
+        self.assertEqual(specs[0]["expected"]["captures"], [{
+            "name": "item_id", "tool_name": "find_item", "path": "$.records[0].id",
+        }])
+        TaskGenerationPipeline._validate_metric_implementations(
+            specs, metrics, require_process=True
+        )
+
+    def test_process_metric_requires_success_call(self):
+        metrics = [{
+            "id": "write", "category": "process", "type": "hybrid",
+            "score_range": [0, 1], "target_action": "save_item",
+            "evaluator": {"kind": "hybrid_tool_call"},
+        }]
+        with self.assertRaisesRegex(PipelineGenerationError, "no matching success tool call"):
+            TaskGenerationPipeline._compile_process_metric_implementations(
+                metrics=metrics, metric_implementations=[],
+                business_scenarios=[{"kind": "goal_success", "steps": []}],
+                tool_bindings=[{"action_name": "save_item", "tool_name": "update_item"}],
+            )
+
+    def test_compiled_process_metric_declares_runtime_rule(self):
+        metrics = [{
+            "id": "write", "category": "process", "type": "hybrid",
+            "target_action": "save_item", "evaluation_inputs": ["tool_call"],
+            "criteria": ["exact"],
+            "evaluator": {"kind": "hybrid_tool_call", "source": "external_llm"},
+        }]
+        specs = [{
+            "metric_id": "write", "source": "trajectory", "path": "$.events",
+            "operator": "contains_tool_call",
+            "expected": {"tool_name": "update_item", "arguments": {"id": 1}, "captures": []},
+            "score_mapping": {"pass": 1, "fail": 0},
+        }]
+        TaskGenerationPipeline._normalize_compiled_process_metrics(metrics, specs)
+        self.assertEqual(metrics[0]["type"], "rule-based")
+        self.assertEqual(metrics[0]["evaluator"]["kind"], "trajectory_rule")
+        self.assertEqual(metrics[0]["evaluator"]["source"], "runtime_rule")
+        self.assertNotIn("evaluation_inputs", metrics[0])
 
     def test_raw_final_agent_response_cannot_use_synthetic_object_path(self):
         metrics = [{"id": "count", "type": "rule-based", "score_range": [0, 1]}]
@@ -1544,14 +2028,6 @@ class RewardContractTest(unittest.TestCase):
         self.assertEqual(schema["properties"]["final_agent_response"]["type"], "string")
         self.assertEqual(schema["properties"]["public_observation"]["type"], "object")
 
-    def test_fixture_conversation_prefers_rich_user_input(self):
-        sessions = [
-            {"turns": [{"role": "user", "content": "改一下菜单"}]},
-            {"turns": [{"role": "user", "content": "红烧肉68元，清蒸鲈鱼时价，请保持菜品不变"}]},
-        ]
-        selected = TaskGenerationPipeline._select_fixture_conversation(sessions)
-        self.assertIn("红烧肉68元", selected[0]["content"])
-
     def test_noise_penalty_removes_duplicate_nested_noise_reference(self):
         metrics = [{
             "id": "penalty_irrelevant_tool_use", "category": "penalty",
@@ -1579,6 +2055,72 @@ class RewardContractTest(unittest.TestCase):
         cases = {item["case_id"]: item for item in contract["reward_cases"]}
         self.assertEqual(cases["penalty.pass"]["expected_score"], 0)
         self.assertEqual(cases["penalty.fail"]["expected_score"], -1)
+
+    def test_acceptance_initial_data_hash_matches_runtime_manifest_hash(self):
+        tables = [{
+            "table_name": "items",
+            "columns": [{"name": "id", "type": "INTEGER"}],
+            "rows": [{"id": 1}],
+        }]
+        contract = TaskGenerationPipeline._build_acceptance_contract(
+            task_description={"task": "test"}, data_manifest={}, data_tables=tables,
+            actions=[], tools=[], key_steps=[], metrics=[], reward_formula={},
+        )
+        self.assertEqual(
+            contract["fixtures"]["initial_data_hash"],
+            sha256_json({"items": [{"id": 1}]}),
+        )
+
+    def test_acceptance_empty_data_hash_matches_stateless_runtime(self):
+        contract = TaskGenerationPipeline._build_acceptance_contract(
+            task_description={"task": "test"}, data_manifest={}, data_tables=[],
+            actions=[], tools=[], key_steps=[], metrics=[], reward_formula={},
+        )
+        self.assertEqual(contract["fixtures"]["initial_data_hash"], sha256_json({}))
+
+    def test_executable_dependency_rejects_incompatible_projection(self):
+        tools = [
+            {"type": "function", "function": {
+                "name": "read_rows", "parameters": {
+                    "type": "object", "properties": {}, "required": [],
+                },
+            }},
+            {"type": "function", "function": {
+                "name": "consume_rows", "parameters": {
+                    "type": "object",
+                    "properties": {"rows": {
+                        "type": "array", "items": {
+                            "type": "object",
+                            "properties": {"date": {"type": "string"}},
+                            "required": ["date"],
+                        },
+                    }},
+                    "required": ["rows"],
+                },
+            }},
+        ]
+        scenarios = [{
+            "scenario_id": "success", "kind": "goal_success",
+            "steps": [
+                {"operation": "tool_call", "tool_name": "read_rows", "arguments": {},
+                 "capture": {"rows": "$.records"}},
+                {"operation": "tool_call", "tool_name": "consume_rows",
+                 "arguments": {"rows": {"$ref": "rows"}}},
+                {"operation": "agent_response", "content": "done"},
+                {"operation": "reward"},
+            ],
+            "assertions": [{"path": "$.reward", "operator": "gte", "expected": 0.6}],
+        }]
+        implementations = [{
+            "tool_name": "read_rows", "operation": "select", "table": "records",
+            "result_field": "records", "projection": ["observation_date"],
+        }]
+        with self.assertRaisesRegex(PipelineGenerationError, "misses projected fields.*date"):
+            TaskGenerationPipeline._validate_executable_scenarios(
+                scenarios, tools=tools, noise_tools=[],
+                training_category="multi_step_agentic",
+                tool_implementations=implementations,
+            )
 
     def test_acceptance_rejects_reversed_penalty_case(self):
         metrics = [{
@@ -1616,6 +2158,77 @@ class RewardContractTest(unittest.TestCase):
         normalized = TaskGenerationPipeline._normalize_metric_types(metrics)
         self.assertEqual(normalized[0]["type"], "rule-based")
 
+    def test_relational_data_rejects_missing_foreign_rows(self):
+        tables = [
+            {"table_name": "users", "columns": [{"name": "id"}],
+             "primary_key": ["id"], "rows": [{"id": 1}]},
+            {"table_name": "orders", "columns": [{"name": "id"}, {"name": "user_id"}],
+             "primary_key": ["id"], "foreign_keys": [{
+                 "column": "user_id", "references_table": "users", "references_column": "id",
+             }], "rows": [{"id": 1, "user_id": 2}]},
+        ]
+        with self.assertRaisesRegex(PipelineGenerationError, "missing foreign values"):
+            TaskGenerationPipeline._validate_relational_data(tables)
+
+    def test_relational_data_accepts_valid_foreign_rows(self):
+        tables = [
+            {"table_name": "users", "columns": [{"name": "id"}],
+             "primary_key": ["id"], "rows": [{"id": 1}]},
+            {"table_name": "orders", "columns": [{"name": "id"}, {"name": "user_id"}],
+             "primary_key": ["id"], "foreign_keys": [{
+                 "column": "user_id", "ref_table": "users", "ref_column": "id",
+             }], "rows": [{"id": 1, "user_id": 1}]},
+        ]
+        TaskGenerationPipeline._validate_relational_data(tables)
+
+    def test_relational_data_rejects_natural_language_constraint(self):
+        tables = [{
+            "table_name": "items",
+            "columns": [{"name": "id"}],
+            "primary_key": ["id"],
+            "constraints": ["id 非空且唯一"],
+            "rows": [{"id": 1}],
+        }]
+        with self.assertRaisesRegex(PipelineGenerationError, "unsupported CHECK"):
+            TaskGenerationPipeline._validate_relational_data(tables)
+
+    def test_table_definition_rejects_uncompilable_constraint_before_rows(self):
+        tables = [{
+            "table_name": "items",
+            "columns": [{"name": "id"}, {"name": "name"}],
+            "primary_key": ["id"],
+            "constraints": ["name 唯一且非空"],
+        }]
+        with self.assertRaisesRegex(PipelineGenerationError, "unsupported CHECK"):
+            TaskGenerationPipeline._validate_table_definitions(tables)
+
+    def test_table_definition_requires_runtime_foreign_key_shape(self):
+        tables = [
+            {"table_name": "users", "columns": [{"name": "id"}], "primary_key": ["id"]},
+            {
+                "table_name": "orders",
+                "columns": [{"name": "id"}, {"name": "user_id"}],
+                "primary_key": ["id"],
+                "foreign_keys": [{
+                    "columns": ["user_id"], "references_table": "users",
+                    "references_columns": ["id"],
+                }],
+            },
+        ]
+        with self.assertRaisesRegex(PipelineGenerationError, "invalid foreign key"):
+            TaskGenerationPipeline._validate_table_definitions(tables)
+
+    def test_relational_data_checks_constraint_against_rows(self):
+        tables = [{
+            "table_name": "items",
+            "columns": [{"name": "quantity"}],
+            "primary_key": ["quantity"],
+            "constraints": ["quantity >= 0"],
+            "rows": [{"quantity": -1}],
+        }]
+        with self.assertRaisesRegex(PipelineGenerationError, "violates CHECK"):
+            TaskGenerationPipeline._validate_relational_data(tables)
+
     def test_rule_assertion_is_recovered_from_metric_condition(self):
         metrics = [{
             "id": "business_complete",
@@ -1646,6 +2259,106 @@ class RewardContractTest(unittest.TestCase):
         }]
         normalized = TaskGenerationPipeline._normalize_metric_evaluators(metrics)
         self.assertEqual(normalized[0]["condition"], "completed == true")
+
+    def test_prose_hybrid_outcome_becomes_an_explicit_semantic_judge(self):
+        metrics = [{
+            "id": "outcome", "type": "hybrid", "condition": "combined",
+            "criteria": ["answer is clear"],
+            "evaluator": {
+                "kind": "hybrid_outcome", "source": "external_llm",
+                "rule": {"kind": "business_state_rule", "assertion": "state satisfies target"},
+                "external_llm": {"judge_criteria": "answer is grounded"},
+                "score_mapping": {"rule_pass_and_llm_pass": 1, "rule_fail": 0},
+            },
+        }]
+        metric = TaskGenerationPipeline._normalize_metric_evaluators(metrics)[0]
+        self.assertEqual(metric["type"], "model-based")
+        self.assertEqual(metric["evaluator"]["kind"], "external_llm_judge")
+        self.assertNotIn("condition", metric)
+        self.assertEqual(
+            metric["criteria"],
+            ["answer is clear", "state satisfies target", "answer is grounded"],
+        )
+
+    def test_observation_schema_includes_platform_envelope(self):
+        schema = TaskGenerationPipeline._canonical_observation_schema({
+            "type": "object",
+            "properties": {
+                "conversation": {"type": "object"},
+                "tool_results": {"type": "object"},
+                "custom_hint": {"type": "string"},
+            },
+            "required": ["conversation"],
+            "additionalProperties": False,
+        })
+        self.assertIn("episode_id", schema["properties"])
+        self.assertIn("episode_id", schema["required"])
+        self.assertIn("final_agent_response", schema["required"])
+        self.assertEqual(schema["properties"]["conversation"]["type"], "array")
+        self.assertEqual(schema["properties"]["tool_results"]["type"], "array")
+        self.assertEqual(schema["properties"]["custom_hint"]["type"], "string")
+        self.assertFalse(schema["additionalProperties"])
+
+    def test_dependency_projection_includes_nested_downstream_fields(self):
+        implementations = [{
+            "tool_name": "list_products", "operation": "select", "table": "products",
+            "projection": ["id"], "filters": [], "order_by": [], "result_field": "records",
+        }]
+        tools = [{"type": "function", "function": {
+            "name": "summarize_products", "parameters": {
+                "type": "object", "properties": {"items": {
+                    "type": "array", "items": {"type": "object", "properties": {
+                        "product_name": {"type": "string"}, "origin": {"type": "string"},
+                    }},
+                }},
+            },
+        }}]
+        tables = [{"table_name": "products", "columns": [
+            {"name": "id"}, {"name": "product_name"}, {"name": "origin"}, {"name": "cost"},
+        ]}]
+        completed = TaskGenerationPipeline._complete_dependency_projections(
+            implementations=implementations, tools=tools, tables=tables
+        )
+        self.assertEqual(completed[0]["projection"], ["id", "product_name", "origin"])
+
+    def test_stateful_tool_surface_requires_goal_fields(self):
+        goal = {"row_predicates": [{
+            "table": "items", "where": {"id": "I-1"},
+            "values": {"status": "approved"}, "count": 1,
+        }]}
+        incomplete = [{"type": "function", "function": {
+            "name": "update_item", "description": "更新记录",
+            "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+        }}]
+        with self.assertRaisesRegex(PipelineGenerationError, "compilable mutation parameters"):
+            TaskGenerationPipeline._validate_stateful_tool_surface(
+                incomplete, semantic_goal=goal
+            )
+        complete = copy.deepcopy(incomplete)
+        complete[0]["function"]["parameters"]["properties"]["status"] = {"type": "string"}
+        TaskGenerationPipeline._validate_stateful_tool_surface(
+            complete, semantic_goal=goal
+        )
+
+    def test_unsourced_governance_normalization_does_not_rewrite_medical_task(self):
+        source = {"task": "检查服装出口合规性并参考法规要求", "context": "医疗诊断不可用"}
+        normalized = TaskGenerationPipeline._normalize_unsourced_governance_task(source)
+        self.assertIn("内部规则一致性", normalized["task"])
+        self.assertIn("内部规则要求", normalized["task"])
+        self.assertEqual(normalized["context"], "医疗诊断不可用")
+
+    def test_action_numeric_grounding_ignores_identifier_suffixes(self):
+        TaskGenerationPipeline._validate_action_grounding(
+            [{
+                "name": "lookup_stage_1", "description": "查询服装目录",
+                "inputs": [], "outputs": [], "preconditions": [], "effects": [],
+            }, {
+                "name": "filter_stage_2", "description": "筛选服装记录",
+                "inputs": [], "outputs": [], "preconditions": [], "effects": [],
+            }],
+            task_description={"task": "查询并筛选服装目录"},
+            keywords=["服装"],
+        )
 
     def test_metric_weights_are_normalized_by_sign_group(self):
         metrics = [

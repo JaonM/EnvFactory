@@ -7,6 +7,7 @@ the LLM never writes the final task contract in one call.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -21,38 +22,39 @@ from pathlib import Path
 from typing import Any
 
 from .llm import LLMClient
+from .pipeline_errors import PipelineGenerationError
+from .pipeline_prompts import REWARD_DESIGN_PROMPT, TOOL_DEFINITION_PROMPT
+from .pipeline_stage import (
+    StageExecutor,
+    is_transient_llm_error,
+    normalize_stage_result,
+    validate_stage_result_shape,
+)
 from .stage_cache import StageCache
+from .user_simulation_contract import UserSimulationContractMixin
 
 logger = logging.getLogger(__name__)
-
-NORMAL_DIALOGUE_OUTCOMES = frozenset({
-    "goal_satisfied", "information_required", "user_correction",
-    "user_rejection", "user_acceptance",
-})
-RECOVERY_DIALOGUE_OUTCOMES = frozenset({
-    "agent_off_topic", "agent_premature_completion", "unrecognized",
-})
 
 HIGH_STAKES_MARKERS = (
     "法律", "法规", "法条", "政策文件", "合规", "法律意见",
     "医疗", "诊断", "用药", "食物中毒", "腹痛", "呕吐", "腹泻",
     "肚子不舒服", "手脚颤抖", "震颤", "就医", "疾病", "症状", "癌症", "癌细胞", "器官移植", "移植排斥",
     "mhc", "冠状病毒", "sars", "投资", "证券", "税务", "投资建议",
-    "乙醚", "丙酮", "甲醇", "乙醇", "甲基叔丁基醚", "有机镁化合物", "格氏试剂",
-    "偏三甲苯", "危险溶剂", "替代溶剂", "化学品安全", "萃取操作",
-    "溶剂混合", "混合液体", "体积收缩", "体积膨胀",
     "legal", "regulation", "compliance", "legal advice", "medical",
     "diagnosis", "medication", "food poisoning", "investment",
     "investment advice", "securities", "tax",
 )
 
-CROSS_TASK_DOMAIN_MARKERS = (
-    "候选城市", "选择最优城市", "城市事实", "住宿评分", "团队建设",
-    "团建活动", "场地布置", "宣传方式", "参与人数", "路由器日志",
-    "家庭网络", "断网", "网络故障", "设备现象", "设备日志", "日志记录",
-    "购物清单", "候选地点", "野餐计划", "野餐活动",
-    "生活成本",
+HIGH_STAKES_CHEMICAL_MARKERS = (
+    "乙醚", "丙酮", "甲醇", "乙醇", "甲基叔丁基醚", "有机镁化合物",
+    "格氏试剂", "偏三甲苯", "溶剂", "萃取", "混合液体",
 )
+HIGH_STAKES_CHEMICAL_RISK_MARKERS = (
+    "安全", "危险", "毒性", "暴露", "防护", "替代", "操作", "事故",
+    "收缩", "膨胀", "hazard", "safety", "toxic", "exposure",
+)
+
+
 
 GENERIC_ACTION_NAMES = frozenset({
     "接收并解析用户输入", "识别用户输入", "检查信息完整性", "请求补充信息",
@@ -67,17 +69,7 @@ GENERIC_ACTION_MARKERS = (
 )
 
 
-class PipelineGenerationError(ValueError):
-    """Raised when one pipeline stage cannot produce a valid artifact."""
-
-
-def _json(content: str) -> Any:
-    text = content.strip()
-    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.S | re.I)
-    return json.loads(match.group(1) if match else text)
-
-
-class TaskGenerationPipeline:
+class TaskGenerationPipeline(UserSimulationContractMixin):
     """Generate a complete task through independently validated stages."""
 
     def __init__(
@@ -85,26 +77,17 @@ class TaskGenerationPipeline:
         llm: LLMClient,
         *,
         script_count: int = 3,
-        sessions_per_script: int = 2,
-        minimum_dialogue_turns: int = 4,
-        maximum_dialogue_turns: int = 12,
         retries: int = 3,
         noise_tool_max: int = 3,
     ) -> None:
         if (
             script_count <= 0
-            or sessions_per_script < 2
-            or minimum_dialogue_turns < 2
-            or maximum_dialogue_turns < minimum_dialogue_turns
             or retries <= 0
             or noise_tool_max < 0
         ):
             raise ValueError("invalid pipeline counts or retries")
         self.llm = llm
         self.script_count = script_count
-        self.sessions_per_script = sessions_per_script
-        self.minimum_dialogue_turns = minimum_dialogue_turns
-        self.maximum_dialogue_turns = maximum_dialogue_turns
         self.retries = retries
         self.noise_tool_max = noise_tool_max
         revision = hashlib.sha256(b"".join(
@@ -113,338 +96,38 @@ class TaskGenerationPipeline:
         provider_hash = hashlib.sha256(str(getattr(llm, "base_url", "")).encode()).hexdigest()
         self.stage_cache = StageCache(os.getenv("ENVFACTORY_STAGE_CACHE_DIR"), revision=revision,
                                       model=str(getattr(llm, "model", "unknown")) + ":" + provider_hash)
+        self.stage_executor = StageExecutor(
+            llm,
+            retries=retries,
+            cache=self.stage_cache,
+            logger=logger,
+            error_type=PipelineGenerationError,
+        )
 
     def _call(self, stage: str, system: str, payload: dict[str, Any]) -> dict[str, Any]:
-        started = time.perf_counter()
-        cache_key = self.stage_cache.key(stage, system, payload)
-        cached = self.stage_cache.read(cache_key)
-        if cached is not None:
-            self._validate_stage_result_shape(cached, payload=payload)
-            logger.info("pipeline stage cache hit: stage=%s", stage)
-            return cached
-        logger.info("pipeline stage started: stage=%s", stage)
-        last_error: Exception | None = None
-        for attempt in range(1, self.retries + 1):
-            try:
-                effective_system = system
-                if stage.startswith("capability_plan"):
-                    effective_system += (
-                        "\n每个 capability 必须声明 dependencies 数组，元素只能是输入动作原名。"
-                        "这是信息或状态的真实依赖，不是书写顺序。multi_step_agentic 必须具有至少两个环境操作，"
-                        "并明确一个环境操作如何消费前序环境操作产生的信息；其 dependencies 必须引用前序环境动作。"
-                        "推理和最终回答不能用来凑环境依赖。该图与是否给予过程奖励无关。"
-                    )
-                if stage == "agent_actions" or stage.startswith("agent_actions."):
-                    effective_system += (
-                        "\n本阶段的输入隔离规则优先级最高：只允许使用 payload 中的 task_description、"
-                        "business_model 和 environment_plan。business_model 只有实体、表、字段、关系和约束定义，"
-                        "不得索取、猜测或使用业务数据行、数据文档、隐藏真值、内部记录、具体字段值或数据库 ID；"
-                        "如果旧提示提到完整业务环境，以本条输入隔离规则和实际 payload 为准。"
-                    )
-                effective_payload = payload
-                if last_error is not None:
-                    effective_system += (
-                        f"\n上一轮输出未通过本阶段结构校验，具体错误是：{last_error}。"
-                        "请修复该错误，严格按照 output 示例返回完整 JSON 对象；不要返回 output/type 包装对象，"
-                        "不要省略必需字段。"
-                    )
-                    if stage.startswith("environment_table_data."):
-                        effective_system += (
-                            "本阶段只允许返回一个顶层 rows 数组；不要返回 table、columns、schema、"
-                            "markdown 或解释文字。每行必须是 JSON object，所有字符串中的双引号、反斜杠和换行"
-                            "必须正确转义；保持字段简短，避免长篇文本。"
-                        )
-                    effective_payload = dict(payload)
-                    effective_payload["previous_validation_error"] = str(last_error)
-                response = self.llm.complete(
-                    json.dumps(effective_payload, ensure_ascii=False, indent=2),
-                    system_prompt=effective_system + "\n只输出合法 JSON 对象，不要解释。",
-                    thinking=False,
-                    temperature=0.2 if attempt > 1 else 0.5,
-                    max_tokens=(
-                        8_000 if stage.startswith("observations_rewards")
-                        else 8_000 if stage.startswith("environment_table_data.")
-                        else 16_000
-                    ),
-                    response_format="json_object",
-                )
-                if getattr(response, "finish_reason", None) in {"length", "max_tokens"}:
-                    raise ValueError("LLM response was truncated by the token limit")
-                value = _json(response.content)
-                if not isinstance(value, dict):
-                    raise TypeError("stage result must be a JSON object")
-                value = self._normalize_stage_result(value, payload=payload)
-                if stage == "task_description":
-                    task_value = value.get("task")
-                    if not isinstance(task_value, str) or not task_value.strip():
-                        raise ValueError(
-                            "task_description response must contain a non-empty task string"
-                        )
-                    complexity = value.get("complexity")
-                    if complexity not in {"simple", "standard", "complex"}:
-                        raise ValueError(
-                            "task_description.complexity must be simple, standard or complex"
-                        )
-                    expected_intent = payload.get("task_intent")
-                    if expected_intent is not None and value.get("task_intent") != expected_intent:
-                        raise ValueError(
-                            f"task_description.task_intent must be {expected_intent!r}"
-                        )
-                if stage.startswith("environment_table_data."):
-                    rows = value.get("rows")
-                    if not isinstance(rows, list) or not rows:
-                        raise ValueError(
-                            f"{stage} response must contain a non-empty rows array"
-                        )
-                if stage.startswith("dialogue_sessions."):
-                    content = value.get("message") or value.get("content")
-                    if not isinstance(content, str) or not content.strip():
-                        raise ValueError(
-                            f"{stage} response must contain a non-empty message/content string"
-                        )
-                    if ".user." in stage and not isinstance(value.get("transition_id"), str):
-                        raise ValueError(
-                            f"{stage} response transition_id must be a string"
-                        )
-                self._validate_stage_result_shape(value, payload=payload)
-                logger.info(
-                    "pipeline stage completed: stage=%s attempt=%d duration_ms=%.1f result_keys=%s",
-                    stage,
-                    attempt,
-                    (time.perf_counter() - started) * 1000,
-                    sorted(value.keys()),
-                )
-                self.stage_cache.write(cache_key, stage, value)
-                return value
-            except Exception as exc:
-                last_error = exc
-                logger.warning(
-                    "pipeline stage attempt failed: stage=%s attempt=%d/%d duration_ms=%.1f error=%s",
-                    stage,
-                    attempt,
-                    self.retries,
-                    (time.perf_counter() - started) * 1000,
-                    exc,
-                )
-                if attempt < self.retries and self._is_transient_llm_error(exc):
-                    delay = min(8.0, float(2 ** attempt)) + random.uniform(0.0, 0.5)
-                    logger.info(
-                        "transient LLM failure; backing off before retry: stage=%s delay_seconds=%.2f",
-                        stage,
-                        delay,
-                    )
-                    time.sleep(delay)
-        logger.error(
-            "pipeline stage failed: stage=%s attempts=%d duration_ms=%.1f error=%s",
+        return self.stage_executor.call(
             stage,
-            self.retries,
-            (time.perf_counter() - started) * 1000,
-            last_error,
+            system,
+            payload,
+            jitter=random.uniform,
+            sleep=time.sleep,
         )
-        raise PipelineGenerationError(f"stage {stage} failed: {last_error}") from last_error
 
     @staticmethod
     def _normalize_stage_result(
         value: dict[str, Any], *, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        """Normalize common provider envelopes against the declared output example."""
-        expected = payload.get("output")
-        expected_keys = set(expected) if isinstance(expected, dict) else set()
-        current: Any = value
-        for _ in range(4):
-            if not isinstance(current, dict):
-                break
-            if expected_keys and expected_keys.issubset(current):
-                return current
-            nested: Any = None
-            for envelope in ("output", "result", "data"):
-                candidate = current.get(envelope)
-                if isinstance(candidate, str):
-                    try:
-                        candidate = _json(candidate)
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        continue
-                if isinstance(candidate, dict) and (
-                    not expected_keys
-                    or expected_keys.intersection(candidate)
-                    or any(key in candidate for key in ("output", "result", "data"))
-                ):
-                    nested = candidate
-                    break
-            if nested is None:
-                break
-            current = nested
-        return current if isinstance(current, dict) else value
+        return normalize_stage_result(value, payload=payload)
 
     @staticmethod
     def _validate_stage_result_shape(
         value: dict[str, Any], *, payload: dict[str, Any]
     ) -> None:
-        """Fail inside `_call` so shape errors receive feedback and a retry."""
-        expected = payload.get("output")
-        if not isinstance(expected, dict) or not expected:
-            return
-        missing = sorted(key for key in expected if key not in value)
-        if missing:
-            raise ValueError(f"stage response is missing required output fields: {missing}")
-        for key, example in expected.items():
-            actual = value.get(key)
-            if isinstance(example, bool) and not isinstance(actual, bool):
-                raise ValueError(f"stage response field {key!r} must be boolean")
-            if isinstance(example, str) and (
-                not isinstance(actual, str) or not actual.strip()
-            ):
-                raise ValueError(f"stage response field {key!r} must be a non-empty string")
-            if isinstance(example, dict) and not isinstance(actual, dict):
-                raise ValueError(f"stage response field {key!r} must be an object")
-            if isinstance(example, list):
-                if not isinstance(actual, list):
-                    raise ValueError(f"stage response field {key!r} must be an array")
-                required_non_empty_arrays = {
-                    "actions", "user_profiles", "user_scripts", "entities",
-                    "tables", "rows", "capabilities", "metrics", "decisions",
-                }
-                if example and key in required_non_empty_arrays and not actual:
-                    raise ValueError(f"stage response field {key!r} must be a non-empty array")
+        validate_stage_result_shape(value, payload=payload)
 
     @staticmethod
     def _is_transient_llm_error(error: Exception) -> bool:
-        text = str(error).lower()
-        return any(marker in text for marker in (
-            "http 429", "http 502", "http 503", "http 504",
-            "too many requests", "service is too busy", "temporarily unavailable",
-            "timed out", "timeout", "connection reset",
-        ))
-
-    def _simulate_dialogue_session(
-        self,
-        *,
-        description: dict[str, Any],
-        environment: dict[str, Any],
-        profile: Any,
-        script: dict[str, Any],
-        script_id: str,
-        session_id: str,
-    ) -> dict[str, Any]:
-        """Run one seeded-style conversation using separate User and Agent prompts."""
-        started = time.perf_counter()
-        logger.info("dialogue session started: session=%s script=%s", session_id, script_id)
-        turns: list[dict[str, str]] = []
-        termination_reason: str | None = None
-        user_end_flags: list[bool] = []
-        states = {
-            str(item["state_id"]): item for item in script.get("states", [])
-            if isinstance(item, dict) and isinstance(item.get("state_id"), str)
-        }
-        transitions_by_source: dict[str, list[dict[str, Any]]] = {}
-        for transition in script.get("transitions", []):
-            if isinstance(transition, dict):
-                transitions_by_source.setdefault(str(transition.get("from_state")), []).append(transition)
-        current_state = str(script.get("initial_state"))
-        state_trace = [current_state]
-        machine_variables = dict(script.get("variables", {}))
-
-        while len(turns) < self.maximum_dialogue_turns:
-            available_transitions = transitions_by_source.get(current_state, [])
-            if not available_transitions:
-                termination_reason = "user_script_end"
-                break
-            user_result = self._call(
-                f"dialogue_sessions.{session_id}.user.{len(turns) + 1}",
-                "你是 User LLM，只能按照用户画像和用户状态机扮演用户。根据 current_state 的 user_behavior 和当前对话，"
-                "从 available_transitions 中选择且只选择一个 condition 匹配的 transition_id，并生成这一状态下的口语化用户消息。"
-                "不得跳到未列出的状态，不得合并多个 transition，不得替 Agent 完成任务，也不得查看或猜测隐藏真值。"
-                "达到 minimum_turns 前不要选择 should_end=true 的 transition。",
-                {"task_description": description, "user_profile": profile, "user_script": script,
-                 "current_state": states.get(current_state),
-                 "current_variables": machine_variables,
-                 "available_transitions": available_transitions,
-                 "conversation": turns, "minimum_turns": self.minimum_dialogue_turns,
-                 "maximum_turns": self.maximum_dialogue_turns,
-                 "output": {"message": "string", "transition_id": "transition-id"}},
-            )
-            # OpenAI-compatible chat providers commonly call the generated
-            # text `content`; the pipeline contract uses `message`. Accept
-            # both and normalize to the stored conversation format.
-            message = user_result.get("message") or user_result.get("content")
-            if not isinstance(message, str) or not message.strip():
-                raise PipelineGenerationError(f"{session_id} user response must contain message/content")
-            transition_id = user_result.get("transition_id")
-            selected = next(
-                (item for item in available_transitions if item.get("transition_id") == transition_id),
-                None,
-            )
-            if selected is None:
-                eligible = [
-                    item for item in available_transitions
-                    if len(turns) + 1 >= self.minimum_dialogue_turns
-                    or not item.get("should_end")
-                ]
-                selected = (eligible or available_transitions)[0]
-                logger.warning(
-                    "%s selected invalid transition %r from state %s; using %s",
-                    session_id, transition_id, current_state, selected.get("transition_id"),
-                )
-            can_end = len(turns) + 1 >= self.minimum_dialogue_turns
-            should_end = bool(selected.get("should_end")) and can_end
-            turns.append({"role": "user", "content": message.strip()})
-            user_end_flags.append(should_end)
-            if should_end or not selected.get("should_end"):
-                machine_variables.update(selected.get("updates", {}))
-                current_state = str(selected["to_state"])
-                state_trace.append(current_state)
-            if len(turns) >= self.minimum_dialogue_turns and should_end:
-                termination_reason = "user_script_end"
-                break
-            if len(turns) >= self.maximum_dialogue_turns:
-                termination_reason = "max_turns_reached"
-                break
-
-            agent_result = self._call(
-                f"dialogue_sessions.{session_id}.agent.{len(turns) + 1}",
-                "你是 Agent LLM。根据任务描述、公开业务环境数据和当前对话回答用户。不要读取或推断任何用户画像信息；只根据用户在当前对话中明确表达的内容、任务描述和公开业务环境数据作答。不要编造环境中不存在的数据，也不要把用户的话当作业务真值。回答应推进任务、提出必要澄清或给出基于环境数据的结果。不要输出对话终止信号，是否结束只由 User Simulator 根据用户剧本决定。",
-                {"task_description": description, "environment": environment, "conversation": turns,
-                 "minimum_turns": self.minimum_dialogue_turns,
-                 "maximum_turns": self.maximum_dialogue_turns,
-                 "output": {"message": "string"}},
-            )
-            message = agent_result.get("message") or agent_result.get("content")
-            if not isinstance(message, str) or not message.strip():
-                raise PipelineGenerationError(f"{session_id} agent response must contain message/content")
-            turns.append({"role": "agent", "content": message.strip()})
-            if len(turns) >= self.maximum_dialogue_turns:
-                termination_reason = "max_turns_reached"
-                break
-
-        result = {
-            "script_id": script_id,
-            "session_id": session_id,
-            "profile_id": profile.get("profile_id") if isinstance(profile, dict) else None,
-            "turns": turns,
-            "turn_count": len(turns),
-            "user_end_flags": user_end_flags,
-            "state_trace": state_trace,
-            "final_variables": machine_variables,
-            "termination_reason": termination_reason or "max_turns_reached",
-        }
-        # With an even turn limit the final slot is normally an Agent answer,
-        # so the User LLM never gets another turn in which it can emit
-        # should_end=true. Treat that completed request/answer pair as a
-        # bounded completion instead of misclassifying the whole session as a
-        # failed non-converging dialogue. The explicit reason remains
-        # observable to readiness reporting.
-        if result["termination_reason"] == "max_turns_reached" and user_end_flags:
-            user_end_flags[-1] = True
-            result["termination_reason"] = "bounded_completion"
-        logger.info(
-            "dialogue session completed: session=%s script=%s turns=%d termination=%s duration_ms=%.1f",
-            session_id,
-            script_id,
-            len(turns),
-            result["termination_reason"],
-            (time.perf_counter() - started) * 1000,
-        )
-        return result
+        return is_transient_llm_error(error)
 
     @staticmethod
     def _list(value: Any, name: str, *, minimum: int = 1) -> list[Any]:
@@ -462,15 +145,24 @@ class TaskGenerationPipeline:
         graph_context: dict[str, Any],
         artifact_dir: str | Path | None = None,
         training_category: str = "multi_step_agentic",
+        rng: random.Random | None = None,
+        available_environment_modes: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
+        random_source = rng or random
+        supported_modes = set(available_environment_modes or (
+            "stateless", "reference_data", "stateful", "external_capability"
+        ))
+        if not supported_modes or not supported_modes <= {
+            "stateless", "reference_data", "stateful", "external_capability"
+        }:
+            raise PipelineGenerationError("available_environment_modes is invalid")
         pipeline_started = time.perf_counter()
         logger.info(
-            "task pipeline started: task_type=%s style=%s keywords=%d scripts=%d sessions_per_script=%d",
+            "task pipeline started: task_type=%s style=%s keywords=%d scripts=%d",
             task_type,
             style,
             len(keywords),
             self.script_count,
-            self.sessions_per_script,
         )
         intent_rules = {
             "query": "目标是查询、查找或整理已有信息，不生成策划方案",
@@ -521,22 +213,62 @@ class TaskGenerationPipeline:
                 "税务、证券或投资建议设为任务目标；即使关键词涉及这些领域，也必须改写成无需权威"
                 "事实的低风险语言处理任务。"
             )
+        description_output = {
+            "task": "string", "task_intent": task_intent, "goal": "string", "context": [],
+            "public_input": {"initial_user_message": "string", "materials": [{"name": "string", "mime_type": "text/plain|application/json", "content": "string"}]},
+            "route_plan": {"environment_operations": [{"action_name": "string", "purpose": "string", "dependencies": []}]},
+            "expected_result": "string", "complexity": "simple|standard|complex", "requirements": {},
+        }
         description = self._call(
             "task_description",
-            f"根据主题和关键词生成真实用户任务。任务意图已经固定为 {task_intent}：{intent_rules[task_intent]}。必须严格遵循该意图，不得用其他意图替换它。训练路由已经固定为 {training_category}：{category_rules[training_category]} 不得把简单任务机械拆成多个查询，也不得为满足工具数量虚构数据源。若当前关键词不足以形成该路由要求，可以忽略弱相关关键词并围绕最有信息量的关键词设计真实业务场景。必须明确目标、上下文、约束、预期结果和复杂度事实。任务必须能由用户运行时提供的信息、明确声明的业务资料或工具能力完成；不得要求 Agent 猜测价格、成分、属性或排名等未提供事实。修改或验证任务若涉及事实替换，必须在上下文或 requirements 中给出权威替换值或判断规则，或者允许 Agent 向用户澄清。当前 Agent 运行时只能提交自然语言最终回答，不能上传或返回 PDF、PNG、DOCX、XLSX、PPTX 等二进制文件；除非任务明确提供了可执行文件交付能力，否则 output_format 必须是文本、Markdown、JSON 或表格内容，禁止让 Agent 声称已经生成不可验证的文件。只有任务确实需要图片、音频、视频或文件输入时，requirements.input_modalities 才能包含对应媒体类型；否则只使用 text 或 structured_data。{source_safety_hint}",
+            f"根据主题和关键词生成真实用户任务。任务意图已经固定为 {task_intent}：{intent_rules[task_intent]}。必须严格遵循该意图，不得用其他意图替换它。训练路由已经固定为 {training_category}：{category_rules[training_category]} route_plan.environment_operations 是该任务真正必要的环境操作骨架：direct_response 必须为空；simple_agentic 必须恰好一个；multi_step_agentic 至少两个，且后续操作 dependencies 必须引用前序 action_name，表示参数、记录标识或分支条件的真实数据依赖。action_name 必须是具体业务动作，不得把分析、比较、总结或最终回答算作环境操作。题面必须让这些操作成为完成目标的必要条件。当前运行环境只支持 {sorted(supported_modes)}，不得生成依赖其他环境模式的任务；external_capability 不在列表时，禁止要求实时搜索、天气、行情、公共网络查询或未提供的外部计算服务。不得把简单任务机械拆成多个查询，也不得为满足工具数量虚构数据源。若当前关键词不足以形成该路由要求，可以忽略弱相关关键词并围绕最有信息量的关键词设计真实业务场景。必须明确目标、上下文、约束、预期结果和复杂度事实。任务必须能由用户运行时提供的信息、明确声明的业务资料或工具能力完成；不得要求 Agent 猜测价格、成分、属性或排名等未提供事实。public_input 是训练时真实交付给 Agent 的公开输入：initial_user_message 必须是完整请求；任务若提到“以下文本、用户提供的资料、给定数据、附件内容”等输入，必须把实际合成内容逐项放入 materials，不能只写“用户已提供”。业务数据库中的隐藏事实不得复制到 public_input。修改、执行或排程任务若涉及事实替换，必须在 public_input、context 或 requirements 中给出权威替换值或确定性规则；当前任务契约尚不能把未定义的新业务真值推迟到后续 User Simulator 回合，因此禁止“先问我、稍后提供、暂时没想好”等未决关键输入。当前 Agent 运行时只能提交自然语言最终回答，不能上传或返回 PDF、PNG、DOCX、XLSX、PPTX 等二进制文件；除非任务明确提供了可执行文件交付能力，否则 output_format 必须是文本、Markdown、JSON 或表格内容，禁止让 Agent 声称已经生成不可验证的文件。只有任务确实需要图片、音频、视频或文件输入时，requirements.input_modalities 才能包含对应媒体类型；否则只使用 text 或 structured_data。{source_safety_hint}",
             {"keywords": keywords, "task_type": task_type, "style": style, "task_intent": task_intent,
              "training_category": training_category,
-             "graph_context": graph_context,
-             "output": {"task": "string", "task_intent": task_intent, "goal": "string", "context": [], "expected_result": "string", "complexity": "simple|standard|complex", "requirements": {}}},
+             "graph_context": graph_context, "output": description_output},
         )
-        task_desc = description.get("task")
-        if not isinstance(task_desc, str) or not task_desc.strip():
-            raise PipelineGenerationError("task_description.task must be non-empty")
-        returned_intent = description.get("task_intent")
-        if returned_intent is not None and returned_intent != task_intent:
-            raise PipelineGenerationError(
-                f"task_description.task_intent must be {task_intent!r}, got {returned_intent!r}"
-            )
+        route_error: PipelineGenerationError | None = None
+        for route_contract_attempt in range(1, self.retries + 1):
+            try:
+                self._validate_route_plan(description.get("route_plan"), training_category)
+                self._validate_route_input_boundary(description, training_category)
+                self._validate_no_deferred_business_truth(description, task_intent)
+                task_desc = description.get("task")
+                if not isinstance(task_desc, str) or not task_desc.strip():
+                    raise PipelineGenerationError("task_description.task must be non-empty")
+                returned_intent = description.get("task_intent")
+                if returned_intent is not None and returned_intent != task_intent:
+                    raise PipelineGenerationError(
+                        f"task_description.task_intent must be {task_intent!r}, got {returned_intent!r}"
+                    )
+                route_error = None
+                break
+            except PipelineGenerationError as exc:
+                route_error = exc
+                logger.warning(
+                    "task route contract validation failed: attempt=%d/%d error=%s",
+                    route_contract_attempt, self.retries, exc,
+                )
+                if route_contract_attempt >= self.retries:
+                    break
+                repaired = self._call(
+                    "task_description.route_repair",
+                    "只修复任务描述的训练路由契约并返回完整任务描述。必须逐字保持 task_intent；"
+                    "direct_response 的 environment_operations 为空，simple_agentic 恰好一个，"
+                    "multi_step_agentic 至少两个且后序 dependencies 只引用前序唯一 action_name。"
+                    "每个 action_name 必须是非空、唯一、稳定的 snake_case 业务动作名；"
+                    "多步任务至少一个后序动作必须真实依赖前序工具返回的私有业务字段。"
+                    "不得用分析、总结、格式化或最终回答充当环境动作，也不得把私有业务真值复制到 public_input。",
+                    {
+                        "task_description": description,
+                        "training_category": training_category,
+                        "task_intent": task_intent,
+                        "validation_error": str(exc),
+                        "output": description_output,
+                    },
+                )
+                description = self._unwrap_task_description(repaired)
+        if route_error is not None:
+            raise route_error
         grounding_error: PipelineGenerationError | None = None
         for grounding_attempt in range(1, self.retries + 1):
             audit = self._call(
@@ -596,6 +328,11 @@ class TaskGenerationPipeline:
                     raise PipelineGenerationError(
                         "repaired task description is structurally invalid"
                     )
+                self._validate_route_plan(
+                    description.get("route_plan"), training_category
+                )
+                self._validate_route_input_boundary(description, training_category)
+                self._validate_no_deferred_business_truth(description, task_intent)
         if grounding_error is not None:
             if "hidden chain-of-thought" in str(grounding_error):
                 description = self._normalize_reasoning_request(description)
@@ -607,78 +344,33 @@ class TaskGenerationPipeline:
                     grounding_error = None
                 except PipelineGenerationError as exc:
                     grounding_error = exc
-            if grounding_error is not None and not has_source_urls and "high-stakes task requires" in str(grounding_error):
-                logger.warning(
-                    "grounding repair retained a high-stakes target; regenerating an independent low-risk task"
-                )
-                description = self._call(
-                    "task_description.low_risk_fallback",
-                    f"重新生成一个全新的低风险用户任务，保持 task_intent={task_intent}（{intent_rules[task_intent]}），但不要沿用上一版主题或措辞。当前没有权威来源 URL，任务及所有字段中禁止出现或要求医疗、诊断、疾病判断、用药、法律、法规、合规、专利、税务、证券、投资建议。可以忽略会诱发这些主题的关键词。任务必须仅依赖用户明确提供的文本或结构化输入即可完成，并输出完整任务描述对象。",
-                    {
-                        "unsafe_keywords": keywords,
-                        "task_type": task_type,
-                        "style": style,
-                        "task_intent": task_intent,
-                        "output": {
-                            "task": "string", "task_intent": task_intent,
-                            "goal": "string", "context": [],
-                            "expected_result": "string",
-                            "complexity": "simple|standard|complex",
-                            "requirements": {},
-                        },
-                    },
-                )
-                if (
-                    description.get("task_intent") != task_intent
-                    or description.get("complexity") not in {"simple", "standard", "complex"}
-                ):
-                    raise PipelineGenerationError(
-                        "low-risk fallback changed task_intent or returned invalid complexity"
-                    )
+            if (
+                grounding_error is not None
+                and "high-stakes task requires authoritative source URLs" in str(grounding_error)
+                and not has_source_urls
+            ):
+                description = self._normalize_unsourced_governance_task(description)
                 try:
+                    self._validate_task_description_consistency(description)
                     self._validate_task_generation_scope(
                         description, graph_context=graph_context
                     )
-                except PipelineGenerationError:
-                    description = self._deterministic_low_risk_task(task_intent)
-                fallback_audit = self._call(
-                    "task_description.low_risk_fallback_audit",
-                    "审查新任务是否自包含、无需未提供事实、预期结果可从输入推出，且 task、goal、context、expected_result、requirements 的对象和约束完全一致。只返回指定布尔字段和 issues。",
-                    {
-                        "task_description": description,
-                        "output": {
-                            "self_contained": True,
-                            "no_unprovided_facts": True,
-                            "expected_result_derivable": True,
-                            "internally_consistent": True,
-                            "issues": [],
-                        },
-                    },
-                )
-                self._validate_task_grounding_audit(fallback_audit)
-                self._validate_task_description_consistency(description)
-                self._validate_task_generation_scope(
-                    description, graph_context=graph_context
-                )
-                grounding_error = None
-            elif grounding_error is not None:
-                logger.warning(
-                    "grounding repairs exhausted; using deterministic low-risk task: %s",
-                    grounding_error,
-                )
-                description = self._deterministic_low_risk_task(task_intent)
-                self._validate_task_description_consistency(description)
-                self._validate_task_generation_scope(
-                    description, graph_context=graph_context
-                )
-                grounding_error = None
-        # Repairs and low-risk fallback may replace the complete description.
-        # Never assemble the artifact with the pre-repair task/complexity.
+                    grounding_error = None
+                    logger.warning(
+                        "normalized unsourced governance wording to internal business rules"
+                    )
+                except PipelineGenerationError as exc:
+                    grounding_error = exc
+            if grounding_error is not None:
+                raise grounding_error
+        # Repairs must not silently replace failed tasks with unrelated templates.
         task_desc = description["task"]
         complexity = description["complexity"]
         requirements = description.get("requirements")
         if not isinstance(requirements, dict):
             requirements = {"input_modalities": ["text"]}
+        public_input = self._normalize_public_input(description)
+        description["public_input"] = public_input
         input_modalities = requirements.get("input_modalities", ["text"])
         input_media_required = isinstance(input_modalities, list) and any(
             item in {"image", "audio", "video", "file"} for item in input_modalities
@@ -705,10 +397,23 @@ class TaskGenerationPipeline:
                 "requires_persistence": False,
                 "reason": "direct_response curriculum route",
             }
-        elif environment_plan["mode"] == "stateless":
-            raise PipelineGenerationError(
-                f"{training_category} requires a non-stateless environment with a necessary business tool"
+        else:
+            environment_plan = self._align_environment_plan_with_route(
+                environment_plan,
+                route_plan=description["route_plan"],
+                task_intent=task_intent,
+                supported_modes=supported_modes,
             )
+        if environment_plan["mode"] not in supported_modes:
+            raise PipelineGenerationError(
+                "task buildability: environment mode "
+                f"{environment_plan['mode']!r} is unavailable; supported={sorted(supported_modes)}"
+            )
+        self._validate_public_input(
+            task_description=description,
+            public_input=public_input,
+            environment_mode=environment_plan["mode"],
+        )
         self._validate_authoritative_task_input(
             task_description=description,
             environment_mode=environment_plan["mode"],
@@ -736,18 +441,49 @@ class TaskGenerationPipeline:
             self._validate_entities(entity_plan.get("entities"))
 
         # 2b. Design atomic table schemas, without rows yet.
-            table_design = self._call(
-            "environment_table_design",
-            "根据任务描述和最小必要业务实体设计可持久化的原子数据库表。对需要持久化的关系数据遵循第三范式（3NF）：每个表表达一个清晰主题，字段依赖候选键、依赖整个键且不通过非键字段传递依赖；使用主键、外键和必要的关联表表达关系。优先使用最少数量的表完整覆盖任务；只有确有独立生命周期、独立访问需求或必要的一对多/多对多业务关系时才拆表，否则将信息作为字段、枚举、JSON 或文本保存。如果任务要求推荐唯一最佳项、排序、判断是否合规或选择首选项，表结构必须包含足以确定该结论的优先级、适配分数、首选标记、规则结果或理由字段，不能只建立无方向的多对多关联。法律、法规、政策、医疗、投资、税务等权威参考资料必须带 source_url、retrieved_at 和 content_hash 字段，且来源必须可追溯；不得由模型凭空编写权威原文。每张表说明存在必要性，并声明主键、外键、字段类型、可见性、索引和约束。输出表定义。",
-            {"task_description": description, "entities": entity_plan["entities"],
-             "output": {"tables": [{"table_name": "string", "description": "string", "columns": [{"name": "string", "type": "string", "description": "string", "nullable": False}], "primary_key": ["id"], "foreign_keys": [], "indexes": [], "constraints": []}]}},
-        )
-            table_definitions = table_design.get("tables")
-            self._validate_table_definitions(table_definitions)
-            self._validate_authoritative_source_schema(
-                task_description=description,
-                table_definitions=table_definitions,
-            )
+            table_output = {"tables": [{
+                "table_name": "string", "description": "string",
+                "columns": [{"name": "string", "type": "string", "description": "string", "nullable": False}],
+                "primary_key": ["id"],
+                "foreign_keys": [{"column": "parent_id", "ref_table": "parent", "ref_column": "id"}],
+                "indexes": [], "constraints": ["status IN ('active','inactive')"],
+            }]}
+            table_definitions = None
+            table_error: PipelineGenerationError | None = None
+            for table_attempt in range(1, self.retries + 1):
+                repair_hint = ""
+                if table_error is not None:
+                    repair_hint = (
+                        f" 上一版表结构未通过校验：{table_error}。"
+                        "foreign_keys 每项必须使用 column、ref_table、ref_column；"
+                        "唯一性必须使用 unique index，非空必须使用 nullable=false；"
+                        "constraints 只能写可执行 SQL CHECK 表达式，不得写中文说明或‘必须为…之一’。"
+                    )
+                table_design = self._call(
+                    "environment_table_design" if table_attempt == 1 else "environment_table_design.repair",
+                    "根据任务描述和最小必要业务实体设计可持久化的原子数据库表。对需要持久化的关系数据遵循第三范式（3NF）：每个表表达一个清晰主题，字段依赖候选键、依赖整个键且不通过非键字段传递依赖；使用主键、外键和必要的关联表表达关系。外键严格使用 column、ref_table、ref_column；唯一性使用 unique index，非空使用 nullable=false；constraints 只允许 field IN (...) 或 field 与常量的比较表达式，可用 AND 连接，禁止自然语言约束。优先使用最少数量的表完整覆盖任务；只有确有独立生命周期、独立访问需求或必要的一对多/多对多业务关系时才拆表，否则将信息作为字段、枚举、JSON 或文本保存。如果任务要求推荐唯一最佳项、排序、判断是否合规或选择首选项，表结构必须包含足以确定该结论的优先级、适配分数、首选标记、规则结果或理由字段，不能只建立无方向的多对多关联。法律、法规、政策、医疗、投资、税务等权威参考资料必须带 source_url、retrieved_at 和 content_hash 字段，且来源必须可追溯；不得由模型凭空编写权威原文。每张表说明存在必要性，并声明主键、外键、字段类型、可见性、索引和约束。输出表定义。" + repair_hint,
+                    {"task_description": description, "entities": entity_plan["entities"],
+                     "previous_tables": table_definitions, "output": table_output},
+                )
+                try:
+                    candidate_tables = table_design.get("tables")
+                    self._validate_table_definitions(candidate_tables)
+                    self._validate_authoritative_source_schema(
+                        task_description=description,
+                        table_definitions=candidate_tables,
+                    )
+                    table_definitions = candidate_tables
+                    table_error = None
+                    break
+                except PipelineGenerationError as exc:
+                    table_definitions = table_design.get("tables")
+                    table_error = exc
+                    logger.warning(
+                        "environment table schema invalid: attempt=%d/%d error=%s",
+                        table_attempt, self.retries, exc,
+                    )
+            if table_error is not None:
+                raise table_error
 
         # 2c. Generate each table's rows independently so tables can be built
         # concurrently and retried without regenerating unrelated data.
@@ -796,7 +532,7 @@ class TaskGenerationPipeline:
             for grounding_attempt in range(1, self.retries + 1):
                 audit = self._call(
                     "environment_data_grounding_audit",
-                    "独立审查业务数据是否足以完成任务。task_supported 表示 rows 覆盖任务所需事实；decision_determinate 表示任务要求唯一推荐、排序、合规判断或首选结论时，数据存在唯一且可追溯的决定性证据，没有多个等价候选；facts_consistent 表示预期结论引用的数值、属性、关系和理由与 rows 精确一致。若任务不要求唯一决策，decision_determinate 应为 true。issues 必须具体说明问题。",
+                    "独立审查业务数据是否足以完成任务。task_supported 表示 rows 覆盖任务所需事实；decision_determinate 表示任务要求唯一推荐、排序、合规判断或首选结论时，数据存在唯一且可追溯的决定性证据，没有多个等价候选；facts_consistent 表示输入事实彼此不矛盾，且预期结论可由 rows 直接读取或通过题面明确规则确定性计算得到。不得因为 rows 未预先存储汇总值、对比表、计算结果或最终答案而判 false；这些应由 Agent 调用工具后推导。只有原始事实矛盾、缺少计算所需输入或预期结论无法由数据推导时才判 false。若任务不要求唯一决策，decision_determinate 应为 true。issues 必须具体说明问题。",
                     {
                         "task_description": description,
                         "data_tables": data_tables,
@@ -817,6 +553,7 @@ class TaskGenerationPipeline:
                 )
                 try:
                     self._validate_data_grounding_audit(audit)
+                    self._validate_relational_data(data_tables)
                     self._validate_data_keyword_alignment(
                         data_tables,
                         task_description=description,
@@ -1028,64 +765,12 @@ class TaskGenerationPipeline:
             count=self.script_count,
         )
 
-        # 4. Materialize deterministic offline fixtures. Runtime user behavior
-        # is produced by ContractUserSimulator + an external LLM; generated
-        # conversations must never become replay data or hidden task truth.
-        script_ids = {str(item["script_id"]) for item in user_scripts}
-        sessions: list[dict[str, Any]] = []
-        for script in user_scripts[:self.script_count]:
-            script_id = str(script.get("script_id") or script.get("id"))
-            for session_index in range(self.sessions_per_script):
-                profile = random.choice(profiles)
-                sessions.append(self._deterministic_dialogue_fixture(
-                    description=description,
-                    profile=profile,
-                    script=script,
-                    script_id=script_id,
-                    session_id=f"{script_id}-session-{session_index + 1}",
-                ))
+        # Runtime conversations are generated by ContractUserSimulator. The
+        # task artifact contains only its reusable persona and FSM inputs;
+        # pre-generated transcripts would be unused, duplicate truth sources.
         user_simulation_manifest = self._materialize_user_simulation(
-            profiles, user_scripts, sessions, materialized_dir / "user_simulation"
+            profiles, user_scripts, materialized_dir / "user_simulation"
         )
-
-        session_counts: dict[str, int] = {}
-        seen_session_ids: set[str] = set()
-        for session in sessions:
-            if not isinstance(session, dict) or not self.minimum_dialogue_turns <= len(session.get("turns", [])) <= self.maximum_dialogue_turns:
-                raise PipelineGenerationError("every dialogue session must stay within the configured turn bounds")
-            script_id = session.get("script_id")
-            session_id = session.get("session_id")
-            if script_id not in script_ids or not isinstance(session_id, str) or not session_id.strip():
-                raise PipelineGenerationError("every dialogue session must reference a valid script_id and session_id")
-            if session_id in seen_session_ids:
-                raise PipelineGenerationError("dialogue session_id values must be unique")
-            seen_session_ids.add(session_id)
-            turns = session.get("turns")
-            if not isinstance(turns, list) or any(
-                not isinstance(turn, dict) or turn.get("role") not in {"agent", "user"}
-                or not isinstance(turn.get("content"), str) or not turn["content"].strip()
-                for turn in turns
-            ) or any(turns[index].get("role") == turns[index + 1].get("role") for index in range(len(turns) - 1)):
-                raise PipelineGenerationError("dialogue turns must be non-empty and strictly alternate agent/user")
-            user_turn_count = sum(turn.get("role") == "user" for turn in turns)
-            if not isinstance(session.get("user_end_flags"), list) or len(session["user_end_flags"]) != user_turn_count or any(
-                not isinstance(flag, bool) for flag in session["user_end_flags"]
-            ):
-                raise PipelineGenerationError("dialogue session user_end_flags must match user turns")
-            if session.get("termination_reason") not in {
-                "user_script_end", "bounded_completion", "max_turns_reached",
-            }:
-                raise PipelineGenerationError("dialogue session requires a valid termination_reason")
-            state_trace = session.get("state_trace")
-            if not isinstance(state_trace, list) or not state_trace or any(
-                not isinstance(state_id, str) or not state_id for state_id in state_trace
-            ):
-                raise PipelineGenerationError("dialogue session requires a non-empty state_trace")
-            session_counts[script_id] = session_counts.get(script_id, 0) + 1
-        if set(session_counts) != script_ids or any(
-            session_counts.get(script_id, 0) < self.sessions_per_script for script_id in script_ids
-        ):
-            raise PipelineGenerationError("every user script must have the required number of sessions")
 
         # 5. Decompose actions from the stable task/environment contract. User
         # simulation is a downstream policy stress test and must not redefine
@@ -1130,6 +815,7 @@ class TaskGenerationPipeline:
                             for item in (semantic_goal or {}).get("row_predicates", [])],
             "task_description": description, "business_model": business_model,
             "environment_plan": environment_plan,
+            "route_plan": description["route_plan"],
             "required_grounding_keywords": self._task_relevant_keywords(
                 description, keywords
             ),
@@ -1146,19 +832,31 @@ class TaskGenerationPipeline:
                 )
             actions = self._call(
                 "agent_actions" if action_attempt == 1 else "agent_actions.repair",
-                "根据任务描述、环境计划和业务模型反推 Agent 必须做的原子动作。不得把用户模拟阶段可能出现的临时扩展请求提升为正式动作。environment_plan.mode=stateless 时禁止生成任何读取或修改数据库、持久化状态或调用外部系统的动作。凡是仅根据用户输入和通用语言能力进行识别、比较、提取、格式化和最终表达的步骤都属于 Agent 自身推理或回答。每个输出动作必须不可再拆，并提供 atomicity_rationale、inputs、outputs、preconditions、effects。动作中的每个业务对象、数值来源和操作都必须能在 task_description 或 business_model 中找到依据，严禁复用其他任务的实体。" + repair_hint,
+                "根据任务描述、环境计划、route_plan 和业务模型反推 Agent 必须做的原子动作。route_plan.environment_operations 中每个 action_name 必须作为同名动作逐一出现，不得删除、合并或改名；其 dependencies 表示真实的输入输出依赖。不得把用户模拟阶段可能出现的临时扩展请求提升为正式动作。environment_plan.mode=stateless 时禁止生成任何读取或修改数据库、持久化状态或调用外部系统的动作。凡是仅根据用户输入和通用语言能力进行识别、比较、提取、格式化和最终表达的步骤都属于 Agent 自身推理或回答。每个输出动作必须不可再拆，并提供 atomicity_rationale、inputs、outputs、preconditions、effects。动作中的每个业务对象、数值来源和操作都必须能在 task_description 或 business_model 中找到依据，严禁复用其他任务的实体。" + repair_hint,
                 action_payload,
             )
             try:
                 candidate_actions = self._list(actions.get("actions"), "agent_actions")
                 candidate_actions = self._normalize_action_numeric_examples(
-                    candidate_actions, task_description=description
+                    candidate_actions,
+                    task_description=description,
+                    grounding_context={
+                        "constraints": [
+                            constraint
+                            for table in business_model.get("tables", [])
+                            if isinstance(table, dict)
+                            for constraint in table.get("constraints", [])
+                        ]
+                    },
                 )
                 self._validate_actions(candidate_actions)
                 self._validate_action_grounding(
                     candidate_actions,
                     task_description=description,
                     keywords=keywords,
+                )
+                self._validate_route_action_coverage(
+                    candidate_actions, route_plan=description["route_plan"]
                 )
                 if environment_plan["mode"] == "external_capability" and not any(
                     any(marker in f"{item.get('name', '')} {item.get('description', '')}".lower()
@@ -1204,6 +902,7 @@ class TaskGenerationPipeline:
                 task_description=description,
                 keywords=keywords,
                 environment_mode=environment_plan["mode"],
+                route_plan=description["route_plan"],
             )
             self._validate_actions(action_list)
             self._validate_action_grounding(
@@ -1253,6 +952,14 @@ class TaskGenerationPipeline:
                     actions=action_list,
                     environment_mode=environment_plan["mode"],
                 )
+                candidate_capabilities = self._normalize_capability_dependencies(
+                    candidate_capabilities,
+                    actions=action_list,
+                )
+                candidate_capabilities = self._apply_route_capability_contract(
+                    candidate_capabilities,
+                    route_plan=description["route_plan"],
+                )
                 self._validate_capability_plan(
                     candidate_capabilities,
                     action_list,
@@ -1264,6 +971,11 @@ class TaskGenerationPipeline:
                 break
             except PipelineGenerationError as exc:
                 capability_error = exc
+                capability_payload["previous_invalid_capabilities"] = (
+                    candidate_capabilities
+                    if "candidate_capabilities" in locals() else []
+                )
+                capability_payload["validation_error"] = str(exc)
                 logger.warning("capability plan validation failed: attempt=%d/%d error=%s", capability_attempt, self.retries, exc)
         if capability_plan is None:
             raise capability_error or PipelineGenerationError("capability plan generation failed")
@@ -1282,9 +994,9 @@ class TaskGenerationPipeline:
         tool_actions = {"actions": tool_action_list}
 
         # 6. Generate strict OpenAI Function Tools from the atomic actions.
-        noise_count = 0 if self.noise_tool_max == 0 else random.randint(min(2, self.noise_tool_max), self.noise_tool_max)
+        noise_count = 0 if self.noise_tool_max == 0 else random_source.randint(min(2, self.noise_tool_max), self.noise_tool_max)
         noise_categories = (["related_irrelevant", "unrelated"] + [
-            random.choice(("unrelated", "related_irrelevant")) for _ in range(max(0, noise_count - 2))
+            random_source.choice(("unrelated", "related_irrelevant")) for _ in range(max(0, noise_count - 2))
         ])[:noise_count]
         noise_tool_example = [
             {
@@ -1311,7 +1023,9 @@ class TaskGenerationPipeline:
             }
             for index, category in enumerate(noise_categories)
         ]
-        tool_prompt = "根据任务描述和已经确认可工具化的环境操作，生成标准 OpenAI Function Tool 定义。严格遵守 payload.training_category：direct_response 不生成业务工具；simple_agentic 生成恰好一个必要业务工具；multi_step_agentic 至少生成两个具有真实依赖或分支关系的业务工具。此阶段不得读取或参考模拟对话、完整业务数据行、数据文档、隐藏真值、数据库记录或其原始字段值；工具定义只能从稳定任务契约和环境操作的业务语义推导。不得为比较、分析、选择、解释、总结或最终回答增加工具。工具设计要依据动作 inputs/outputs，确定自然的工具名、描述、参数名、类型、枚举值、必填性和参数说明；不要把业务数据中的具体记录、内部主键、数据库 ID、隐藏真值或用户确认 ID 写入工具定义。用户交互不生成 ask_user 工具，用户回复通过独立的 UserSimulator HTTP 接口获得。无 Agent 输入时使用 properties={}、required=[]。如果没有环境操作，tools 必须是空数组。输出标准工具 schema，并为顶层参数、嵌套对象属性和 array items schema 提供 description；数组对象同时定义 items.properties 和 items.required。每个业务工具在 tool_bindings 中只使用 tool_name 和 action_name；不要输出 trainer_action。严格按照 payload.noise_spec 的数量和顺序生成噪声工具。噪声工具必须是完整的标准 OpenAI Function Tool：unrelated 与当前任务完全无关；related_irrelevant 与任务主题相关但不影响任务目标完成。噪声工具必须是纯只读查询或无状态计算：只能返回信息，不得预订、预约、创建、修改、删除、提交、发送、购买或执行任何外部操作；名称使用 search、lookup、get、list、estimate、calculate 等只读动词，不得使用 book、reserve、create、update、delete、submit、send、purchase、order 等写操作动词。噪声工具不得绑定原子动作、不得修改任务关键业务数据、不得被奖励指标视为任务进展。每个工具必须根据其真实能力使用具体、可理解的 snake_case 名称；payload.output 中 semantic_function_name_N 只是结构占位符，严禁原样返回，也不得使用 noise_tool_N、tool_N、function_N 等占位名称。"
+        tool_prompt = TOOL_DEFINITION_PROMPT
+        if environment_plan["mode"] == "stateful":
+            tool_prompt += " 当前任务是 stateful：每个 goal_contract row_predicate 必须有一个明确的创建、更新或删除业务工具；该工具 parameters 应优先使用目标表 where/values 字段同名参数，也可使用可唯一映射的 entity_field 或 new_field 命名，以便平台编译 selector 和变更映射。"
         tool_payload = {"task_description": description,
                         "capability_plan": capability_plan,
                         "agent_actions": tool_actions,
@@ -1390,26 +1104,9 @@ class TaskGenerationPipeline:
                         noise_audit.get("decisions"), noise_names=noise_names
                     )
                     if unsafe_noise_names:
-                        logger.warning(
-                            "discarding materially useful tools from noise set: %s",
-                            sorted(unsafe_noise_names),
+                        raise PipelineGenerationError(
+                            f"noise tools materially help the task; regenerate distractors: {sorted(unsafe_noise_names)}"
                         )
-                        candidate_noise_tools = [
-                            item for item in candidate_noise_tools
-                            if item["function"]["name"] not in unsafe_noise_names
-                        ]
-                        candidate_noise_metadata = [
-                            item for item in candidate_noise_metadata
-                            if item["name"] not in unsafe_noise_names
-                        ]
-                        noise_names -= unsafe_noise_names
-                    if not candidate_noise_tools:
-                        fallback_tool, fallback_metadata = self._fallback_noise_tool(
-                            occupied_names=primary_names
-                        )
-                        candidate_noise_tools = [fallback_tool]
-                        candidate_noise_metadata = [fallback_metadata]
-                        noise_names = {fallback_metadata["name"]}
                 candidate_bindings = tools.get("tool_bindings", [])
                 if not isinstance(candidate_bindings, list):
                     raise PipelineGenerationError("tool_bindings must be a list")
@@ -1459,6 +1156,10 @@ class TaskGenerationPipeline:
                     raise PipelineGenerationError("simple_agentic requires exactly one business tool")
                 if training_category == "multi_step_agentic" and business_count < 2:
                     raise PipelineGenerationError("multi_step_agentic requires at least two business tools")
+                if environment_plan["mode"] == "stateful":
+                    self._validate_stateful_tool_surface(
+                        candidate_tools, semantic_goal=semantic_goal
+                    )
                 if environment_plan["mode"] == "external_capability" and not primary_names:
                     raise PipelineGenerationError(
                         "external-capability task requires at least one business tool"
@@ -1525,8 +1226,7 @@ class TaskGenerationPipeline:
         # Noise is implemented over independent read-only fixtures. Its public
         # result never contains the private noise label or usefulness verdict.
         for metadata in noise_tool_metadata:
-            if str(metadata["name"]).startswith("roll_virtual_die"):
-                continue
+
             noise_function = next(tool["function"] for tool in tool_list if tool["function"]["name"] == metadata["name"])
             fixture_error = None
             for attempt in range(self.retries):
@@ -1544,7 +1244,12 @@ class TaskGenerationPipeline:
                     break
                 fixture_error = "fixture must support exact filtering, contain two rows and map every parameter to a present column"
             else:
-                raise PipelineGenerationError(f"noise fixture for {metadata['name']} is not executable: {fixture_error}")
+                rows, mapping = self._build_noise_fixture(noise_function)
+                metadata.update(records=rows, parameter_columns=mapping)
+                logger.warning(
+                    "noise fixture proposals remained invalid; using schema-derived fixture: tool=%s error=%s",
+                    metadata["name"], fixture_error,
+                )
         tools_manifest = self._materialize_tools(tool_list, materialized_dir)
 
         implementation_result = self._call(
@@ -1577,11 +1282,119 @@ class TaskGenerationPipeline:
                     if attempt + 1 == self.retries:
                         logger.warning("single declarative implementation needs custom handler: %s", exc)
                         break
-                    repaired = self._call("tool_implementation_specs.repair", "仅修复给定的声明式工具实现，保持工具业务语义。输出 spec 对象；不能表达时返回 spec=null。不要修改其他工具。", {
+                    repaired = self._call("tool_implementation_specs.repair", "仅修复给定的声明式工具实现，保持工具业务语义。能够表达时返回 supported=true 和 spec 对象；不能表达时返回 supported=false 和空 spec 对象。不要修改其他工具。", {
                         "spec": proposed, "validation_error": str(exc), "business_model": business_model,
-                        "tools": candidate_tools, "output": {"spec": {}},
+                        "tools": candidate_tools, "output": {"supported": True, "spec": {}},
                     })
+                    if repaired.get("supported") is False:
+                        proposed = None
+                        break
                     proposed = repaired.get("spec")
+
+        if environment_plan["mode"] == "stateful":
+            tool_implementations = self._complete_stateful_tool_implementations(
+                implementations=tool_implementations,
+                tools=candidate_tools,
+                tables=business_model["tables"],
+                semantic_goal=semantic_goal,
+            )
+            try:
+                self._validate_goal_tool_coverage(
+                    semantic_goal=semantic_goal,
+                    tool_implementations=tool_implementations,
+                )
+            except PipelineGenerationError as initial_coverage_error:
+                coverage_error: PipelineGenerationError = initial_coverage_error
+                for coverage_attempt in range(1, self.retries + 1):
+                    repaired = self._call(
+                        "tool_implementation_specs.coverage_repair",
+                        "重新生成完整的声明式业务工具实现，修复 goal_contract 覆盖错误。"
+                        "每个 stateful row_predicate 所在表必须由一个 insert、update 或 delete 工具实现；"
+                        "update 的 selector 必须定位 where 字段，changes 必须覆盖 values 字段。"
+                        "参数键必须来自对应工具 parameters，映射值必须是实际表字段。"
+                        "不得为噪声工具生成实现；无法满足时返回空 specs，不得编造表或字段。",
+                        {
+                            "validation_error": str(coverage_error),
+                            "semantic_goal": semantic_goal,
+                            "business_model": business_model,
+                            "tools": candidate_tools,
+                            "previous_specs": tool_implementations,
+                            "output": {"specs": [{
+                                "tool_name": "string", "operation": "update", "table": "string",
+                                "selector": {"tool_argument": "table_column"},
+                                "changes": {"tool_argument": "table_column"},
+                                "values": {"tool_argument": "table_column"},
+                                "filters": [], "projection": [], "order_by": [],
+                                "result_field": "records",
+                            }]},
+                        },
+                    )
+                    candidate_specs: list[dict[str, Any]] = []
+                    for spec in repaired.get("specs", []) if isinstance(repaired.get("specs"), list) else []:
+                        try:
+                            self._validate_tool_implementations(
+                                [*candidate_specs, spec], tools=candidate_tools,
+                                tables=business_model["tables"],
+                            )
+                        except PipelineGenerationError:
+                            continue
+                        candidate_specs.append(spec)
+                    candidate_specs = self._complete_stateful_tool_implementations(
+                        implementations=candidate_specs,
+                        tools=candidate_tools,
+                        tables=business_model["tables"],
+                        semantic_goal=semantic_goal,
+                    )
+                    try:
+                        self._validate_goal_tool_coverage(
+                            semantic_goal=semantic_goal,
+                            tool_implementations=candidate_specs,
+                        )
+                        tool_implementations = candidate_specs
+                        coverage_error = None
+                        break
+                    except PipelineGenerationError as exc:
+                        coverage_error = exc
+                        logger.warning(
+                            "stateful goal/tool coverage repair failed: attempt=%d/%d error=%s",
+                            coverage_attempt, self.retries, exc,
+                        )
+                if coverage_error is not None:
+                    raise coverage_error
+
+        tool_implementations = self._complete_dependency_projections(
+            implementations=tool_implementations,
+            tools=candidate_tools,
+            tables=business_model["tables"],
+        )
+        semantic_implementations: list[dict[str, Any]] = []
+        tools_by_name = {
+            item.get("function", {}).get("name"): item for item in candidate_tools
+            if isinstance(item, dict)
+        }
+        for implementation in tool_implementations:
+            tool_name = implementation.get("tool_name") if isinstance(implementation, dict) else None
+            tool = tools_by_name.get(tool_name)
+            if not isinstance(tool, dict):
+                continue
+            try:
+                self._validate_business_tool_semantics(
+                    tools=[tool], implementations=[implementation],
+                )
+            except PipelineGenerationError as exc:
+                logger.warning(
+                    "declarative implementation cannot preserve business semantics; "
+                    "requiring custom handler: tool=%s error=%s",
+                    tool_name, exc,
+                )
+                continue
+            semantic_implementations.append(implementation)
+        tool_implementations = semantic_implementations
+        if environment_plan["mode"] == "stateful":
+            self._validate_goal_tool_coverage(
+                semantic_goal=semantic_goal,
+                tool_implementations=tool_implementations,
+            )
 
         # 7a. Identify the small set of goal-critical steps before creating
         # process metrics. Ordinary tools are not process-reward candidates.
@@ -1625,9 +1438,10 @@ class TaskGenerationPipeline:
                 raise key_step_error or PipelineGenerationError("reward key-step generation failed")
 
         # 7b. Design executable observations and rewards from key steps.
-        reward_prompt = "根据任务、业务数据模型、原子动作和工具定义生成紧凑、可执行的 observation 与 reward 设计。只保留与任务目标完成强相关的关键过程指标和目标结果指标，不为普通动作机械创建指标；如果任务无需关键工具动作或可直接生成答案，process 指标可以为空；如果存在关键工具动作，每个关键动作或关键动作链都可以有对应过程指标，不限制过程指标数量。观测指标不得依赖任务生成阶段的 user_profiles、user_scripts 或 dialogue_sessions 等模拟产物；evaluation_inputs 只能引用沙箱运行时实际产生的 conversation、public_observation、available_tools、tool_call、tool_results、business_data、final_agent_response、terminal_observation 等输入。每个 metric 必须同时生成机器可执行的 evaluator 对象，不能只有自然语言 condition/criteria：evaluator.kind 必须声明评估器类型，evaluator.source 必须声明 runtime_rule 或 external_llm，evaluator.score_mapping 必须声明如何把评估结果映射到 score_range。关键过程指标必须是 hybrid，并使用 evaluator.kind=hybrid_tool_call、evaluator.source=external_llm、evaluator.comparison=exact_tool_name_and_canonical_arguments，以及 target_action、evaluation_inputs、criteria 和固定 condition=llm_expected_tool_call_exact_match。沙箱 Code Agent 根据这个指标在实现评估器时调用外部 LLM，结合当前运行时 Context、可用工具和 criteria 生成期望的工具名和参数真值；然后由规则引擎对 Agent 实际 tool_call 的工具名和规范化参数进行确定性精确比对。任务 JSON 不要嵌入 LLM prompt、output_schema 或嵌套 expected-call 配置；不要用 LLM 直接给最终过程分数，也不要把工具选择错误或参数错误设计成 penalty。结果指标只判断任务目标是否完成或关键业务数据是否达到目标，优先使用可量化的业务数据变化；rule-based 必须声明 evaluator.kind=business_state_rule、document_rule 或 trajectory_rule，明确 source_fields、assertion 和 score_mapping；model-based 必须声明 evaluator.kind=external_llm_judge、source=external_llm；hybrid 结果指标必须同时声明 evaluator.kind=hybrid_outcome、rule 和 external_llm 字段。惩罚指标只有在直接影响任务目标时才保留，用于偏离用户诉求、无效循环或业务数据偏离预期，不评价工具选择或参数错误。每个 metric 包含 id、category、type、scope、rubric、weight、score_range 和 evaluator；rule-based 或 hybrid 提供 condition，model-based 或 hybrid 提供 evaluation_inputs 和 criteria。process/outcome 分数范围为 [0,1]，penalty 分数范围为 [-1,0]；所有 process 与 outcome 指标的权重合计为 1，所有 penalty 指标的权重合计为 1，且 outcome 权重合计大于 process 权重合计。reward_formula 必须把所有 process/outcome 项放在同一个正反馈加权和中，把 penalty 项放在独立的负反馈加权和中，不得分别归一化 process 和 outcome；标准公式为 R = clip(sum(w_i*score_i, category in {process,outcome}) + sum(w_j*score_j, category == penalty), -1, 1)，该公式在分数范围和权重归一化成立时落在 [-1,1]。category 取 process、outcome、penalty。所有 rubric、criteria、assertion 和 description 必须是简短单句，禁止输出长篇解释或回显输入数据。"
+        reward_prompt = REWARD_DESIGN_PROMPT
         reward_prompt += " payload.key_steps 是上一阶段确认的关键步骤。process 指标只能评价这些 key_steps 中的 action_name；不得为非关键读取、噪声工具、可选探索或每个工具机械创建过程奖励。先使用 key_steps 判断是否确实需要过程奖励，再生成最少且必要的 process metrics。"
         reward_prompt += " metric 的 rubric、criteria、condition 和 assertion 中不得新增任务描述未提出的数量、字数、比例、时间或最低条目数；只能检验任务中已有的明确约束。"
+        reward_prompt += " payload.task_description 只包含 Agent 在运行时可见的公开请求。结果指标不得引用生成阶段隐藏的 goal、context、expected_result 或 requirements，也不得把公开请求未要求的文件格式、Markdown 语法、表格样式、应用场景或措辞设为成功条件。"
         reward_prompt += " 优先使用可执行的 runtime_rule 结果指标，并将多个关键动作合并为最少必要的过程指标。"
         if environment_plan["mode"] == "stateless":
             reward_prompt += " 当前任务是 stateless：不得生成 process 指标，不得以 business_data 或数据库变化作为成功条件。结果指标必须根据运行时 conversation 与 final_agent_response 评价任务完成度、忠实性和格式；噪声工具调用只能作为轨迹惩罚。"
@@ -1642,7 +1456,12 @@ class TaskGenerationPipeline:
                 for table in table_definitions
             ],
         }
-        reward_payload = {"task_description": description, "environment": reward_environment,
+        public_reward_task = {
+            "task": public_input.get("initial_user_message", description.get("task", "")),
+            "public_input": public_input,
+            "training_category": training_category,
+        }
+        reward_payload = {"task_description": public_reward_task, "environment": reward_environment,
                           "goal_contract": semantic_goal,
                           "environment_plan": environment_plan,
                           "agent_actions": {"actions": action_list},
@@ -1691,7 +1510,7 @@ class TaskGenerationPipeline:
                     candidate_metrics, environment_mode=environment_plan["mode"]
                 )
                 candidate_metrics = self._drop_ungrounded_numeric_metrics(
-                    candidate_metrics, task_description=description
+                    candidate_metrics, task_description=public_reward_task
                 )
                 if noise_tool_metadata:
                     self._ensure_deterministic_noise_penalty(
@@ -1705,7 +1524,7 @@ class TaskGenerationPipeline:
                     candidate_metrics, environment_mode=environment_plan["mode"]
                 )
                 self._validate_metric_constraint_grounding(
-                    candidate_metrics, task_description=description
+                    candidate_metrics, task_description=public_reward_task
                 )
                 # Build the formula from the validated metric weights instead
                 # of trusting an independently generated expression. Positive
@@ -1783,6 +1602,14 @@ class TaskGenerationPipeline:
         metric_implementations = metric_impl_result.get("specs", [])
         if not isinstance(metric_implementations, list):
             metric_implementations = []
+        rule_metric_ids = {
+            item.get("id") for item in rewards["metrics"]
+            if isinstance(item, dict) and item.get("type") == "rule-based"
+        }
+        metric_implementations = [
+            item for item in metric_implementations
+            if isinstance(item, dict) and item.get("metric_id") in rule_metric_ids
+        ]
         if noise_tool_metadata:
             metric_implementations = [
                 item for item in metric_implementations
@@ -1917,10 +1744,11 @@ class TaskGenerationPipeline:
         }
         business_scenarios: list[Any] | None = None
         executable_error: PipelineGenerationError | None = None
-        success_fixture = self._select_success_response_fixture(
-            task_description=description, sessions=sessions
-        )
-        fixture_conversation = self._select_fixture_conversation(sessions)
+        success_fixture = self._select_success_response_fixture(task_description=description)
+        fixture_conversation = [{
+            "role": "user",
+            "content": str(public_input.get("initial_user_message", "")).strip(),
+        }]
         try:
             fixture_result = self._call(
                 "acceptance_success_fixture",
@@ -2081,6 +1909,9 @@ class TaskGenerationPipeline:
             tools=tool_list,
             noise_tools=noise_tool_metadata,
             data_tables=data_tables,
+            tool_implementations=tool_implementations,
+            semantic_goal=semantic_goal,
+            training_category=training_category,
             success_content=success_fixture,
         )
         executable_payload["output"] = {"scenarios": [{"kind": "goal_success", "steps": [
@@ -2102,6 +1933,9 @@ class TaskGenerationPipeline:
                 executable_result.get("scenarios", []),
                 success_content=success_fixture,
             )
+            candidate_scenarios = self._repair_business_scenario_arguments(
+                candidate_scenarios, baseline=executable_baseline, tools=tool_list
+            )
             candidate_scenarios = self._compile_business_scenario_structure(
                 candidate_scenarios, executable_baseline
             )
@@ -2111,6 +1945,8 @@ class TaskGenerationPipeline:
                 self._validate_executable_scenarios(
                     candidate_scenarios, tools=tool_list, noise_tools=noise_tool_metadata,
                     training_category=training_category,
+                    tool_implementations=tool_implementations,
+                    semantic_goal=semantic_goal,
                 )
                 business_scenarios = candidate_scenarios
                 break
@@ -2121,6 +1957,8 @@ class TaskGenerationPipeline:
             self._validate_executable_scenarios(
                 executable_baseline, tools=tool_list, noise_tools=noise_tool_metadata,
                 training_category=training_category,
+                tool_implementations=tool_implementations,
+                semantic_goal=semantic_goal,
             )
             logger.warning(
                 "business executable scenario proposals remained invalid; using deterministic baseline: %s",
@@ -2130,6 +1968,18 @@ class TaskGenerationPipeline:
         acceptance_contract["executable_scenarios"] = [
             *acceptance_contract.get("executable_scenarios", []), *business_scenarios
         ]
+        metric_implementations = self._compile_process_metric_implementations(
+            metrics=rewards["metrics"],
+            metric_implementations=metric_implementations,
+            business_scenarios=business_scenarios,
+            tool_bindings=tool_bindings,
+        )
+        self._normalize_compiled_process_metrics(
+            rewards["metrics"], metric_implementations
+        )
+        self._validate_metric_implementations(
+            metric_implementations, rewards["metrics"], require_process=True
+        )
 
         requirements = description.get("requirements")
         if not isinstance(requirements, dict):
@@ -2159,20 +2009,6 @@ class TaskGenerationPipeline:
             key_step_count=len(key_steps),
         )
         readiness_warnings = []
-        max_turn_sessions = sum(
-            session.get("termination_reason") == "max_turns_reached" for session in sessions
-        )
-        bounded_sessions = sum(
-            session.get("termination_reason") == "bounded_completion" for session in sessions
-        )
-        if max_turn_sessions:
-            readiness_warnings.append(
-                f"{max_turn_sessions}/{len(sessions)} dialogue sessions reached the turn limit"
-            )
-        if bounded_sessions:
-            readiness_warnings.append(
-                f"{bounded_sessions}/{len(sessions)} dialogue sessions used bounded completion"
-            )
         if complexity != declared_complexity:
             readiness_warnings.append(
                 f"complexity normalized from {declared_complexity} to {complexity}"
@@ -2240,9 +2076,11 @@ class TaskGenerationPipeline:
             "task": task_desc.strip(), "task_type": task_type, "task_intent": task_intent,
             "training_category": training_category,
             "training_contract": training_blueprint,
+            "runtime_capabilities": {"environment_modes": sorted(supported_modes)},
             "task_spec": task_spec,
             "complexity": complexity,
             "requirements": requirements,
+            "public_input": public_input,
             "environment_plan": environment_plan,
             "environment": self._environment_records(environment_summary, action_list),
             "media_generation": media_generation,
@@ -2266,9 +2104,9 @@ class TaskGenerationPipeline:
                 "warnings": readiness_warnings,
             },
             "generation_pipeline": {"version": "1.0", "stages": [
-                "task_description", "environment_plan", "environment_entities", "environment_table_design",
+                "task_description", "public_input_contract", "environment_plan", "environment_entities", "environment_table_design",
                 "environment_table_data", "environment_data_consistency", "environment_data_document",
-                "environment_media_generation", "user_profiles", "user_scripts", "dialogue_sessions",
+                "environment_media_generation", "user_profiles", "user_scripts",
                 "agent_actions", "capability_plan", "openai_tools", "tool_implementation_specs", "reward_key_steps",
                 "observations_rewards", "metric_implementation_specs", "acceptance_contract",
                 "acceptance_executable_scenarios",
@@ -2455,6 +2293,17 @@ class TaskGenerationPipeline:
             }
             for case in tool_cases if case.get("kind") == "invalid_input"
         ]]
+        # Match ManifestDataStore exactly: the runtime hashes the loaded table
+        # mapping, not the richer generation-time schema/table documents.
+        initial_tables = {
+            str(table.get("table_name")): table.get("rows", [])
+            for table in data_tables if isinstance(table, dict) and table.get("table_name")
+        }
+        initial_data_hash = hashlib.sha256(
+            json.dumps(
+                initial_tables, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
         return {
             "version": "1.0",
             "authority": "env_factory_outer_workflow",
@@ -2463,7 +2312,7 @@ class TaskGenerationPipeline:
                 "data_manifest": data_manifest,
                 "tables": table_names,
                 "critical_fields": critical_fields,
-                "initial_data_hash": __import__("hashlib").sha256(json.dumps(data_tables, ensure_ascii=False, sort_keys=True).encode()).hexdigest(),
+                "initial_data_hash": initial_data_hash,
             },
             "scenarios": [
                 {"scenario_id": "reset_isolation", "kind": "lifecycle", "steps": ["reset(seed=17)", "write_episode_a", "reset(seed=17)", "assert_episode_a_not_visible"]},
@@ -2616,6 +2465,8 @@ class TaskGenerationPipeline:
     def _validate_executable_scenarios(
         scenarios: Any, *, tools: list[dict[str, Any]], noise_tools: list[dict[str, Any]],
         training_category: str | None = None,
+        tool_implementations: list[dict[str, Any]] | None = None,
+        semantic_goal: dict[str, Any] | None = None,
     ) -> None:
         if not isinstance(scenarios, list) or not scenarios:
             raise PipelineGenerationError("executable business scenarios must be a non-empty list")
@@ -2633,6 +2484,10 @@ class TaskGenerationPipeline:
         }
         kinds: set[str] = set()
         ids: set[str] = set()
+        implementation_by_tool = {
+            item.get("tool_name"): item for item in (tool_implementations or [])
+            if isinstance(item, dict) and isinstance(item.get("tool_name"), str)
+        }
 
         def validate_value(value: Any, schema: dict[str, Any], path: str) -> None:
             if isinstance(value, dict) and set(value) == {"$ref"}:
@@ -2660,7 +2515,8 @@ class TaskGenerationPipeline:
                     raise PipelineGenerationError(f"{path} must be a non-empty string")
                 lowered = value.strip().lower()
                 if any(marker in lowered for marker in (
-                    "fixture-value", "placeholder", "todo", "sample-value", "test-value"
+                    "fixture-value", "placeholder", "todo", "sample-value", "test-value",
+                    "任务输入中", "待提供", "请填写", "示例值",
                 )):
                     raise PipelineGenerationError(f"{path} uses a placeholder value")
         def references(value: Any) -> set[str]:
@@ -2682,6 +2538,7 @@ class TaskGenerationPipeline:
             if not isinstance(steps, list) or not steps:
                 raise PipelineGenerationError(f"executable_scenarios[{index}] requires steps")
             captures: set[str] = set()
+            capture_shapes: dict[str, set[str]] = {}
             success_business_calls = 0
             has_dependency_edge = False
             for step in steps:
@@ -2714,6 +2571,21 @@ class TaskGenerationPipeline:
                                 schema.get("properties", {}).get(argument_name, {}),
                                 f"executable_scenarios[{index}].{name}.{argument_name}",
                             )
+                            argument = arguments[argument_name]
+                            argument_schema = schema.get("properties", {}).get(argument_name, {})
+                            if isinstance(argument, dict) and set(argument) == {"$ref"}:
+                                projected = capture_shapes.get(argument["$ref"])
+                                item_schema = argument_schema.get("items", {})
+                                required_fields = set(item_schema.get("required", [])) if (
+                                    argument_schema.get("type") == "array"
+                                    and isinstance(item_schema, dict)
+                                ) else set()
+                                if projected is not None and not required_fields <= projected:
+                                    missing = sorted(required_fields - projected)
+                                    raise PipelineGenerationError(
+                                        f"executable_scenarios[{index}] dependency into "
+                                        f"{name}.{argument_name} misses projected fields: {missing}"
+                                    )
                 if step["operation"] == "agent_response" and (
                     not isinstance(step.get("content"), str) or not step["content"].strip()
                 ):
@@ -2721,6 +2593,16 @@ class TaskGenerationPipeline:
                 capture = step.get("capture") or {}
                 if not isinstance(capture, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in capture.items()):
                     raise PipelineGenerationError(f"executable_scenarios[{index}] capture is invalid")
+                if step.get("operation") == "tool_call":
+                    implementation = implementation_by_tool.get(step.get("tool_name"), {})
+                    result_field = implementation.get("result_field")
+                    projection = implementation.get("projection")
+                    if isinstance(result_field, str) and isinstance(projection, list):
+                        for variable, json_path in capture.items():
+                            if json_path == f"$.{result_field}":
+                                capture_shapes[variable] = {
+                                    field for field in projection if isinstance(field, str)
+                                }
                 captures.update(capture)
             if scenario["kind"] == "goal_success":
                 if training_category == "direct_response" and success_business_calls:
@@ -2733,6 +2615,11 @@ class TaskGenerationPipeline:
                     raise PipelineGenerationError(
                         "multi_step_agentic success requires two business calls and a capture/$ref dependency"
                     )
+                TaskGenerationPipeline._validate_success_scenario_goal_coverage(
+                    scenario,
+                    semantic_goal=semantic_goal,
+                    tool_implementations=tool_implementations or [],
+                )
             assertions = scenario.get("assertions", [])
             if not isinstance(assertions, list) or not assertions:
                 raise PipelineGenerationError(f"executable_scenarios[{index}] requires assertions")
@@ -2771,6 +2658,80 @@ class TaskGenerationPipeline:
         if noise_names and "noise_selection" not in kinds:
             raise PipelineGenerationError("tasks with noise tools require a noise_selection scenario")
 
+    @staticmethod
+    def _validate_success_scenario_goal_coverage(
+        scenario: dict[str, Any], *, semantic_goal: dict[str, Any] | None,
+        tool_implementations: list[dict[str, Any]],
+    ) -> None:
+        """Prove that the success trace can establish every declared state goal."""
+        predicates = (
+            semantic_goal.get("row_predicates", [])
+            if isinstance(semantic_goal, dict) else []
+        )
+        if not predicates:
+            return
+        implementations = {
+            item.get("tool_name"): item for item in tool_implementations
+            if isinstance(item, dict) and isinstance(item.get("tool_name"), str)
+        }
+        calls = [
+            step for step in scenario.get("steps", [])
+            if isinstance(step, dict) and step.get("operation") == "tool_call"
+        ]
+        used: set[int] = set()
+
+        def matches(call: dict[str, Any], predicate: dict[str, Any]) -> bool:
+            implementation = implementations.get(call.get("tool_name"), {})
+            operation = implementation.get("operation")
+            expected_operation = "delete" if predicate.get("count") == 0 else None
+            if implementation.get("table") != predicate.get("table"):
+                return False
+            if expected_operation and operation != expected_operation:
+                return False
+            if not expected_operation and operation not in {"update", "insert"}:
+                return False
+            arguments = call.get("arguments", {})
+            if not isinstance(arguments, dict):
+                return False
+            selector = implementation.get("selector", {})
+            changes = implementation.get("changes", {})
+            values = implementation.get("values", {})
+
+            def establishes(expected: dict[str, Any], mappings: list[Any], *, allow_ref: bool) -> bool:
+                for column, value in expected.items():
+                    candidates = [
+                        argument for mapping in mappings if isinstance(mapping, dict)
+                        for argument, mapped_column in mapping.items()
+                        if mapped_column == column
+                    ]
+                    if not candidates:
+                        return False
+                    actual = arguments.get(candidates[0])
+                    if actual == value:
+                        continue
+                    if allow_ref and isinstance(actual, dict) and set(actual) == {"$ref"}:
+                        continue
+                    return False
+                return True
+
+            return (
+                establishes(predicate.get("where", {}), [selector, values], allow_ref=True)
+                and establishes(predicate.get("values", {}), [changes, values], allow_ref=False)
+            )
+
+        for index, predicate in enumerate(predicates):
+            if not isinstance(predicate, dict):
+                continue
+            match = next((
+                call_index for call_index, call in enumerate(calls)
+                if call_index not in used and matches(call, predicate)
+            ), None)
+            if match is None:
+                raise PipelineGenerationError(
+                    f"goal_success does not establish row_predicates[{index}]"
+                )
+            used.add(match)
+
     @classmethod
     def _build_business_scenario_baseline(
         cls,
@@ -2779,6 +2740,9 @@ class TaskGenerationPipeline:
         tools: list[dict[str, Any]],
         noise_tools: list[dict[str, Any]],
         data_tables: list[dict[str, Any]] | None = None,
+        tool_implementations: list[dict[str, Any]] | None = None,
+        semantic_goal: dict[str, Any] | None = None,
+        training_category: str | None = None,
         success_content: str | None = None,
     ) -> list[dict[str, Any]]:
         noise_names = {
@@ -2791,17 +2755,72 @@ class TaskGenerationPipeline:
         success_steps: list[dict[str, Any]] = [
             {"operation": "reset", "body": {"episode_id": "goal-success", "seed": 17}, "expected_status": 200}
         ]
-        for index, tool in enumerate(business_tools, start=1):
+        implementation_by_tool = {
+            item.get("tool_name"): item for item in (tool_implementations or [])
+            if isinstance(item, dict) and isinstance(item.get("tool_name"), str)
+        }
+        prior_outputs: list[tuple[str, list[str]]] = []
+        dependency_added = False
+        tool_step_index = 0
+        goal_predicates = (
+            semantic_goal.get("row_predicates", [])
+            if isinstance(semantic_goal, dict) else []
+        )
+        for tool in business_tools:
             function = tool["function"]
-            success_steps.append({
-                "step_id": f"business_tool_{index}",
-                "operation": "tool_call",
-                "tool_name": function["name"],
-                "arguments": cls._schema_fixture(
-                    function["parameters"], fixture_values=fixture_values
-                ),
-                "expected_status": 200,
-            })
+            fixture_arguments = cls._schema_fixture(
+                function["parameters"], fixture_values=fixture_values
+            )
+            implementation = implementation_by_tool.get(function["name"], {})
+            predicates = [
+                item for item in goal_predicates
+                if isinstance(item, dict) and item.get("table") == implementation.get("table")
+            ]
+            argument_variants = [fixture_arguments]
+            if implementation.get("operation") in {"insert", "update", "delete"} and predicates:
+                argument_variants = []
+                for predicate in predicates:
+                    arguments = copy.deepcopy(fixture_arguments)
+                    for mapping_name, source in (
+                        ("selector", predicate.get("where", {})),
+                        ("changes", predicate.get("values", {})),
+                        ("values", {**predicate.get("where", {}), **predicate.get("values", {})}),
+                    ):
+                        mapping = implementation.get(mapping_name, {})
+                        if isinstance(mapping, dict) and isinstance(source, dict):
+                            for argument, column in mapping.items():
+                                if column in source:
+                                    arguments[argument] = source[column]
+                    argument_variants.append(arguments)
+            for arguments in argument_variants:
+                if training_category == "multi_step_agentic" and prior_outputs and not dependency_added:
+                    required = function["parameters"].get("required", [])
+                    properties = function["parameters"].get("properties", {})
+                    dependency = cls._match_baseline_dependency(
+                        required=required, properties=properties, prior_outputs=prior_outputs
+                    )
+                    if dependency is not None:
+                        argument_name, variable_name, json_path = dependency
+                        arguments[argument_name] = {"$ref": variable_name}
+                        prior_step = next(
+                            step for step in reversed(success_steps)
+                            if step.get("operation") == "tool_call"
+                        )
+                        prior_step.setdefault("capture", {})[variable_name] = json_path
+                        dependency_added = True
+                tool_step_index += 1
+                success_steps.append({
+                    "step_id": f"business_tool_{tool_step_index}",
+                    "operation": "tool_call",
+                    "tool_name": function["name"],
+                    "arguments": arguments,
+                    "expected_status": 200,
+                })
+            result_field = implementation.get("result_field")
+            projection = implementation.get("projection", [])
+            if isinstance(result_field, str) and result_field.strip():
+                fields = [item for item in projection if isinstance(item, str)]
+                prior_outputs.append((result_field, fields))
         success_steps.extend([
             {
                 "step_id": "final_answer",
@@ -2850,72 +2869,35 @@ class TaskGenerationPipeline:
         return scenarios
 
     @staticmethod
+    def _match_baseline_dependency(
+        *, required: list[Any], properties: dict[str, Any],
+        prior_outputs: list[tuple[str, list[str]]],
+    ) -> tuple[str, str, str] | None:
+        """Find a schema-compatible, fixture-backed edge for a multi-tool trace."""
+        for result_field, projection in reversed(prior_outputs):
+            for argument_name in required:
+                if not isinstance(argument_name, str):
+                    continue
+                if argument_name in projection:
+                    variable = f"upstream_{argument_name}"
+                    return argument_name, variable, f"$.{result_field}[0].{argument_name}"
+            for argument_name in required:
+                schema = properties.get(argument_name, {})
+                if not isinstance(argument_name, str) or schema.get("type") != "array":
+                    continue
+                variable = f"upstream_{result_field}"
+                return argument_name, variable, f"$.{result_field}"
+        return None
+
+    @staticmethod
     def _select_success_response_fixture(
-        *, task_description: dict[str, Any], sessions: list[dict[str, Any]]
+        *, task_description: dict[str, Any]
     ) -> str:
-        candidates = [
-            str(turn.get("content", "")).strip()
-            for session in sessions if isinstance(session, dict)
-            for turn in session.get("turns", []) if isinstance(turn, dict) and turn.get("role") == "agent"
-            if isinstance(turn.get("content"), str) and turn["content"].strip()
-        ]
-        if candidates:
-            return max(candidates, key=len)
         return str(
             task_description.get("expected_result")
             or task_description.get("goal")
             or "已完成任务并给出依据。"
         )
-
-    @staticmethod
-    def _select_fixture_conversation(sessions: list[dict[str, Any]]) -> list[dict[str, str]]:
-        """Choose the richest success-path conversation, excluding withdrawals."""
-        candidates = [
-            session.get("turns", []) for session in sessions
-            if isinstance(session, dict) and isinstance(session.get("turns"), list)
-        ]
-        if not candidates:
-            return []
-        active_candidates = [
-            turns for turns in candidates
-            if not TaskGenerationPipeline._conversation_withdraws_request(turns)
-        ]
-        if active_candidates:
-            candidates = active_candidates
-        else:
-            # A cancellation trajectory is useful for interaction coverage but
-            # cannot serve as the goal-success acceptance fixture.
-            return []
-        selected = max(
-            candidates,
-            key=lambda turns: sum(
-                len(str(turn.get("content", "")))
-                for turn in turns if isinstance(turn, dict) and turn.get("role") == "user"
-            ),
-        )
-        # Previous Agent turns are candidate answers, not evidence. Reusing
-        # them here can turn an early hallucination into acceptance truth.
-        return [
-            {"role": "user", "content": str(turn.get("content", ""))}
-            for turn in selected
-            if isinstance(turn, dict) and turn.get("role") == "user"
-        ]
-
-    @staticmethod
-    def _conversation_withdraws_request(turns: list[Any]) -> bool:
-        user_messages = [
-            str(turn.get("content", "")) for turn in turns
-            if isinstance(turn, dict) and turn.get("role") == "user"
-        ]
-        if not user_messages:
-            return False
-        tail = user_messages[-1].lower()
-        withdrawal_markers = (
-            "不用了", "不弄了", "先不做", "先不弄", "暂停", "取消",
-            "撤销", "改天再", "下次再", "以后再", "到此为止",
-            "never mind", "cancel", "stop here", "not now", "another time",
-        )
-        return any(marker in tail for marker in withdrawal_markers)
 
     @staticmethod
     def _compile_business_scenario_structure(
@@ -2935,6 +2917,95 @@ class TaskGenerationPipeline:
             step["expected_status"] = 200
         compiled["steps"] = [compiled["steps"][0], *calls, *compiled["steps"][-2:]]
         return result
+
+    @staticmethod
+    def _repair_business_scenario_arguments(
+        proposals: list[dict[str, Any]], *, baseline: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Absorb malformed argument serialization without changing a valid plan.
+
+        Tool schemas and fixture-backed baseline calls are already validated by
+        the platform.  We use them only to fill missing, empty, or wrong-typed
+        values.  Valid model values and capture references remain authoritative.
+        """
+        import copy
+
+        schemas = {
+            item.get("function", {}).get("name"): item.get("function", {}).get("parameters", {})
+            for item in tools if isinstance(item, dict)
+        }
+        baseline_success = next(
+            (item for item in baseline if isinstance(item, dict) and item.get("kind") == "goal_success"),
+            {},
+        )
+        fallback_arguments = {
+            step.get("tool_name"): step.get("arguments", {})
+            for step in baseline_success.get("steps", []) if isinstance(step, dict)
+            and step.get("operation") == "tool_call"
+        }
+
+        def repair(value: Any, schema: dict[str, Any], fallback: Any, field_name: str = "") -> Any:
+            if isinstance(value, dict) and set(value) == {"$ref"}:
+                reference = value.get("$ref")
+                if isinstance(reference, str) and reference.strip():
+                    return value
+            kind = schema.get("type")
+            if kind == "object":
+                properties = schema.get("properties", {})
+                current = value if isinstance(value, dict) else {}
+                base = fallback if isinstance(fallback, dict) else {}
+                result = {
+                    name: repair(child, properties.get(name, {}), base.get(name), name)
+                    for name, child in current.items() if name in properties
+                }
+                for name in schema.get("required", []):
+                    if name not in result:
+                        result[name] = repair(None, properties.get(name, {}), base.get(name), name)
+                return result
+            if kind == "array":
+                if not isinstance(value, list) or not value:
+                    if not isinstance(fallback, list) or not fallback:
+                        fallback = TaskGenerationPipeline._schema_fixture(
+                            schema, field_name=field_name
+                        )
+                    return copy.deepcopy(fallback)
+                item_schema = schema.get("items", {})
+                fallback_items = fallback if isinstance(fallback, list) else []
+                return [
+                    repair(item, item_schema, fallback_items[min(index, len(fallback_items) - 1)] if fallback_items else None, field_name)
+                    for index, item in enumerate(value)
+                ]
+            if kind == "string":
+                if isinstance(value, str) and value.strip():
+                    return value
+                if not isinstance(fallback, str) or not fallback.strip():
+                    fallback = TaskGenerationPipeline._schema_fixture(
+                        schema, field_name=field_name
+                    )
+                return copy.deepcopy(fallback)
+            if kind in {"integer", "number"}:
+                valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+                return value if valid else copy.deepcopy(fallback)
+            if kind == "boolean":
+                return value if isinstance(value, bool) else copy.deepcopy(fallback)
+            return value if value is not None else copy.deepcopy(fallback)
+
+        repaired = copy.deepcopy(proposals)
+        for scenario in repaired:
+            if not isinstance(scenario, dict) or scenario.get("kind") != "goal_success":
+                continue
+            for step in scenario.get("steps", []):
+                if not isinstance(step, dict) or step.get("operation") != "tool_call":
+                    continue
+                name = step.get("tool_name")
+                schema = schemas.get(name)
+                if not isinstance(schema, dict):
+                    continue
+                step["arguments"] = repair(
+                    step.get("arguments"), schema, fallback_arguments.get(name, {})
+                )
+        return repaired
 
     @staticmethod
     def _normalize_executable_scenarios(
@@ -3059,6 +3130,25 @@ class TaskGenerationPipeline:
         return unsafe
 
     @staticmethod
+    def _build_noise_fixture(function: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Build a minimal exact-match fixture from a validated noise schema."""
+        properties = function.get("parameters", {}).get("properties", {})
+        mapping = {name: name for name in properties}
+        rows: list[dict[str, Any]] = []
+        for index in range(2):
+            row: dict[str, Any] = {}
+            for name, schema in properties.items():
+                value = TaskGenerationPipeline._schema_fixture(schema, field_name=name)
+                if isinstance(value, str) and not schema.get("enum"):
+                    value = f"{value}-{index + 1}"
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    value += index
+                row[name] = value
+            row["result"] = f"{function.get('name', 'noise_lookup')} 的合成参考结果 {index + 1}"
+            rows.append(row)
+        return rows, mapping
+
+    @staticmethod
     def _validate_noise_tool_safety(tools: list[Any]) -> None:
         """Noise tools must not claim real-world writes the shared runtime cannot perform."""
         mutation_name_prefixes = (
@@ -3100,34 +3190,7 @@ class TaskGenerationPipeline:
                     f"noise tool {function.get('name')} claims a side effect; use a read-only distractor"
                 )
 
-    @staticmethod
-    def _fallback_noise_tool(
-        *, occupied_names: set[str]
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        base = "roll_virtual_die"
-        name = base
-        suffix = 2
-        while name in occupied_names:
-            name = f"{base}_{suffix}"
-            suffix += 1
-        return ({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": "掷一个虚拟六面骰并返回随机点数；不读取或修改任务业务状态。",
-                "parameters": {
-                    "type": "object",
-                    "description": "虚拟骰子参数。",
-                    "properties": {},
-                    "required": [],
-                    "additionalProperties": False,
-                },
-            },
-        }, {
-            "name": name,
-            "category": "unrelated",
-            "rationale": "通用娱乐性随机工具，不提供任务事实、证据、比较依据或验证能力。",
-        })
+
 
     @staticmethod
     def _validate_tools(tools: list[Any]) -> None:
@@ -3190,10 +3253,14 @@ class TaskGenerationPipeline:
             if not isinstance(spec, dict):
                 raise PipelineGenerationError(f"tool_implementations[{index}] must be an object")
             name, table = spec.get("tool_name"), spec.get("table")
-            if name not in tool_parameters or name in seen:
+            if not isinstance(name, str) or name not in tool_parameters or name in seen:
                 raise PipelineGenerationError(f"tool_implementations[{index}] references an invalid tool")
             operation = spec.get("operation")
-            if operation not in {"select", "aggregate_count", "insert", "update", "delete"} or table not in table_columns:
+            if (
+                operation not in {"select", "aggregate_count", "insert", "update", "delete"}
+                or not isinstance(table, str)
+                or table not in table_columns
+            ):
                 raise PipelineGenerationError(f"tool_implementations[{index}] operation/table is invalid")
             if not isinstance(spec.get("result_field"), str) or not spec["result_field"]:
                 raise PipelineGenerationError(f"tool_implementations[{index}] requires result_field")
@@ -3203,6 +3270,8 @@ class TaskGenerationPipeline:
             for rule in filters:
                 if (
                     not isinstance(rule, dict)
+                    or not isinstance(rule.get("argument"), str)
+                    or not isinstance(rule.get("column"), str)
                     or rule.get("argument") not in tool_parameters[name]
                     or rule.get("column") not in table_columns[table]
                     or rule.get("operator") not in {"eq", "in", "contains", "gte", "lte"}
@@ -3210,12 +3279,18 @@ class TaskGenerationPipeline:
                     raise PipelineGenerationError(f"tool_implementations[{index}] has an invalid filter")
             for field in ("projection", "order_by"):
                 values = spec.get(field, [])
-                if not isinstance(values, list) or any(value not in table_columns[table] for value in values):
+                if not isinstance(values, list) or any(
+                    not isinstance(value, str) or value not in table_columns[table]
+                    for value in values
+                ):
                     raise PipelineGenerationError(f"tool_implementations[{index}].{field} is invalid")
             for field in ("selector", "values", "changes"):
                 mapping = spec.get(field, {})
                 if not isinstance(mapping, dict) or any(
-                    argument not in tool_parameters[name] or column not in table_columns[table]
+                    not isinstance(argument, str)
+                    or not isinstance(column, str)
+                    or argument not in tool_parameters[name]
+                    or column not in table_columns[table]
                     for argument, column in mapping.items()
                 ):
                     raise PipelineGenerationError(f"tool_implementations[{index}].{field} is invalid")
@@ -3226,6 +3301,316 @@ class TaskGenerationPipeline:
             if operation == "update" and not spec.get("changes"):
                 raise PipelineGenerationError(f"tool_implementations[{index}] requires changes")
             seen.add(name)
+
+    @staticmethod
+    def _validate_business_tool_semantics(
+        *, tools: list[dict[str, Any]], implementations: list[dict[str, Any]],
+    ) -> None:
+        """Reject declarative tools whose public API overclaims their behavior."""
+        by_name = {
+            item.get("tool_name"): item for item in implementations
+            if isinstance(item, dict) and isinstance(item.get("tool_name"), str)
+        }
+        read_tokens = {"get", "query", "search", "lookup", "list", "find", "fetch", "inspect"}
+        mutation_tokens = {
+            "create", "insert", "add", "update", "modify", "correct", "set", "save", "mark",
+            "delete", "remove",
+        }
+        semantic_tokens = {
+            "calculate", "validate", "verify", "compare", "recommend", "classify", "summarize",
+            "estimate", "score", "evaluate",
+        }
+        for tool in tools:
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = function.get("name")
+            spec = by_name.get(name)
+            # No declarative spec means the sandbox must supply a real custom
+            # handler; the independent semantic review owns that path.
+            if not isinstance(name, str) or not isinstance(spec, dict):
+                continue
+            parameters = function.get("parameters", {}).get("properties", {})
+            parameter_names = set(parameters) if isinstance(parameters, dict) else set()
+            consumed = {
+                rule.get("argument") for rule in spec.get("filters", [])
+                if isinstance(rule, dict) and isinstance(rule.get("argument"), str)
+            }
+            for field in ("selector", "values", "changes"):
+                mapping = spec.get(field, {})
+                if isinstance(mapping, dict):
+                    consumed.update(mapping)
+            unused = sorted(parameter_names - consumed)
+            if unused:
+                raise PipelineGenerationError(
+                    f"business tool {name} exposes parameters ignored by its implementation: {unused}"
+                )
+            operation = spec.get("operation")
+            lowered = name.lower()
+            name_tokens = set(lowered.split("_"))
+            if operation == "select" and (
+                name_tokens & semantic_tokens or not name_tokens & read_tokens
+            ):
+                raise PipelineGenerationError(
+                    f"business tool {name} overclaims a plain select implementation"
+                )
+            if operation == "aggregate_count" and "count" not in name_tokens:
+                raise PipelineGenerationError(
+                    f"business tool {name} must expose count semantics"
+                )
+            if operation in {"insert", "update", "delete"} and not name_tokens & mutation_tokens:
+                raise PipelineGenerationError(
+                    f"business tool {name} does not name its mutation semantics"
+                )
+
+    @staticmethod
+    def _validate_goal_tool_coverage(
+        *, semantic_goal: dict[str, Any] | None,
+        tool_implementations: list[Any],
+    ) -> None:
+        """Require every compiled mutation to implement an asserted goal delta."""
+        predicates = (
+            semantic_goal.get("row_predicates", [])
+            if isinstance(semantic_goal, dict) else []
+        )
+        by_table: dict[str, list[dict[str, Any]]] = {}
+        for predicate in predicates:
+            if isinstance(predicate, dict) and isinstance(predicate.get("table"), str):
+                by_table.setdefault(predicate["table"], []).append(predicate)
+
+        mutations = [
+            item for item in tool_implementations
+            if isinstance(item, dict)
+            and item.get("operation") in {"insert", "update", "delete"}
+        ]
+        mutation_tables = {
+            item.get("table") for item in mutations if isinstance(item.get("table"), str)
+        }
+        uncovered_goal_tables = sorted(set(by_table) - mutation_tables)
+        if uncovered_goal_tables:
+            raise PipelineGenerationError(
+                "stateful goal_contract has no declarative mutation for tables: "
+                f"{uncovered_goal_tables}"
+            )
+        for implementation in mutations:
+            table = str(implementation.get("table", ""))
+            tool_name = implementation.get("tool_name")
+            table_predicates = by_table.get(table, [])
+            if not table_predicates:
+                raise PipelineGenerationError(
+                    f"stateful tool {tool_name} mutates table {table} but goal_contract "
+                    "does not assert its final state"
+                )
+            if implementation.get("operation") != "update":
+                continue
+            changed_columns = {
+                column for column in implementation.get("changes", {}).values()
+                if isinstance(column, str)
+            }
+            asserted_values = {
+                field for predicate in table_predicates
+                for field in predicate.get("values", {})
+            }
+            missing = asserted_values - changed_columns
+            if missing:
+                raise PipelineGenerationError(
+                    f"stateful tool {tool_name} cannot establish goal fields: {sorted(missing)}"
+                )
+
+    @staticmethod
+    def _validate_stateful_tool_surface(
+        tools: list[Any], *, semantic_goal: dict[str, Any] | None
+    ) -> None:
+        """Require a compilable mutation surface before accepting tool schemas."""
+        predicates = (
+            semantic_goal.get("row_predicates", [])
+            if isinstance(semantic_goal, dict) else []
+        )
+        mutation_markers = (
+            "create", "insert", "add", "update", "modify", "correct", "delete", "remove",
+            "创建", "新增", "添加", "更新", "修改", "修正", "删除", "移除",
+        )
+        surfaces: list[set[str]] = []
+        for tool in tools:
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            label = f"{function.get('name', '')} {function.get('description', '')}".lower()
+            if not any(marker in label for marker in mutation_markers):
+                continue
+            properties = function.get("parameters", {}).get("properties", {})
+            if isinstance(properties, dict):
+                surfaces.append(set(properties))
+        for predicate in predicates if isinstance(predicates, list) else []:
+            if not isinstance(predicate, dict):
+                continue
+            required = set(predicate.get("where", {})) | set(predicate.get("values", {}))
+            def covers(surface: set[str]) -> bool:
+                return all(
+                    len([
+                        argument for argument in surface
+                        if argument == field
+                        or argument.endswith(f"_{field}")
+                        or argument.removeprefix("new_") == field
+                        or argument.removeprefix("target_") == field
+                    ]) == 1
+                    for field in required
+                )
+            if not required or not any(covers(surface) for surface in surfaces):
+                raise PipelineGenerationError(
+                    "stateful tool schema has no compilable mutation parameters for "
+                    f"table {predicate.get('table')}: {sorted(required)}"
+                )
+
+    @staticmethod
+    def _complete_dependency_projections(
+        *, implementations: list[dict[str, Any]], tools: list[dict[str, Any]],
+        tables: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Expose table fields that downstream tool schemas can consume."""
+        import copy
+
+        schema_fields: set[str] = set()
+        def collect(schema: Any) -> None:
+            if not isinstance(schema, dict):
+                return
+            properties = schema.get("properties", {})
+            if isinstance(properties, dict):
+                schema_fields.update(str(name) for name in properties)
+                for child in properties.values():
+                    collect(child)
+            collect(schema.get("items"))
+        for tool in tools:
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            collect(function.get("parameters"))
+
+        table_columns = {
+            table.get("table_name"): [
+                str(column.get("name")) for column in table.get("columns", [])
+                if isinstance(column, dict) and isinstance(column.get("name"), str)
+            ]
+            for table in tables if isinstance(table, dict)
+        }
+        completed = copy.deepcopy(implementations)
+        for spec in completed:
+            if not isinstance(spec, dict) or spec.get("operation") != "select":
+                continue
+            available = table_columns.get(spec.get("table"), [])
+            required = [name for name in available if name in schema_fields]
+            projection = spec.get("projection", [])
+            if not isinstance(projection, list):
+                projection = []
+            if projection:
+                spec["projection"] = list(dict.fromkeys([*projection, *required]))
+        return completed
+
+    @staticmethod
+    def _complete_stateful_tool_implementations(
+        *, implementations: list[dict[str, Any]], tools: list[dict[str, Any]],
+        tables: list[dict[str, Any]], semantic_goal: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Compile obvious one-table updates when a model omits a valid spec.
+
+        This is intentionally conservative: argument and column names must be
+        identical, selector and changed fields must both be present, and their
+        primitive types must agree. More complex semantics remain custom-handler
+        work and therefore fail the stateful buildability gate.
+        """
+        completed = [dict(item) for item in implementations]
+        implemented_names = {item.get("tool_name") for item in completed}
+        raw_predicates = (
+            semantic_goal.get("row_predicates", [])
+            if isinstance(semantic_goal, dict) else []
+        )
+        predicates = [
+            item for item in raw_predicates if isinstance(item, dict)
+        ] if isinstance(raw_predicates, list) else []
+        goals_by_table: dict[str, list[dict[str, Any]]] = {}
+        for predicate in predicates:
+            table = predicate.get("table")
+            if isinstance(table, str):
+                goals_by_table.setdefault(table, []).append(predicate)
+
+        table_by_name = {
+            table.get("table_name"): table for table in tables
+            if isinstance(table, dict) and isinstance(table.get("table_name"), str)
+        }
+        numeric_types = ("INT", "DECIMAL", "NUMERIC", "REAL", "FLOAT", "DOUBLE")
+
+        def compatible(schema: dict[str, Any], sql_type: str) -> bool:
+            json_type = schema.get("type")
+            is_numeric = any(token in sql_type.upper() for token in numeric_types)
+            return json_type in ({"number", "integer"} if is_numeric else {"string"})
+
+        def argument_for(field: str, properties: dict[str, Any], columns: dict[str, Any]) -> str | None:
+            candidates = [
+                argument for argument, schema in properties.items()
+                if isinstance(argument, str)
+                and (
+                    argument == field
+                    or argument.endswith(f"_{field}")
+                    or argument.removeprefix("new_") == field
+                    or argument.removeprefix("target_") == field
+                )
+                and field in columns
+                and isinstance(schema, dict)
+                and compatible(schema, str(columns[field].get("type", "")))
+            ]
+            return candidates[0] if len(candidates) == 1 else None
+
+        for tool in tools:
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = function.get("name")
+            if not isinstance(name, str) or name in implemented_names:
+                continue
+            label = f"{name} {function.get('description', '')}".lower()
+            if not any(marker in label for marker in ("update", "modify", "更新", "修改", "修正")):
+                continue
+            properties = function.get("parameters", {}).get("properties", {})
+            if not isinstance(properties, dict):
+                continue
+            candidates: list[dict[str, Any]] = []
+            for table_name, table_predicates in goals_by_table.items():
+                table = table_by_name.get(table_name, {})
+                columns = {
+                    column.get("name"): column
+                    for column in table.get("columns", [])
+                    if isinstance(column, dict)
+                    if isinstance(column.get("name"), str)
+                }
+                where_fields = {
+                    field for predicate in table_predicates
+                    for field in predicate.get("where", {})
+                }
+                value_fields = {
+                    field for predicate in table_predicates
+                    for field in predicate.get("values", {})
+                }
+                selector = {
+                    argument: field for field in where_fields
+                    if (argument := argument_for(field, properties, columns)) is not None
+                }
+                changes = {
+                    argument: field for field in value_fields
+                    if (argument := argument_for(field, properties, columns)) is not None
+                }
+                if (
+                    selector and changes
+                    and where_fields <= set(selector.values())
+                    and value_fields <= set(changes.values())
+                ):
+                    candidates.append({
+                        "tool_name": name, "operation": "update", "table": table_name,
+                        "selector": selector, "changes": changes, "result_field": "records",
+                    })
+            if len(candidates) == 1:
+                self_spec = candidates[0]
+                TaskGenerationPipeline._validate_tool_implementations(
+                    [*completed, self_spec], tools=tools, tables=tables
+                )
+                completed.append(self_spec)
+                implemented_names.add(name)
+                logger.warning(
+                    "compiled deterministic stateful implementation: tool=%s table=%s",
+                    name, self_spec["table"],
+                )
+        return completed
 
     @staticmethod
     def _build_runtime_interface(
@@ -3384,6 +3769,8 @@ class TaskGenerationPipeline:
                             "match_status": {"type": "string", "description": "实时对话为 matched、unmatched 或 ambiguous。"},
                             "outcome_category": {"type": "string", "description": "固定的八类对话结果之一。"},
                             "reason_code": {"type": "string", "description": "分支匹配或恢复原因。"},
+                            "attachments": {"type": "array", "items": {"type": "object", "description": "附件对象（当前不支持）"}, "maxItems": 0,
+                                            "description": "当前文本/结构化环境不接受模型生成附件，固定为空。"},
                             "termination_reason": {"type": "string", "description": "结束时为 completed 或 unresolved_dialogue。"},
                         },
                         "required": ["user_query", "should_end"],
@@ -3593,7 +3980,8 @@ class TaskGenerationPipeline:
 
     @staticmethod
     def _deterministic_actions(
-        *, task_description: dict[str, Any], keywords: list[str], environment_mode: str
+        *, task_description: dict[str, Any], keywords: list[str], environment_mode: str,
+        route_plan: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build a minimal grounded plan after repeated action-model drift."""
         relevant = TaskGenerationPipeline._task_relevant_keywords(
@@ -3613,7 +4001,18 @@ class TaskGenerationPipeline:
                 "effects": [f"产生{output}，不引入任务外事实。"],
             }
 
-        if environment_mode in {"reference_data", "stateful"}:
+        route_operations = (
+            route_plan.get("environment_operations", [])
+            if isinstance(route_plan, dict) else []
+        )
+        if route_operations:
+            for index, operation in enumerate(route_operations, start=1):
+                actions.append(action(
+                    str(operation["action_name"]),
+                    str(operation.get("purpose", "执行任务所需的环境操作。")),
+                    f"environment_result_{index}",
+                ))
+        elif environment_mode in {"reference_data", "stateful"}:
             actions.append(action(
                 f"读取{subject}任务数据", f"读取沙箱中与{subject}任务直接相关的记录。", "task_records"
             ))
@@ -3688,6 +4087,82 @@ class TaskGenerationPipeline:
                 item["requires_tool"] = True
                 if not isinstance(item.get("reason"), str) or not item["reason"].strip():
                     item["reason"] = "该动作必须读取沙箱中的参考或业务数据。"
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _normalize_capability_dependencies(
+        capabilities: list[Any], *, actions: list[Any]
+    ) -> list[Any]:
+        """Translate common ordinal dependency aliases to canonical action names.
+
+        Dependency topology belongs to the action/capability contract, while
+        weaker models often serialize an intended edge as ``step-1`` or
+        ``action_1``.  Canonicalizing those identifiers preserves the edge;
+        unknown values remain untouched so semantic validation still rejects
+        invented dependencies.
+        """
+        action_names = [
+            str(action["name"]) for action in actions
+            if isinstance(action, dict) and isinstance(action.get("name"), str)
+        ]
+
+        def key(value: str) -> str:
+            return re.sub(r"[\s_-]+", "-", value.strip().lower())
+
+        aliases: dict[str, str] = {}
+        for index, action_name in enumerate(action_names, start=1):
+            aliases[key(action_name)] = action_name
+            for alias in (str(index), f"step-{index}", f"action-{index}"):
+                aliases[key(alias)] = action_name
+        for action in actions:
+            if not isinstance(action, dict) or action.get("name") not in action_names:
+                continue
+            for field in ("id", "action_id", "step_id"):
+                value = action.get(field)
+                if isinstance(value, str) and value.strip():
+                    aliases[key(value)] = str(action["name"])
+
+        normalized: list[Any] = []
+        for capability in capabilities:
+            if not isinstance(capability, dict):
+                normalized.append(capability)
+                continue
+            item = dict(capability)
+            dependencies = item.get("dependencies", [])
+            if isinstance(dependencies, list):
+                canonical: list[Any] = []
+                for dependency in dependencies:
+                    value = aliases.get(key(dependency), dependency) if isinstance(dependency, str) else dependency
+                    if value not in canonical:
+                        canonical.append(value)
+                item["dependencies"] = canonical
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _apply_route_capability_contract(
+        capabilities: list[Any], *, route_plan: dict[str, Any]
+    ) -> list[Any]:
+        """Project the validated route skeleton onto capability classification."""
+        operations = {
+            item["action_name"]: item
+            for item in route_plan.get("environment_operations", [])
+            if isinstance(item, dict) and isinstance(item.get("action_name"), str)
+        }
+        normalized: list[Any] = []
+        for capability in capabilities:
+            if not isinstance(capability, dict):
+                normalized.append(capability)
+                continue
+            item = dict(capability)
+            route_operation = operations.get(item.get("action_name"))
+            if route_operation is not None:
+                item["kind"] = "environment_operation"
+                item["requires_tool"] = True
+                item["dependencies"] = list(route_operation.get("dependencies", []))
+                if not isinstance(item.get("reason"), str) or not item["reason"].strip():
+                    item["reason"] = str(route_operation.get("purpose", "环境操作"))
             normalized.append(item)
         return normalized
 
@@ -3806,68 +4281,149 @@ class TaskGenerationPipeline:
 
     @staticmethod
     def _validate_task_description_consistency(description: Any) -> None:
-        """Catch high-signal cross-field task contamination deterministically."""
+        """Check structure only; task-specific semantics belong to grounding audits."""
         if not isinstance(description, dict):
             raise PipelineGenerationError("task description must be an object")
-        task = str(description.get("task", "")).lower()
-        requirements = description.get("requirements", {})
-        if not isinstance(requirements, dict):
+        if not isinstance(description.get("task"), str) or not description["task"].strip():
+            raise PipelineGenerationError("task description requires non-empty task")
+        if not isinstance(description.get("requirements", {}), dict):
+            raise PipelineGenerationError("task requirements must be an object")
+
+    @staticmethod
+    def _validate_route_plan(route_plan: Any, training_category: str) -> None:
+        if not isinstance(route_plan, dict):
+            raise PipelineGenerationError("task route_plan must be an object")
+        operations = route_plan.get("environment_operations")
+        if not isinstance(operations, list):
+            raise PipelineGenerationError(
+                "task route_plan.environment_operations must be a list"
+            )
+        names: list[str] = []
+        dependencies: dict[str, list[str]] = {}
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, dict):
+                raise PipelineGenerationError(
+                    f"route_plan.environment_operations[{index}] must be an object"
+                )
+            name = operation.get("action_name")
+            purpose = operation.get("purpose")
+            declared = operation.get("dependencies")
+            if not isinstance(name, str) or not name.strip() or name in names:
+                raise PipelineGenerationError(
+                    f"route_plan.environment_operations[{index}] has invalid action_name"
+                )
+            if not isinstance(purpose, str) or not purpose.strip():
+                raise PipelineGenerationError(
+                    f"route_plan.environment_operations[{index}] requires purpose"
+                )
+            if not isinstance(declared, list) or any(
+                not isinstance(item, str) or item not in names for item in declared
+            ):
+                raise PipelineGenerationError(
+                    f"route_plan.environment_operations[{index}] dependencies must reference earlier actions"
+                )
+            names.append(name)
+            dependencies[name] = list(dict.fromkeys(declared))
+        if training_category == "direct_response" and operations:
+            raise PipelineGenerationError(
+                "direct_response route_plan must not contain environment operations"
+            )
+        if training_category == "simple_agentic" and len(operations) != 1:
+            raise PipelineGenerationError(
+                "simple_agentic route_plan requires exactly one environment operation"
+            )
+        if training_category == "multi_step_agentic" and (
+            len(operations) < 2 or not any(dependencies.values())
+        ):
+            raise PipelineGenerationError(
+                "multi_step_agentic route_plan requires dependent environment operations"
+            )
+
+    @staticmethod
+    def _validate_route_input_boundary(
+        description: dict[str, Any], training_category: str
+    ) -> None:
+        """Reject tool routes whose complete truth is already in public input."""
+        if training_category == "direct_response":
             return
-        requirement_text = json.dumps(requirements, ensure_ascii=False).lower()
-        list_contract = (
-            "sort_within_category" in requirements
-            or isinstance(requirements.get("categories"), list)
-            or "购物清单" in requirement_text
+        public_input = description.get("public_input", {})
+        corpus = " ".join(
+            str(description.get(key, ""))
+            for key in ("task", "goal", "context", "expected_result", "requirements")
         )
-        list_task_markers = ("清单", "列表", "分类", "归类", "整理", "排序", "采购")
-        if list_contract and not any(marker in task for marker in list_task_markers):
-            raise PipelineGenerationError(
-                "task requirements define a categorized/sorted list but task asks for a different deliverable"
+        if isinstance(public_input, dict):
+            corpus += " " + str(public_input.get("initial_user_message", ""))
+        complete_input_supplied = any(
+            re.search(pattern, corpus) is not None
+            for pattern in (
+                r"(?:基于|仅依赖|仅使用|只依赖|只使用)用户提供的.{0,12}(?:规格|数据|资料|文本|列表|清单)",
+                r"基于以下提供的.{0,8}(?:规格|数据|资料|文本)",
+                r"从用户提供的.{0,8}(?:列表|清单|文本|数据)中",
             )
-        if requirements.get("candidate_list_required") is True and not any(
-            marker in task for marker in ("用户提供", "给定", "候选", "输入")
-        ):
+        )
+        operations = description.get("route_plan", {}).get("environment_operations", [])
+        route_text = json.dumps(operations, ensure_ascii=False).lower()
+        private_markers = (
+            "内部", "私有", "沙箱", "数据库", "业务数据", "库存", "目录", "历史记录",
+            "系统记录", "internal", "private", "sandbox", "database", "inventory",
+            "catalog", "system record",
+        )
+        has_private_route = any(marker in route_text for marker in private_markers)
+        if complete_input_supplied and not has_private_route:
             raise PipelineGenerationError(
-                "task must disclose that a required candidate list is supplied at runtime"
+                f"{training_category} task is fully solvable from public user input; "
+                "make at least one route operation depend on sandbox-private business data"
             )
-        cooking_markers = ("煎煮", "烹饪", "火候", "菜谱", "食谱", "煮一锅")
-        if any(marker in task for marker in cooking_markers) and "购物清单" in requirement_text:
+
+    @staticmethod
+    def _validate_no_deferred_business_truth(
+        description: dict[str, Any], task_intent: str
+    ) -> None:
+        """Do not make a future simulator invent authoritative mutation inputs.
+
+        Clarification dialogue is still useful for preferences and presentation
+        details.  It cannot supply a value that determines the sandbox's target
+        business state unless that value (or a deterministic derivation rule) is
+        already part of the immutable task contract.
+        """
+        if task_intent not in {"modify", "execute", "schedule"}:
+            return
+        corpus = json.dumps({
+            key: description.get(key)
+            for key in ("task", "goal", "expected_result")
+        } | {
+            "initial_user_message": (
+                description.get("public_input", {}).get("initial_user_message")
+                if isinstance(description.get("public_input"), dict) else None
+            )
+        }, ensure_ascii=False).lower()
+        unresolved_markers = (
+            "暂时没想好", "先问我", "稍后提供", "之后提供", "待我提供",
+            "需要向用户询问", "询问正确", "ask me", "provide later",
+            "to be provided",
+        )
+        if any(marker in corpus for marker in unresolved_markers):
             raise PipelineGenerationError(
-                "cooking task is contaminated by a shopping-list output contract"
+                "stateful task defers required business truth to an unspecified "
+                "future user reply"
             )
-        if any(marker in task for marker in ("代码", "编程", "脚本", "模型实现")) and any(
-            marker in requirement_text for marker in ("活动方案", "视频会议", "参与规则", "人员分工")
-        ):
-            raise PipelineGenerationError(
-                "coding or model-implementation task is contaminated by an event activity contract"
-            )
-        domain_groups = {
-            "commerce": ("销售", "商品", "折扣", "单价", "销量", "收入", "订单"),
-            "health": ("症状", "颤抖", "震颤", "患者", "诊断", "治疗"),
-            "event": ("活动", "会议", "场地", "参与者", "议程"),
-            "network": ("路由器", "网络", "断网", "日志", "连接"),
-            "food": ("菜品", "火腿", "罐头", "食材", "小吃", "餐"),
-            "architecture": ("街墙", "建筑", "墙面", "园林", "街道界面"),
+
+    @staticmethod
+    def _validate_route_action_coverage(
+        actions: list[Any], *, route_plan: dict[str, Any]
+    ) -> None:
+        action_names = {
+            action.get("name") for action in actions if isinstance(action, dict)
         }
-        task_domains = {
-            name for name, markers in domain_groups.items()
-            if any(marker in task for marker in markers)
+        required = {
+            operation.get("action_name")
+            for operation in route_plan.get("environment_operations", [])
+            if isinstance(operation, dict)
         }
-        requirement_domains = {
-            name for name, markers in domain_groups.items()
-            if sum(marker in requirement_text for marker in markers) >= 2
-        }
-        if task_domains and requirement_domains and task_domains.isdisjoint(requirement_domains):
+        missing = sorted(required - action_names)
+        if missing:
             raise PipelineGenerationError(
-                "task and requirements describe different business domains"
-            )
-        if description.get("task_intent") == "compare" and {"food", "architecture"} <= task_domains:
-            raise PipelineGenerationError(
-                "comparison combines unrelated food and architecture objects"
-            )
-        if "普通话" in task and "重音" in task and "规则" not in f"{task} {requirement_text}":
-            raise PipelineGenerationError(
-                "Mandarin stress classification requires an explicit rule or reference contract"
+                f"agent actions do not implement route_plan operations: {missing}"
             )
 
     @staticmethod
@@ -3914,14 +4470,7 @@ class TaskGenerationPipeline:
             raise PipelineGenerationError(
                 "agent actions omit every task-specific keyword and may belong to another task"
             )
-        imported_domains = [
-            marker for marker in CROSS_TASK_DOMAIN_MARKERS
-            if marker.lower() in action_text and marker.lower() not in task_text
-        ]
-        if imported_domains:
-            raise PipelineGenerationError(
-                f"agent actions import cross-task domain concepts absent from the task: {imported_domains}"
-            )
+
         action_names = [
             str(item.get("name", "")).strip() for item in actions if isinstance(item, dict)
         ]
@@ -3935,7 +4484,19 @@ class TaskGenerationPipeline:
                 "agent actions are predominantly generic placeholders instead of task-specific steps"
             )
         allowed_numbers = set(re.findall(r"\d+(?:\.\d+)?", task_text))
-        action_numbers = set(re.findall(r"\d+(?:\.\d+)?", action_text))
+        # Numeric suffixes in stable action identifiers (for example
+        # lookup_stage_1) are graph identity, not user-facing constraints.
+        numeric_semantics = json.dumps([
+            {
+                "description": item.get("description"),
+                "inputs": item.get("inputs", []),
+                "outputs": item.get("outputs", []),
+                "preconditions": item.get("preconditions", []),
+                "effects": item.get("effects", []),
+            }
+            for item in actions if isinstance(item, dict)
+        ], ensure_ascii=False).lower()
+        action_numbers = set(re.findall(r"\d+(?:\.\d+)?", numeric_semantics))
         invented = sorted(action_numbers - allowed_numbers)
         if invented:
             raise PipelineGenerationError(
@@ -3944,11 +4505,16 @@ class TaskGenerationPipeline:
 
     @staticmethod
     def _normalize_action_numeric_examples(
-        actions: list[Any], *, task_description: dict[str, Any]
+        actions: list[Any], *, task_description: dict[str, Any],
+        grounding_context: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Remove model-invented example numbers without changing action structure."""
         allowed = set(re.findall(
-            r"\d+(?:\.\d+)?", json.dumps(task_description, ensure_ascii=False)
+            r"\d+(?:\.\d+)?",
+            json.dumps(
+                {"task": task_description, "grounding": grounding_context or {}},
+                ensure_ascii=False,
+            ),
         ))
 
         def clean(value: Any) -> Any:
@@ -4093,12 +4659,26 @@ class TaskGenerationPipeline:
             raise PipelineGenerationError(
                 "task must request concise rationale, not hidden chain-of-thought"
             )
-        if any(marker in text for marker in HIGH_STAKES_MARKERS):
+        if TaskGenerationPipeline._is_high_stakes_task(task_description):
             evidence = json.dumps(graph_context, ensure_ascii=False)
             if not re.search(r"https?://[^\s\"']+", evidence, re.I):
                 raise PipelineGenerationError(
                     "high-stakes task requires authoritative source URLs in graph_context"
                 )
+
+    @staticmethod
+    def _is_high_stakes_task(task_description: dict[str, Any]) -> bool:
+        """Classify the user-facing decision, not incidental generated metadata."""
+        text = json.dumps({
+            key: task_description.get(key)
+            for key in ("task", "goal", "context", "requirements")
+        }, ensure_ascii=False).lower()
+        if any(marker in text for marker in HIGH_STAKES_MARKERS):
+            return True
+        return (
+            any(marker in text for marker in HIGH_STAKES_CHEMICAL_MARKERS)
+            and any(marker in text for marker in HIGH_STAKES_CHEMICAL_RISK_MARKERS)
+        )
 
     @staticmethod
     def _normalize_reasoning_request(value: Any) -> Any:
@@ -4125,6 +4705,38 @@ class TaskGenerationPipeline:
         return value
 
     @staticmethod
+    def _normalize_unsourced_governance_task(value: Any) -> Any:
+        """Turn unsourced governance wording into fixture-owned rule checks.
+
+        Medical, financial, tax and hazardous-chemical decisions are not
+        rewritten here; without authoritative sources they remain rejected.
+        """
+        replacements = (
+            ("法律法规", "内部业务规则"), ("法律规定", "内部业务规则"),
+            ("法规要求", "内部规则要求"), ("政策文件", "内部规则文档"),
+            ("监管要求", "内部审核要求"), ("合规性", "内部规则一致性"),
+            ("合规", "符合内部规则"),
+            ("legal compliance", "internal rule consistency"),
+            ("regulatory compliance", "internal rule consistency"),
+        )
+        if isinstance(value, str):
+            result = value
+            for old, new in replacements:
+                result = re.sub(re.escape(old), new, result, flags=re.I)
+            return result
+        if isinstance(value, list):
+            return [
+                TaskGenerationPipeline._normalize_unsourced_governance_task(item)
+                for item in value
+            ]
+        if isinstance(value, dict):
+            return {
+                key: TaskGenerationPipeline._normalize_unsourced_governance_task(item)
+                for key, item in value.items()
+            }
+        return value
+
+    @staticmethod
     def _unwrap_task_description(value: dict[str, Any]) -> dict[str, Any]:
         """Accept common repair envelopes while keeping one canonical shape."""
         if isinstance(value.get("output"), dict) and isinstance(value["output"].get("task"), str):
@@ -4135,50 +4747,7 @@ class TaskGenerationPipeline:
             return value["task_description"]
         return value
 
-    @staticmethod
-    def _deterministic_low_risk_task(task_intent: str) -> dict[str, Any]:
-        """Provide a safe task when source keywords repeatedly force unsafe topics."""
-        task_by_intent = {
-            "query": "根据用户提供的物品清单和筛选条件，找出符合条件的条目并以表格返回。",
-            "recommend": "根据用户提供的候选书籍、偏好和限制，推荐最合适的一项并说明依据。",
-            "compare": "根据用户提供的两个方案及评价字段，逐项比较差异并总结适用场景。",
-            "plan": "根据用户提供的目标、可用时间和限制条件，制定一份可执行的活动计划。",
-            "summarize": "将用户提供的会议记录整理为简洁摘要、决定事项和待办清单。",
-            "create": "根据用户提供的主题、目标受众、语气、必含信息和字数上限，创建一份结构清晰的文本草稿；缺失关键字段时先请求补充。",
-            "extract": "从用户提供的文本中提取指定字段；缺失字段明确标记为未提供。",
-            "classify": "按照用户提供的分类标签和规则，对输入条目分类并说明对应规则。",
-            "validate": "按照用户提供的检查规则验证输入记录，列出通过项和未通过项。",
-            "audit": "按照用户提供的完整性规则审查一组记录，并输出问题清单。",
-            "calculate": "根据用户提供的数值、单位和公式完成计算，并展示可复核步骤。",
-            "estimate": "根据用户提供的基础数据和假设进行区间估算，并说明不确定性。",
-            "schedule": "根据用户提供的事项、时长、先后约束和可用时间生成日程。",
-            "monitor": "根据用户提供的状态记录汇总当前状态、变化和待关注事项。",
-            "diagnose": "根据用户提供的家用设备类型、故障现象、最近变更和日志片段，按证据列出可能原因、验证步骤和停止条件；信息不足时先请求补充。",
-            "troubleshoot": "根据用户提供的设备现象和日志，整理排查顺序及验证方法。",
-            "transform": "将用户提供的文本转换为指定格式，且不增加原文没有的事实。",
-            "decide": "根据用户提供的候选项、约束和评价规则，选择一项并说明依据。",
-            "simulate": "根据用户提供的初始值、规则和参数模拟结果，并列明假设条件。",
-            "explain": "根据用户提供的材料，用通俗语言解释其中的概念和关系。",
-            "modify": "按照用户提供的修改规则改写文本，并简要列出所做修改。",
-        }
-        task = task_by_intent.get(
-            task_intent,
-            "根据用户提供的文本和明确要求完成处理；信息不足时先请求补充。",
-        )
-        return {
-            "task": task,
-            "task_intent": task_intent,
-            "goal": task,
-            "context": ["所有事实、数值和判断规则均由用户在运行时提供。"],
-            "expected_result": "给出严格基于用户输入、格式清晰且可复核的结果。",
-            "complexity": "simple",
-            "requirements": {
-                "input_modalities": ["text", "structured_data"],
-                "output_format": "Markdown",
-                "clarification_allowed": True,
-                "constraints": ["不得补充用户未提供的事实。"],
-            },
-        }
+
 
     @staticmethod
     def _unwrap_structured_output(
@@ -4322,6 +4891,49 @@ class TaskGenerationPipeline:
         }
 
     @staticmethod
+    def _align_environment_plan_with_route(
+        environment_plan: dict[str, Any], *, route_plan: dict[str, Any],
+        task_intent: str, supported_modes: set[str],
+    ) -> dict[str, Any]:
+        """Make the validated tool route authoritative over a noisy mode label.
+
+        A non-empty route plan represents operations that must cross the sandbox
+        boundary.  Treating such a task as stateless contradicts that contract.
+        The correction is deterministic and chooses the smallest environment
+        capable of implementing the route; it does not invent an unavailable
+        external service.
+        """
+        operations = route_plan.get("environment_operations", [])
+        if not isinstance(operations, list) or not operations:
+            raise PipelineGenerationError(
+                "agentic route requires at least one environment operation"
+            )
+        if environment_plan.get("mode") != "stateless":
+            return environment_plan
+
+        mutating_intents = {"modify", "execute", "schedule"}
+        required_mode = "stateful" if task_intent in mutating_intents else "reference_data"
+        if required_mode not in supported_modes:
+            raise PipelineGenerationError(
+                "task buildability: route requires environment mode "
+                f"{required_mode!r}, but supported={sorted(supported_modes)}"
+            )
+        logger.warning(
+            "environment_plan conflicts with non-empty route; aligned mode from "
+            "stateless to %s for intent=%s",
+            required_mode, task_intent,
+        )
+        return {
+            "mode": required_mode,
+            "requires_business_data": True,
+            "requires_persistence": required_mode == "stateful",
+            "reason": (
+                "已验证的训练路由包含必须跨越沙箱边界的业务操作；"
+                "按任务意图确定性选择最小可实现环境。"
+            ),
+        }
+
+    @staticmethod
     def _infer_environment_mode(
         *, task_description: dict[str, Any], task_intent: str
     ) -> str:
@@ -4363,18 +4975,6 @@ class TaskGenerationPipeline:
         # whether the result must be persisted. Without an explicit state
         # boundary, the minimal environment is stateless.
         return "stateless"
-
-    @staticmethod
-    def _looks_like_dialogue_closure(message: str) -> bool:
-        text = re.sub(r"[\s！!。,.，~～]+", "", str(message)).lower()
-        closure_patterns = (
-            r"^(?:好的?|行|可以)(?:就这样|先这样|结束|没有其他|没别的)?(?:谢谢|感谢)?(?:你|您)?$",
-            r"^(?:完美|满意|可以了|够用了)(?:谢谢|感谢)?(?:你|您)?$",
-            r"^(?:谢谢|感谢)(?:你|您)?(?:的帮助|耐心解答|耐心解释)?$",
-            r"^(?:没有|没了|暂无|暂时没有)(?:其他|别的)?(?:问题|需求)?(?:了)?$",
-            r"^(?:确认)?结束(?:对话)?$",
-        )
-        return any(re.fullmatch(pattern, text) for pattern in closure_patterns)
 
     @staticmethod
     def _validate_success_fixture_audit(audit: Any) -> None:
@@ -4596,8 +5196,7 @@ class TaskGenerationPipeline:
         *, task_description: dict[str, Any], table_definitions: list[Any]
     ) -> None:
         """Require traceable provenance for generated high-stakes reference facts."""
-        text = json.dumps(task_description, ensure_ascii=False).lower()
-        if not any(marker in text for marker in HIGH_STAKES_MARKERS):
+        if not TaskGenerationPipeline._is_high_stakes_task(task_description):
             return
         column_names = {
             str(column.get("name", "")).lower()
@@ -4620,6 +5219,69 @@ class TaskGenerationPipeline:
             )
 
     @staticmethod
+    def _normalize_public_input(task_description: dict[str, Any]) -> dict[str, Any]:
+        """Compile the public episode payload without copying hidden truth."""
+        task = str(task_description.get("task") or "").strip()
+        candidate = task_description.get("public_input")
+        candidate = candidate if isinstance(candidate, dict) else {}
+        message = candidate.get("initial_user_message")
+        if not isinstance(message, str) or not message.strip():
+            message = task
+        materials: list[dict[str, str]] = []
+        raw_materials = candidate.get("materials")
+        if isinstance(raw_materials, list):
+            for index, item in enumerate(raw_materials, start=1):
+                if isinstance(item, str):
+                    item = {"name": f"material-{index}", "mime_type": "text/plain", "content": item}
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                name = item.get("name")
+                mime_type = item.get("mime_type")
+                materials.append({
+                    "name": name.strip() if isinstance(name, str) and name.strip() else f"material-{index}",
+                    "mime_type": mime_type.strip() if isinstance(mime_type, str) and mime_type.strip() else "text/plain",
+                    "content": content.strip(),
+                })
+        return {"initial_user_message": message.strip(), "materials": materials}
+
+    @staticmethod
+    def _validate_public_input(
+        *, task_description: dict[str, Any], public_input: dict[str, Any], environment_mode: str,
+    ) -> None:
+        message = public_input.get("initial_user_message")
+        if not isinstance(message, str) or not message.strip():
+            raise PipelineGenerationError("public_input.initial_user_message must be non-empty")
+        materials = public_input.get("materials")
+        if not isinstance(materials, list):
+            raise PipelineGenerationError("public_input.materials must be a list")
+        text = json.dumps({
+            "task": task_description.get("task"),
+            "context": task_description.get("context"),
+            "requirements": task_description.get("requirements"),
+        }, ensure_ascii=False).lower()
+        references_runtime_material = re.search(
+            r"(?:以下|下列|上述|这段|这些|给定|提供|附上|附件).{0,12}"
+            r"(?:文本|资料|数据|列表|清单|内容|说明|笔记|记录|规格|描述|选项)",
+            text,
+        ) is not None
+        concrete = [
+            item for item in materials
+            if isinstance(item, dict)
+            and isinstance(item.get("content"), str)
+            and len(item["content"].strip()) >= 8
+            and not re.fullmatch(r"(?:用户)?(?:已)?提供(?:的)?(?:文本|资料|数据|内容|说明|笔记|记录|规格|描述)", item["content"].strip())
+        ]
+        if references_runtime_material and not concrete:
+            raise PipelineGenerationError(
+                "public_input is missing the concrete material referenced by the task"
+            )
+        if environment_mode == "stateless" and not message.strip():
+            raise PipelineGenerationError("stateless task requires a complete public user message")
+
+    @staticmethod
     def _validate_authoritative_task_input(
         *,
         task_description: dict[str, Any],
@@ -4629,13 +5291,7 @@ class TaskGenerationPipeline:
         """Do not let an LLM invent the source corpus for high-stakes lookup tasks."""
         if environment_mode not in {"reference_data", "stateful"}:
             return
-        text = json.dumps(task_description, ensure_ascii=False).lower()
-        high_stakes_markers = (
-            "法律", "法规", "法条", "政策文件", "合规", "医疗", "诊断", "用药",
-            "投资", "证券", "税务", "legal", "regulation", "medical", "diagnosis",
-            "investment", "tax",
-        )
-        if not any(marker in text for marker in high_stakes_markers):
+        if not TaskGenerationPipeline._is_high_stakes_task(task_description):
             return
         evidence = json.dumps(graph_context, ensure_ascii=False)
         if not re.search(r"https?://[^\s\"']+", evidence, re.I):
@@ -4743,258 +5399,6 @@ class TaskGenerationPipeline:
                 pass
 
     @staticmethod
-    def _validate_user_script_state_machine(script: dict[str, Any], index: int) -> None:
-        """Validate a reusable, finite user-behavior state machine."""
-        states = script.get("states")
-        transitions = script.get("transitions")
-        initial = script.get("initial_state")
-        variables = script.get("variables", {})
-        recovery_policy = script.get("recovery_policy")
-        if not isinstance(states, list) or len(states) < 2:
-            raise PipelineGenerationError(f"user_scripts[{index}] requires at least two states")
-        if not isinstance(transitions, list) or len(transitions) < 2:
-            raise PipelineGenerationError(f"user_scripts[{index}] requires at least two transitions")
-        if not isinstance(variables, dict):
-            raise PipelineGenerationError(f"user_scripts[{index}].variables must be an object")
-        if (
-            not isinstance(recovery_policy, dict)
-            or not isinstance(recovery_policy.get("max_recoveries"), int)
-            or not 1 <= recovery_policy["max_recoveries"] <= 3
-            or not isinstance(recovery_policy.get("user_behavior"), str)
-            or not recovery_policy["user_behavior"].strip()
-            or set(recovery_policy.get("handled_outcomes", [])) != RECOVERY_DIALOGUE_OUTCOMES
-        ):
-            raise PipelineGenerationError(f"user_scripts[{index}].recovery_policy is invalid")
-        by_id: dict[str, dict[str, Any]] = {}
-        for state_index, state in enumerate(states):
-            if not isinstance(state, dict):
-                raise PipelineGenerationError(f"user_scripts[{index}].states[{state_index}] must be an object")
-            state_id = state.get("state_id")
-            if not isinstance(state_id, str) or not state_id.strip() or state_id in by_id:
-                raise PipelineGenerationError(f"user_scripts[{index}] has invalid or duplicate state_id")
-            if not isinstance(state.get("user_behavior"), str) or not state["user_behavior"].strip():
-                raise PipelineGenerationError(f"user_scripts[{index}] state {state_id} requires user_behavior")
-            if not isinstance(state.get("terminal"), bool):
-                raise PipelineGenerationError(f"user_scripts[{index}] state {state_id} requires terminal")
-            by_id[state_id] = state
-        if not isinstance(initial, str) or initial not in by_id or by_id[initial]["terminal"]:
-            raise PipelineGenerationError(f"user_scripts[{index}] initial_state is invalid")
-
-        outgoing: dict[str, list[str]] = {state_id: [] for state_id in by_id}
-        seen_transitions: set[str] = set()
-        covered_outcomes: set[str] = set()
-        for transition_index, transition in enumerate(transitions):
-            if not isinstance(transition, dict):
-                raise PipelineGenerationError(f"user_scripts[{index}].transitions[{transition_index}] must be an object")
-            transition_id = transition.get("transition_id")
-            source, target = transition.get("from_state"), transition.get("to_state")
-            if not isinstance(transition_id, str) or not transition_id.strip() or transition_id in seen_transitions:
-                raise PipelineGenerationError(f"user_scripts[{index}] has invalid or duplicate transition_id")
-            if source not in by_id or target not in by_id:
-                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} references unknown state")
-            if by_id[source]["terminal"]:
-                raise PipelineGenerationError(f"user_scripts[{index}] terminal state {source} cannot have outgoing transitions")
-            if not isinstance(transition.get("condition"), str) or not transition["condition"].strip():
-                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} requires condition")
-            outcome = transition.get("outcome_category")
-            if outcome not in NORMAL_DIALOGUE_OUTCOMES:
-                raise PipelineGenerationError(
-                    f"user_scripts[{index}] transition {transition_id} has invalid outcome_category"
-                )
-            if not isinstance(transition.get("should_end"), bool):
-                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} requires should_end")
-            if transition["should_end"] != bool(by_id[target]["terminal"]):
-                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} end flag must match target state")
-            if outcome == "user_acceptance" and not by_id[target]["terminal"]:
-                raise PipelineGenerationError(f"user_scripts[{index}] user_acceptance must enter a terminal state")
-            if outcome in {"information_required", "user_correction", "user_rejection"} and by_id[target]["terminal"]:
-                raise PipelineGenerationError(f"user_scripts[{index}] {outcome} cannot enter a terminal state")
-            updates = transition.get("updates", {})
-            if not isinstance(updates, dict) or any(key not in variables for key in updates):
-                raise PipelineGenerationError(f"user_scripts[{index}] transition {transition_id} has invalid updates")
-            seen_transitions.add(transition_id)
-            covered_outcomes.add(str(outcome))
-            outgoing[source].append(target)
-
-        reachable = {initial}
-        frontier = [initial]
-        while frontier:
-            source = frontier.pop()
-            for target in outgoing[source]:
-                if target not in reachable:
-                    reachable.add(target)
-                    frontier.append(target)
-        if reachable != set(by_id):
-            raise PipelineGenerationError(f"user_scripts[{index}] contains unreachable states")
-        visiting: set[str] = set()
-        visited: set[str] = set()
-
-        def reject_cycle(state_id: str) -> None:
-            if state_id in visiting:
-                raise PipelineGenerationError(f"user_scripts[{index}] state machine must be acyclic")
-            if state_id in visited:
-                return
-            visiting.add(state_id)
-            for target in outgoing[state_id]:
-                reject_cycle(target)
-            visiting.remove(state_id)
-            visited.add(state_id)
-
-        reject_cycle(initial)
-        terminals = {state_id for state_id, state in by_id.items() if state["terminal"]}
-        if not terminals:
-            raise PipelineGenerationError(f"user_scripts[{index}] requires a terminal state")
-        reverse: dict[str, set[str]] = {state_id: set() for state_id in by_id}
-        for source, targets in outgoing.items():
-            for target in targets:
-                reverse[target].add(source)
-        can_terminate = set(terminals)
-        frontier = list(terminals)
-        while frontier:
-            target = frontier.pop()
-            for source in reverse[target]:
-                if source not in can_terminate:
-                    can_terminate.add(source)
-                    frontier.append(source)
-        if reachable - can_terminate:
-            raise PipelineGenerationError(f"user_scripts[{index}] has states without a terminal path")
-        missing_outcomes = NORMAL_DIALOGUE_OUTCOMES - covered_outcomes
-        if missing_outcomes:
-            raise PipelineGenerationError(
-                f"user_scripts[{index}] misses dialogue outcomes: {sorted(missing_outcomes)}"
-            )
-
-    @staticmethod
-    def _deterministic_user_scripts(*, description: dict[str, Any], count: int) -> list[dict[str, Any]]:
-        """Build minimal valid FSMs when a model cannot repair script structure.
-
-        User scripts are test drivers rather than task semantics. A structurally
-        sound generic driver is therefore preferable to discarding an otherwise
-        valid task after repeated formatting failures.
-        """
-        goal = str(description.get("description") or description.get("task") or "完成用户任务").strip()
-        scripts: list[dict[str, Any]] = []
-        for index in range(1, max(1, count) + 1):
-            script = {
-                "script_id": f"script-{index}",
-                "goal": goal,
-                "initial_state": "request",
-                "variables": {"clarification": None},
-                "recovery_policy": {
-                    "max_recoveries": 2,
-                    "user_behavior": "指出回复没有解决当前问题，并要求 Agent 根据已有信息重新回答。",
-                    "handled_outcomes": sorted(RECOVERY_DIALOGUE_OUTCOMES),
-                },
-                "states": [
-                    {
-                        "state_id": "request",
-                        "user_behavior": "提出任务请求，并仅提供完成任务所需的公开信息。",
-                        "terminal": False,
-                    },
-                    {
-                        "state_id": "clarify",
-                        "user_behavior": "回答一个必要澄清问题，或要求 Agent 直接完成任务。",
-                        "terminal": False,
-                    },
-                    {"state_id": "corrected", "user_behavior": "纠正 Agent 对需求的误解。", "terminal": False},
-                    {"state_id": "rejected", "user_behavior": "拒绝不符合约束的方案并重申要求。", "terminal": False},
-                    {"state_id": "review", "user_behavior": "检查 Agent 已完成的结果并决定是否接受。", "terminal": False},
-                    {
-                        "state_id": "done",
-                        "user_behavior": "确认收到结果并结束对话。",
-                        "terminal": True,
-                    },
-                ],
-                "transitions": [
-                    {
-                        "transition_id": "request-to-clarify",
-                        "outcome_category": "information_required",
-                        "from_state": "request",
-                        "to_state": "clarify",
-                        "condition": "Agent 请求必要信息或开始处理任务",
-                        "should_end": False,
-                        "updates": {"clarification": "按任务上下文提供必要补充"},
-                    },
-                    {
-                        "transition_id": "request-to-corrected",
-                        "outcome_category": "user_correction",
-                        "from_state": "request", "to_state": "corrected",
-                        "condition": "Agent 误解了用户已明确的目标或约束",
-                        "should_end": False, "updates": {},
-                    },
-                    {
-                        "transition_id": "request-to-rejected",
-                        "outcome_category": "user_rejection",
-                        "from_state": "request", "to_state": "rejected",
-                        "condition": "Agent 给出不符合约束的候选方案",
-                        "should_end": False, "updates": {},
-                    },
-                    {
-                        "transition_id": "request-to-review",
-                        "outcome_category": "goal_satisfied",
-                        "from_state": "request", "to_state": "review",
-                        "condition": "Agent 已完成当前任务目标，等待用户确认",
-                        "should_end": False, "updates": {},
-                    },
-                    {
-                        "transition_id": "clarify-to-review",
-                        "outcome_category": "goal_satisfied",
-                        "from_state": "clarify",
-                        "to_state": "review",
-                        "condition": "Agent 给出可验收的最终结果",
-                        "should_end": False,
-                        "updates": {},
-                    },
-                    {"transition_id": "corrected-to-review", "outcome_category": "goal_satisfied", "from_state": "corrected", "to_state": "review", "condition": "Agent 按纠正后的要求完成任务", "should_end": False, "updates": {}},
-                    {"transition_id": "rejected-to-review", "outcome_category": "goal_satisfied", "from_state": "rejected", "to_state": "review", "condition": "Agent 提供符合约束的新方案", "should_end": False, "updates": {}},
-                    {"transition_id": "review-to-done", "outcome_category": "user_acceptance", "from_state": "review", "to_state": "done", "condition": "用户接受已完成的结果", "should_end": True, "updates": {}},
-                ],
-            }
-            TaskGenerationPipeline._validate_user_script_state_machine(script, index - 1)
-            scripts.append(script)
-        return scripts
-
-    def _deterministic_dialogue_fixture(
-        self, *, description: dict[str, Any], profile: Any,
-        script: dict[str, Any], script_id: str, session_id: str,
-    ) -> dict[str, Any]:
-        """Create a bounded acceptance fixture without using an LLM transcript.
-
-        These records only exercise artifact shape and seed acceptance-fixture
-        generation. They are deliberately not consumed by the runtime user
-        simulator and contain no generated business truth.
-        """
-        request = str(description.get("task") or description.get("description") or "完成任务").strip()
-        expected = str(description.get("expected_result") or description.get("goal") or "给出可核验的结果").strip()
-        clarification = "请基于任务中已经给出的约束继续，并明确说明结果依据。"
-        turns = [
-            {"role": "user", "content": request},
-            {"role": "agent", "content": "我会先核对必要条件，再完成任务。请确认按已给出的约束执行。"},
-            {"role": "user", "content": clarification},
-            {"role": "agent", "content": expected},
-            {"role": "user", "content": "结果符合要求，我接受并结束本次对话。"},
-        ]
-        # Preserve configured bounds for callers using non-default values.
-        turns = turns[:self.maximum_dialogue_turns]
-        while len(turns) < self.minimum_dialogue_turns:
-            role = "agent" if turns[-1]["role"] == "user" else "user"
-            content = expected if role == "agent" else clarification
-            turns.append({"role": role, "content": content})
-        user_turns = sum(turn["role"] == "user" for turn in turns)
-        return {
-            "script_id": script_id,
-            "session_id": session_id,
-            "profile_id": profile.get("profile_id") if isinstance(profile, dict) else None,
-            "turns": turns,
-            "turn_count": len(turns),
-            "user_end_flags": [False] * max(0, user_turns - 1) + [True],
-            "state_trace": ["request", "clarify", "review", "done"],
-            "final_variables": {"clarification": clarification},
-            "termination_reason": "user_script_end",
-            "fixture_only": True,
-        }
-
-    @staticmethod
     def _normalize_metric_weights(metrics: list[Any]) -> list[Any]:
         """Normalize positive and negative metric weights independently.
 
@@ -5077,6 +5481,42 @@ class TaskGenerationPipeline:
                     rule_assertion = rule.get("assertion")
                     if (not isinstance(rule_assertion, str) or not rule_assertion.strip()) and isinstance(condition, str) and condition.strip():
                         rule["assertion"] = condition.strip()
+                # A prose assertion is not a deterministic program. Avoid a
+                # hybrid declaration that the runtime cannot honestly execute
+                # as two independent branches; retain all criteria in one
+                # explicit semantic judge instead.
+                criteria: list[str] = []
+                for value in metric.get("criteria", []):
+                    if isinstance(value, str) and value.strip() and value.strip() not in criteria:
+                        criteria.append(value.strip())
+                if isinstance(rule, dict) and isinstance(rule.get("assertion"), str):
+                    value = rule["assertion"].strip()
+                    if value and value not in criteria:
+                        criteria.append(value)
+                semantic = evaluator.get("external_llm")
+                if isinstance(semantic, dict):
+                    values = semantic.get("criteria", [])
+                    if isinstance(values, str):
+                        values = [values]
+                    judge = semantic.get("judge_criteria")
+                    if isinstance(judge, str):
+                        values = [*values, judge]
+                    for value in values:
+                        if isinstance(value, str) and value.strip() and value.strip() not in criteria:
+                            criteria.append(value.strip())
+                metric["type"] = "model-based"
+                metric.pop("condition", None)
+                metric["criteria"] = criteria or [str(metric.get("rubric") or "任务结果满足目标")]
+                metric["evaluator"] = {
+                    "kind": "external_llm_judge",
+                    "source": "external_llm",
+                    "criteria": list(metric["criteria"]),
+                    "score_mapping": copy.deepcopy(evaluator.get("score_mapping", {"pass": 1, "fail": 0})),
+                }
+                logger.info(
+                    "normalized non-executable hybrid outcome to semantic judge: metric=%s",
+                    metric.get("id"),
+                )
         return metrics
 
     @staticmethod
@@ -5213,6 +5653,7 @@ class TaskGenerationPipeline:
     def _canonical_observation_schema(candidate: Any) -> dict[str, Any]:
         """Return one stable observation shape for every generated task."""
         descriptions = {
+            "episode_id": "当前 episode 标识。",
             "conversation": "当前 episode 的完整对话消息。",
             "public_observation": "沙箱允许 Agent 或 Trainer 观察的公开环境信息。",
             "available_tools": "当前提供给 Agent 的 OpenAI Function Tool 定义。",
@@ -5224,19 +5665,26 @@ class TaskGenerationPipeline:
         if isinstance(candidate, dict) and isinstance(candidate.get("properties"), dict):
             properties.update(candidate["properties"])
         field_types = {
-            "conversation": "array", "public_observation": "object",
+            "episode_id": "string", "conversation": "array", "public_observation": "object",
             "available_tools": "array", "tool_call": "object",
             "tool_results": "array", "final_agent_response": "string",
         }
         for name, description in descriptions.items():
-            properties.setdefault(name, {
+            # These fields are emitted by the shared runtime protocol.  Model
+            # proposals may add task-specific observation fields, but must not
+            # redefine platform-owned types (for example tool_results as an
+            # object when the runtime always emits an array).
+            properties[name] = {
                 "type": field_types[name],
                 "description": description,
-            })
+            }
         return {
             "type": "object",
             "properties": properties,
-            "required": ["conversation", "available_tools", "tool_results"],
+            "required": [
+                "episode_id", "conversation", "available_tools", "tool_results",
+                "public_observation", "final_agent_response",
+            ],
             "additionalProperties": False,
         }
 
@@ -5279,7 +5727,7 @@ class TaskGenerationPipeline:
             expected = spec.get("expected")
             targets_noise = (
                 spec.get("operator") == "none_tool_calls"
-                or expected in noise_names
+                or (isinstance(expected, str) and expected in noise_names)
                 or (isinstance(expected, list) and bool(set(expected) & noise_names))
             )
             if metric.get("category") == "penalty" and targets_noise:
@@ -5422,7 +5870,6 @@ class TaskGenerationPipeline:
                 simulated_inputs = {
                     "user_profiles",
                     "user_scripts",
-                    "dialogue_sessions",
                     "simulated_dialogue",
                     "user_simulation",
                 }
@@ -5493,25 +5940,48 @@ class TaskGenerationPipeline:
                 )
 
     @staticmethod
-    def _validate_metric_implementations(specs: list[Any], metrics: list[Any]) -> None:
+    def _validate_metric_implementations(
+        specs: list[Any], metrics: list[Any], *, require_process: bool = False
+    ) -> None:
+        from .sandbox_runtime import DeclarativeMetricEvaluator, SandboxError
+
         by_id = {
             metric.get("id"): metric for metric in metrics
             if isinstance(metric, dict) and isinstance(metric.get("id"), str)
         }
         seen: set[str] = set()
         allowed_sources = {"business_state", "trajectory", "final_agent_response", "observation"}
-        allowed_operators = {"eq", "ne", "gte", "lte", "contains", "exists", "count_gte", "count_eq", "none_tool_calls"}
+        allowed_operators = {
+            "eq", "ne", "gte", "lte", "contains", "exists", "count_gte",
+            "count_eq", "none_tool_calls", "contains_tool_call",
+        }
         for index, spec in enumerate(specs):
             if not isinstance(spec, dict):
                 raise PipelineGenerationError(f"metric_implementations[{index}] must be an object")
             metric_id = spec.get("metric_id")
             metric = by_id.get(metric_id)
-            if metric is None or metric_id in seen or metric.get("type") != "rule-based":
-                raise PipelineGenerationError(f"metric_implementations[{index}] references a non-rule metric")
+            is_process_call = (
+                isinstance(metric, dict)
+                and metric.get("category") == "process"
+                and spec.get("operator") == "contains_tool_call"
+            )
+            if metric is None or metric_id in seen or (
+                metric.get("type") != "rule-based" and not is_process_call
+            ):
+                raise PipelineGenerationError(
+                    f"metric_implementations[{index}] references an unsupported metric"
+                )
             if spec.get("source") not in allowed_sources or spec.get("operator") not in allowed_operators:
                 raise PipelineGenerationError(f"metric_implementations[{index}] source/operator is invalid")
             if not isinstance(spec.get("path"), str) or not spec["path"]:
                 raise PipelineGenerationError(f"metric_implementations[{index}] path is invalid")
+            try:
+                DeclarativeMetricEvaluator.path_tokens(spec["path"])
+            except (SandboxError, ValueError, SyntaxError) as exc:
+                raise PipelineGenerationError(
+                    f"metric_implementations[{index}] unsupported path {spec['path']!r}; "
+                    "use fields, integer indices or literal equality filters"
+                ) from exc
             if spec.get("source") == "final_agent_response" and spec.get("path") not in {"$", ""}:
                 raise PipelineGenerationError(
                     f"metric_implementations[{index}] cannot address fields on raw final_agent_response"
@@ -5520,6 +5990,19 @@ class TaskGenerationPipeline:
                 raise PipelineGenerationError(
                     f"metric_implementations[{index}] cannot address final_agent_response through business_state"
                 )
+            if is_process_call:
+                expected = spec.get("expected")
+                if (
+                    spec.get("source") != "trajectory"
+                    or spec.get("path") != "$.events"
+                    or not isinstance(expected, dict)
+                    or not isinstance(expected.get("tool_name"), str)
+                    or not isinstance(expected.get("arguments"), dict)
+                    or not isinstance(expected.get("captures", []), list)
+                ):
+                    raise PipelineGenerationError(
+                        f"metric_implementations[{index}] process call contract is invalid"
+                    )
             mapping = spec.get("score_mapping")
             low, high = metric.get("score_range", [0, 1])
             if (
@@ -5531,11 +6014,153 @@ class TaskGenerationPipeline:
         required = {
             metric_id for metric_id, metric in by_id.items()
             if metric.get("type") == "rule-based"
+            or (require_process and metric.get("category") == "process")
         }
         if seen != required:
             raise PipelineGenerationError(
-                f"rule-based metrics require executable implementations; missing={sorted(required - seen)}"
+                "rule-based and process metrics require executable implementations; "
+                f"missing={sorted(required - seen)}"
             )
+
+    @staticmethod
+    def _compile_process_metric_implementations(
+        *,
+        metrics: list[Any],
+        metric_implementations: list[Any],
+        business_scenarios: list[Any],
+        tool_bindings: list[Any],
+    ) -> list[Any]:
+        """Compile process rewards from the accepted success trajectory.
+
+        The success scenario is already the executable source of truth for tool
+        names and canonical arguments. Reusing it removes a redundant runtime
+        LLM judgment while retaining support for arguments captured from an
+        earlier tool result.
+        """
+        result = [dict(item) for item in metric_implementations if isinstance(item, dict)]
+        result = [
+            item for item in result
+            if not any(
+                isinstance(metric, dict)
+                and metric.get("id") == item.get("metric_id")
+                and metric.get("category") == "process"
+                for metric in metrics
+            )
+        ]
+        action_to_tool = {
+            item.get("action_name"): item.get("tool_name")
+            for item in tool_bindings
+            if isinstance(item, dict)
+            and isinstance(item.get("action_name"), str)
+            and isinstance(item.get("tool_name"), str)
+        }
+        success = next((
+            scenario for scenario in business_scenarios
+            if isinstance(scenario, dict) and scenario.get("kind") == "goal_success"
+        ), None)
+        steps = success.get("steps", []) if isinstance(success, dict) else []
+        if not isinstance(steps, list):
+            steps = []
+        for metric in metrics:
+            if not isinstance(metric, dict) or metric.get("category") != "process":
+                continue
+            target = metric.get("target_action")
+            tool_name = action_to_tool.get(target, target)
+            target_index = next((
+                index for index, step in enumerate(steps)
+                if isinstance(step, dict)
+                and step.get("operation") == "tool_call"
+                and step.get("tool_name") == tool_name
+            ), None)
+            if target_index is None:
+                raise PipelineGenerationError(
+                    f"process metric {metric.get('id')} has no matching success tool call"
+                )
+            target_step = steps[target_index]
+            arguments = target_step.get("arguments", {})
+            if not isinstance(arguments, dict):
+                raise PipelineGenerationError(
+                    f"process metric {metric.get('id')} success arguments are invalid"
+                )
+            referenced = {
+                value.get("$ref")
+                for value in TaskGenerationPipeline._walk_values(arguments)
+                if isinstance(value, dict) and set(value) == {"$ref"}
+                and isinstance(value.get("$ref"), str)
+            }
+            captures: list[dict[str, str]] = []
+            for step in steps[:target_index]:
+                if not isinstance(step, dict) or step.get("operation") != "tool_call":
+                    continue
+                declared = step.get("capture", {})
+                if not isinstance(declared, dict):
+                    continue
+                for name, path in declared.items():
+                    if name in referenced and isinstance(path, str):
+                        captures.append({
+                            "name": name,
+                            "tool_name": str(step.get("tool_name")),
+                            "path": path,
+                        })
+            if referenced != {item["name"] for item in captures}:
+                raise PipelineGenerationError(
+                    f"process metric {metric.get('id')} has unresolved success references"
+                )
+            result.append({
+                "metric_id": metric["id"],
+                "source": "trajectory",
+                "path": "$.events",
+                "operator": "contains_tool_call",
+                "expected": {
+                    "tool_name": tool_name,
+                    "arguments": copy.deepcopy(arguments),
+                    "captures": captures,
+                },
+                "score_mapping": {"pass": 1, "fail": 0},
+            })
+        return result
+
+    @staticmethod
+    def _normalize_compiled_process_metrics(
+        metrics: list[Any], metric_implementations: list[Any]
+    ) -> None:
+        """Make the metric declaration agree with its compiled runtime rule."""
+        compiled = {
+            item.get("metric_id"): item
+            for item in metric_implementations
+            if isinstance(item, dict) and item.get("operator") == "contains_tool_call"
+        }
+        for metric in metrics:
+            if not isinstance(metric, dict) or metric.get("category") != "process":
+                continue
+            spec = compiled.get(metric.get("id"))
+            if not isinstance(spec, dict):
+                continue
+            expected = spec.get("expected", {})
+            metric["type"] = "rule-based"
+            metric["condition"] = "trajectory_contains_exact_compiled_tool_call"
+            metric["evaluator"] = {
+                "kind": "trajectory_rule",
+                "source": "runtime_rule",
+                "assertion": (
+                    "trajectory contains the accepted success-path call to "
+                    f"{expected.get('tool_name')} with exact canonical arguments"
+                ),
+                "score_mapping": {"pass": 1, "fail": 0},
+            }
+            metric.pop("evaluation_inputs", None)
+            metric.pop("criteria", None)
+
+    @staticmethod
+    def _walk_values(value: Any) -> list[Any]:
+        values = [value]
+        if isinstance(value, dict):
+            for item in value.values():
+                values.extend(TaskGenerationPipeline._walk_values(item))
+        elif isinstance(value, list):
+            for item in value:
+                values.extend(TaskGenerationPipeline._walk_values(item))
+        return values
 
     @staticmethod
     def _promote_unimplemented_rule_metrics(
@@ -5659,8 +6284,61 @@ class TaskGenerationPipeline:
             if not isinstance(rows, list) or not rows:
                 raise PipelineGenerationError(f"data_tables[{index}] requires complete non-empty rows")
             for row_index, row in enumerate(rows):
-                if not isinstance(row, dict) or any(column not in row for column in column_names):
+                if not isinstance(row, dict) or set(row) != column_names:
                     raise PipelineGenerationError(f"data_tables[{index}].rows[{row_index}] is not a complete row")
+
+    @staticmethod
+    def _validate_relational_data(tables: list[dict[str, Any]]) -> None:
+        """Validate generated rows with the same relational invariants as runtime."""
+        from .sandbox_runtime import ManifestDataStore, SandboxError
+
+        by_name = {str(table["table_name"]): table for table in tables}
+        for table in tables:
+            name = str(table["table_name"])
+            rows = table["rows"]
+            primary = table.get("primary_key", [])
+            keys = [tuple(row.get(field) for field in primary) for row in rows]
+            if len(keys) != len(set(keys)):
+                raise PipelineGenerationError(f"data table {name} has duplicate primary keys")
+            for foreign in table.get("foreign_keys", []):
+                if not isinstance(foreign, dict):
+                    raise PipelineGenerationError(f"data table {name} has an invalid foreign key")
+                field = foreign.get("column")
+                parent_name = foreign.get("ref_table") or foreign.get("references_table")
+                target = foreign.get("ref_column") or foreign.get("references_column")
+                parent = by_name.get(str(parent_name))
+                parent_columns = {
+                    item.get("name") for item in parent.get("columns", [])
+                } if isinstance(parent, dict) else set()
+                own_columns = {item.get("name") for item in table.get("columns", [])}
+                if field not in own_columns or target not in parent_columns:
+                    raise PipelineGenerationError(
+                        f"data table {name} foreign key declaration is invalid"
+                    )
+                available = {row.get(target) for row in parent["rows"]}
+                missing = sorted({row.get(field) for row in rows if row.get(field) is not None} - available, key=str)
+                if missing:
+                    raise PipelineGenerationError(
+                        f"data table {name}.{field} has missing foreign values: {missing[:5]}"
+                    )
+            for constraint in table.get("constraints", []):
+                if isinstance(constraint, str):
+                    expression = constraint.strip()
+                elif isinstance(constraint, dict) and str(constraint.get("type", "CHECK")).upper() == "CHECK":
+                    expression = constraint.get("expression")
+                else:
+                    expression = None
+                if not isinstance(expression, str) or not expression.strip():
+                    raise PipelineGenerationError(f"data table {name} has an invalid CHECK constraint")
+                try:
+                    if any(not ManifestDataStore._check_constraint(row, expression) for row in rows):
+                        raise PipelineGenerationError(
+                            f"data table {name} violates CHECK constraint: {expression}"
+                        )
+                except SandboxError as exc:
+                    raise PipelineGenerationError(
+                        f"data table {name} has unsupported CHECK constraint: {expression}"
+                    ) from exc
 
     @staticmethod
     def _validate_entities(entities: Any) -> None:
@@ -5681,8 +6359,18 @@ class TaskGenerationPipeline:
 
     @staticmethod
     def _validate_table_definitions(tables: Any) -> None:
+        from .sandbox_runtime import ManifestDataStore, SandboxError
+
         if not isinstance(tables, list) or not tables:
             raise PipelineGenerationError("environment_table_design.tables must be a non-empty list")
+        declared_names = [
+            table.get("table_name") for table in tables if isinstance(table, dict)
+        ]
+        if any(not isinstance(name, str) or not name.strip() for name in declared_names):
+            raise PipelineGenerationError("table definitions contain an invalid table_name")
+        if len(declared_names) != len(set(declared_names)):
+            raise PipelineGenerationError("table definitions contain duplicate table_name values")
+        known_tables = set(declared_names)
         names: set[str] = set()
         for index, table in enumerate(tables):
             if not isinstance(table, dict):
@@ -5708,6 +6396,55 @@ class TaskGenerationPipeline:
             for field in ("foreign_keys", "indexes", "constraints"):
                 if field in table and not isinstance(table[field], list):
                     raise PipelineGenerationError(f"table definitions[{index}].{field} must be a list")
+            for foreign in table.get("foreign_keys", []):
+                ref_table = foreign.get("ref_table") or foreign.get("references_table") if isinstance(foreign, dict) else None
+                ref_column = foreign.get("ref_column") or foreign.get("references_column") if isinstance(foreign, dict) else None
+                if (
+                    not isinstance(foreign, dict)
+                    or not isinstance(foreign.get("column"), str)
+                    or foreign.get("column") not in column_names
+                    or ref_table not in known_tables
+                    or not isinstance(ref_column, str)
+                    or not ref_column.strip()
+                ):
+                    raise PipelineGenerationError(
+                        f"table definitions[{index}] contains an invalid foreign key"
+                    )
+            for constraint in table.get("constraints", []):
+                if isinstance(constraint, str):
+                    expression = constraint.strip()
+                elif isinstance(constraint, dict) and str(constraint.get("type", "CHECK")).upper() == "CHECK":
+                    expression = constraint.get("expression")
+                else:
+                    expression = None
+                if not isinstance(expression, str) or not expression.strip():
+                    raise PipelineGenerationError(
+                        f"table definitions[{index}] contains an invalid CHECK constraint"
+                    )
+                for clause in re.split(r"\s+AND\s+", expression.strip(), flags=re.I):
+                    in_match = re.fullmatch(
+                        r"\s*([A-Za-z_][A-Za-z0-9_]*)\s+IN\s*\((.*)\)\s*",
+                        clause, flags=re.I,
+                    )
+                    comparison = re.fullmatch(
+                        r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|<>|!=|=|>|<)\s*(.*?)\s*",
+                        clause,
+                    )
+                    match = in_match or comparison
+                    if not match or match.group(1) not in column_names:
+                        raise PipelineGenerationError(
+                            f"table definitions[{index}] has unsupported CHECK constraint: {expression}"
+                        )
+                    try:
+                        if in_match:
+                            import ast
+                            ast.literal_eval(f"({in_match.group(2)},)")
+                        else:
+                            ManifestDataStore._constraint_literal(comparison.group(3))
+                    except (ValueError, SyntaxError, SandboxError) as exc:
+                        raise PipelineGenerationError(
+                            f"table definitions[{index}] has unsupported CHECK constraint: {expression}"
+                        ) from exc
             names.add(name)
 
     @staticmethod
@@ -5756,36 +6493,6 @@ class TaskGenerationPipeline:
             "root": str(artifact_dir),
             "document_file": str(document_path.relative_to(artifact_dir)),
             "tables": manifest_tables,
-        }
-
-    @staticmethod
-    def _materialize_user_simulation(
-        profiles: list[Any],
-        scripts: list[Any],
-        sessions: list[dict[str, Any]],
-        artifact_dir: Path,
-    ) -> dict[str, Any]:
-        """Persist user simulation inputs and sessions outside task.json."""
-        sessions_dir = artifact_dir / "sessions"
-        sessions_dir.mkdir(parents=True, exist_ok=True)
-        profiles_path = artifact_dir / "user_profiles.json"
-        scripts_path = artifact_dir / "user_scripts.json"
-        profiles_path.write_text(json.dumps(profiles, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        scripts_path.write_text(json.dumps(scripts, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        session_files: list[dict[str, str]] = []
-        for index, session in enumerate(sessions):
-            session_id = str(session.get("session_id") or f"session-{index + 1}")
-            safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id).strip("._") or f"session-{index + 1}"
-            path = sessions_dir / f"{safe_id}.json"
-            path.write_text(json.dumps(session, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            session_files.append({"session_id": session_id, "file": str(path.relative_to(artifact_dir))})
-        return {
-            "version": "2.0",
-            "script_model": "finite_state_machine",
-            "root": str(artifact_dir),
-            "profiles_file": str(profiles_path.relative_to(artifact_dir)),
-            "scripts_file": str(scripts_path.relative_to(artifact_dir)),
-            "sessions": session_files,
         }
 
     @staticmethod

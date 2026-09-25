@@ -281,6 +281,7 @@ def compile_task_spec(
             "goal": task_description.get("goal"),
             "expected_result": task_description.get("expected_result"),
             "requirements": task_description.get("requirements", {}),
+            "public_input": task_description.get("public_input", {}),
         },
         "training_contract": {
             "category": training_category,

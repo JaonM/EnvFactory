@@ -4,6 +4,11 @@
 
 `examples/generate_task.py` 统一使用分阶段外部 LLM 流程。每个任务先随机选择一个 `task_intent`，再由独立的外部 OpenAI 兼容 LLM 按该意图生成任务；进入下一阶段前进行 JSON 结构校验。
 
+代码按职责组织：`task_pipeline.py` 只保留领域阶段编排和跨阶段契约；`pipeline_stage.py`
+负责单阶段 LLM 调用、缓存、结构校验、错误反馈与重试；`user_simulation_contract.py`
+负责用户画像/FSM 协议校验、确定性剧本和运行时输入物化。`TaskGenerationPipeline` 保留原有
+方法入口，因此调用方和已生成任务契约不受模块拆分影响。
+
 当前任务意图包括：`query`（查询）、`explain`（解释）、`compare`（比较）、`recommend`（推荐）、`diagnose`（诊断）、`modify`（修改）、`execute`（执行）、`plan`（规划）、`summarize`（总结）、`create`（创建）、`extract`（提取）、`classify`（分类）、`validate`（验证）、`audit`（审查）、`calculate`（计算）、`estimate`（估算）、`schedule`（排程）、`monitor`（监控）、`troubleshoot`（排障）、`transform`（转换）、`decide`（决策）和 `simulate`（模拟）。只有 `plan` 意图允许生成策划或执行方案，其他意图必须保持对应的目标和输出形式。可通过 `--task-intent` 指定意图，不指定时随机选择。
 
 ```text
@@ -15,8 +20,7 @@ Scene 路径
   1b. environment_plan（stateless/reference_data/stateful/external_capability）
   2. environment_data（仅 reference_data/stateful 生成业务实体和表）
   3. user_profiles 与 user_scripts（画像独立，剧本参考任务和业务环境）
-  4. dialogue_sessions（独立 User/Agent LLM 角色）
-  5. agent_actions
+  4. agent_actions
   5b. capability_plan（区分环境操作、Agent 推理和最终回答）
   6. openai_tools（只接收环境操作）
   6b. tool_implementation_specs（为可声明化的单表只读查询生成编译规格）
@@ -37,6 +41,17 @@ Scene 路径
 `environment_plan` 只依据任务描述中的明确目标选择运行模式。`stateless` 任务直接处理用户提供的文本或结构化输入，跳过实体、表结构、rows、一致性和持久化文档生成；其 data manifest 明确标记 `environment_mode=stateless` 且允许空 `tables`。`extract`、`summarize`、`classify`、`transform`、`explain` 等意图在没有明确保存、更新或外部实时能力要求时会被确定性收敛为 `stateless`，避免用户模拟中的扩展请求污染正式任务范围。`reference_data` 生成只读资料，`stateful` 生成可持久化业务状态，`external_capability` 描述外部能力边界。
 
 任务描述进入环境规划前先经过独立 grounding 审计，检查任务是否由声明的运行时用户输入、业务资料或工具能力完成，是否要求猜测未提供的价格、成分、属性或排名，以及预期结论是否可推导。审计失败时先修复完整任务描述；连续失败则拒绝生成，避免将隐藏答案或臆造事实带入后续用户模拟和奖励。
+
+任务描述同时生成规范化 `public_input`：`initial_user_message` 是 episode 的初始公开请求，
+`materials` 保存题面明确引用的文本或结构化输入。若题面提到“用户提供的资料”“以下文本”或
+“给定数据”，但没有交付实际材料，任务会在生成阶段被拒绝。`public_input` 会写入 task、
+TaskSpec、User Simulator FSM，并由沙箱 observation 和真实 rollout 暴露给 Agent；它不能包含
+业务数据库中的隐藏真值。
+
+生成器还接收运行时能力目录。未配置 `SANDBOX_EXTERNAL_CAPABILITY_URL`，且没有有效的
+`SANDBOX_EXTERNAL_FIXTURES` 文件时，能力目录不包含 `external_capability`，任务不得依赖实时搜索、
+天气、行情或其他外部服务。沙箱构建前会再次执行 buildability preflight；任务契约、数据清单、
+外部能力或奖励 DSL 不可实现时直接归还任务生成阶段，不消耗 Luna 构建预算。
 
 数据型环境还执行独立 grounding 审计：业务 rows 必须覆盖任务所需事实；唯一推荐、排序、合规判断或首选结论必须具有唯一且可追溯的决定性证据；成功答案引用的数值、属性和理由必须与 rows 一致。确定性关键词对齐也在该阶段执行，失败会反馈给 `environment_data_consistency.repair`，只重做数据而不重跑已通过的任务描述。动作、工具、奖励和 fixture 同样在各自边界反馈并重试。`reference_data`/`stateful` 只要包含业务表，就必须至少暴露一个读取或操作数据的业务工具，不能把读取私有数据误标为 Agent 自身推理；`reference_data` 若模型遗漏业务工具，会从已验证的数据访问动作生成通用只读工具和绑定。data manifest 的 `environment_mode` 与顶层环境计划保持一致。
 
@@ -65,13 +80,11 @@ Scene 路径
 
 `acceptance_contract` 由 EnvFactory 根据业务数据、原子动作、工具、关键奖励步骤和指标确定性生成，包含业务场景、数据不变量、工具非法输入、成功/失败奖励样例、数据变异策略和 mutation test 清单。Code Agent 不能修改该契约；外层验收使用它执行黑盒轨迹、前后数据快照、反事实奖励和实现缺陷注入测试。
 
-用户画像和用户剧本由两个独立提示词生成。用户画像不强制与任务主题或业务环境相关，但要求结构化描述 `profile_id`、身份背景、年龄阶段、职业或人生阶段、地域语境、教育背景、知识水平、目标动机、沟通风格、语言习惯、决策方式、风险容忍度、耐心、信任度、信息披露方式、提问方式、反馈方式、资源和时间敏感度、无障碍需求、挫败触发点、误解或偏见、已知事实、未知事实及行为倾向。数组字段应提供多个特征，画像之间要有明显差异；画像只影响用户的表达、节奏和决策，不提供任务业务真值。用户剧本采用有限状态机：`initial_state` 指向初始状态，`states` 定义用户行为和终止状态，`transitions` 通过 `from_state`、`to_state`、`condition`、`should_end` 和 `updates` 描述转移，`variables` 声明可逐步披露的用户约束。生成器检查状态引用、可达性、终止路径和变量更新；User LLM 每轮只能选择当前状态的一条合法 transition。剧本生成不依赖用户画像，也不直接参与动作、工具或奖励设计。生成每个 session 时，从用户画像集合中随机选择一个 profile 与状态机组合，并记录 `profile_id` 和 `state_trace`。任务生成 CLI 每次从已有最大 `task-N` 的下一号开始追加，并用原子目录创建支持并发进程；不会重新生成或清理历史任务。失败任务只清理本次预留目录，成功任务只保留 `task.json` 及其清单引用的运行依赖文件。
+用户画像由独立提示词生成，不强制与任务主题或业务环境相关，但要求结构化描述身份、知识、沟通和决策特征；画像只影响表达与行为，不提供任务业务真值。用户剧本由 EnvFactory 确定性构造为有限状态机：`initial_state` 指向初始状态，`states` 定义用户行为和终止状态，`transitions` 通过 `from_state`、`to_state`、`condition`、`outcome_category`、`should_end` 和 `updates` 描述转移。生成器检查状态引用、可达性、终止路径和变量更新。任务生成阶段不再生成或落盘模拟对话；真实对话只在 rollout 时由外部 User LLM 根据画像、FSM 与实时上下文产生。任务生成 CLI 每次从已有最大 `task-N` 的下一号开始追加，并用原子目录创建支持并发进程。
 
 启用噪声工具时，工具生成阶段至少生成一个噪声工具；默认上限为 3 时至少同时覆盖 `related_irrelevant` 和 `unrelated` 两类。候选工具还要经过独立的反事实有用性审查：凡是能提供原因分析证据、关键事实、比较依据、验证手段或排查资料的工具都不能作为噪声，会从候选集合中自动剔除；若候选集合被全部剔除，则注入一个不读取或修改业务状态的通用无关工具，避免正确的审计结论导致整项任务生成失败。噪声调用惩罚由共享运行时使用 `trajectory.events` 和 `none_tool_calls` 运算符确定性执行，不交给外部 LLM 判断。
 
-对话生成使用两个独立的外部 LLM 角色：User LLM 按画像和剧本发起或继续用户消息；Agent LLM 只读取任务描述、公开业务环境和当前对话，不接收用户画像，也不能从隐藏画像推断用户属性。Agent 只能根据用户在对话中明确表达的内容进行回答。每个用户剧本分支包含 `should_end` 布尔字段；User LLM 消费该字段并在输出中返回 `message` 与 `should_end`，`true` 表示用户停止提问，`false` 表示继续对话。Agent LLM 不生成终止信号。每个 session 都维护 `turn_count` 和 `termination_reason`，控制器仅在 User LLM 输出 `should_end=true` 且达到最少对话轮数时结束；达到最大消息数 `max_dialogue_turns`（默认 12）只是安全兜底。每个 session 至少生成 4 条交替消息。
-
-用户画像、用户剧本和对话 session 不内嵌到 `task.json`，而是写入 `user_simulation/` 目录，并由 `user_simulation_manifest` 引用：画像保存为 `user_profiles.json`，状态机剧本保存为 `user_scripts.json`，每个任务生成期压力测试 session 保存为独立 JSON 文件。运行时 User Simulator 只加载画像和状态机，不读取或回放这些 session；每轮通过外部 `RuntimeLLMClient` 根据完整实时对话、当前画像、当前状态、变量和合法出边生成下一条用户消息。协议固定八类结果：`goal_satisfied`、`information_required`、`user_correction`、`user_rejection`、`user_acceptance`、`agent_off_topic`、`agent_premature_completion`、`unrecognized`。前五类是正常结果，必须使用 `matched` 和具有相同 `outcome_category` 的当前 transition；后三类是恢复结果，不得选择或推进正常 transition，其中 `unrecognized` 可以标记为 `ambiguous`。每个生成 FSM 必须覆盖全部五种正常结果，异常三类由 `recovery_policy.handled_outcomes` 统一声明。恢复时保持当前业务状态不变，默认最多两次，超过后返回 `should_end=true` 和 `termination_reason=unresolved_dialogue`，且不能视为成功或业务进展。正常进入 terminal 状态时返回 `termination_reason=completed`。外部 LLM 不可用、类别与 transition 不一致或返回非法分支时统一按 `unrecognized` 恢复。生成期 session 只用于生成质量检查和验收 fixture。用户状态机和模拟对话不参与动作、工具或奖励定义；这些核心契约仅从任务描述、环境计划和业务模型推导，避免一次 rollout 的偶然内容污染工具边界。
+用户画像和用户剧本不内嵌到 `task.json`，而是写入 `user_simulation/` 并由 `user_simulation_manifest` 引用。运行时 User Simulator 加载画像和状态机，每轮通过外部 `RuntimeLLMClient` 根据完整实时对话、当前画像、状态、变量和合法出边生成下一条用户消息。协议固定八类结果：`goal_satisfied`、`information_required`、`user_correction`、`user_rejection`、`user_acceptance`、`agent_off_topic`、`agent_premature_completion`、`unrecognized`。前五类走正常转移，后三类走不推进业务状态的有界恢复；超过恢复上限后以 `unresolved_dialogue` 结束。
 
 `agent_actions` 阶段只根据任务目标、环境计划及业务实体、表和字段拆解 Agent 操作，不读取模拟对话。其后由 `capability_plan` 逐项分类为 `environment_operation`、`agent_reasoning` 或 `agent_response`。只有必须读取或修改沙箱私有状态、调用外部系统或使用确定性专用能力的 `environment_operation` 可以生成工具；比较、分析、选择和最终回答保留给待训练 Agent。每个动作必须提供 `atomicity_rationale`、`inputs`、`outputs`、`preconditions`、`effects`。后续 `openai_tools` 同样不读取对话，只接收通过资格判断的环境动作。
 
@@ -112,7 +125,6 @@ Scene 路径
 ```bash
 python examples/generate_task.py \
   --user-script-count 3 \
-  --sessions-per-script 2 \
   --output output
 ```
 
@@ -120,7 +132,7 @@ python examples/generate_task.py \
 
 任务生成已统一使用当前 pipeline，不再提供旧版生成模式或兼容分支。画像下位词扩展、constraints 构造和历史格式兼容解析均已删除。
 
-用户剧本的每个分支都包含布尔字段 `should_end`。该字段是用户终止信号：`true` 表示用户停止提问，`false` 表示继续对话。User Simulator 每轮消费当前剧本分支并输出 `message` 与 `should_end`；Agent Simulator 不生成终止信号。控制器仅在 User Simulator 输出 `should_end=true` 且达到最少对话轮数时结束 session，达到最大轮数只是安全兜底。
+用户剧本的每个分支都包含布尔字段 `should_end`。User Simulator 每轮消费当前合法分支并输出用户消息与终止状态；Agent 不生成用户终止信号。
 
 观测与奖励设计规则：只保留与任务目标完成强相关的关键过程指标和目标结果指标，不能为每个普通动作机械创建指标；任务无需关键工具动作时 process 指标可以为空，存在多个关键动作时不限制过程指标数量。关键过程指标必须是 `hybrid`，使用精简字段 `target_action`、`evaluation_inputs`、`criteria` 和固定 `condition=llm_expected_tool_call_exact_match`。共享评估运行时根据该指标调用外部 LLM，结合当前 Context、可用工具和 `criteria` 生成期望工具名及参数真值；随后由规则引擎对 Agent 实际工具名和规范化参数进行确定性精确比对，LLM 不直接输出最终过程分数，任务 JSON 也不嵌入完整 prompt 或 expected-call schema。结果指标判断任务目标是否完成或关键业务数据是否达到目标，可使用 `rule-based`、`model-based` 或 `hybrid`。惩罚指标只有在直接影响任务目标时才保留，用于偏离用户诉求、无效循环或业务数据偏离预期；工具选择错误和工具参数错误不作为惩罚项。
 

@@ -3,7 +3,13 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from examples.generate_task import _existing_task_numbers, _reserve_task_directories
+from examples.generate_task import (
+    _existing_task_numbers,
+    _generation_failure_class,
+    _reserve_task_directories,
+    _reset_reserved_directory,
+)
+from env_factory.task_pipeline import PipelineGenerationError
 from env_factory.task_routing import (
     allocate_training_routes,
     compatible_training_categories,
@@ -84,6 +90,28 @@ class IncrementalTaskDirectoryTest(unittest.TestCase):
             numbers = [number for batch in batches for number, _ in batch]
             self.assertEqual(len(numbers), 6)
             self.assertEqual(len(set(numbers)), 6)
+
+    def test_retry_cleanup_preserves_sample_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sample_manifest.json").write_text("{}")
+            (root / "partial.json").write_text("partial")
+            (root / "rows").mkdir()
+            (root / "rows/data.jsonl").write_text("{}")
+            _reset_reserved_directory(root)
+            self.assertTrue((root / "sample_manifest.json").is_file())
+            self.assertFalse((root / "partial.json").exists())
+            self.assertFalse((root / "rows").exists())
+
+    def test_generation_failure_taxonomy_is_structured(self):
+        self.assertEqual(
+            _generation_failure_class(PipelineGenerationError("tool schema is invalid")),
+            "GEN_SCHEMA",
+        )
+        self.assertEqual(
+            _generation_failure_class(PipelineGenerationError("external capability unavailable")),
+            "TASK_BUILDABILITY",
+        )
 
 
 if __name__ == "__main__":

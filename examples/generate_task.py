@@ -5,8 +5,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
+import random
 import re
 import shutil
+import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,6 +32,38 @@ from env_factory.task_routing import (
 
 
 _TASK_DIR_PATTERN = re.compile(r"task-(\d+)")
+
+
+def _write_json(path: Path, value: object) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _reset_reserved_directory(path: Path) -> None:
+    """Remove partial artifacts while preserving the experiment sample identity."""
+    for child in path.iterdir():
+        if child.name == "sample_manifest.json":
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def _generation_failure_class(exc: BaseException) -> str:
+    """Observability taxonomy only; it never changes generation behavior."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    if name in {"ServiceUnavailable", "SessionExpired", "ConnectionError", "TimeoutError"}:
+        return "INFRA"
+    if any(marker in text for marker in ("schema", "must be", "requires", "invalid", "non-empty list")):
+        return "GEN_SCHEMA"
+    if any(marker in text for marker in ("external capability", "buildability", "unsupported", "missing input")):
+        return "TASK_BUILDABILITY"
+    if isinstance(exc, TaskGenerationError) and ("path" in text or "keyword" in text):
+        return "INPUT_SAMPLING"
+    return "GEN_SEMANTIC"
 
 
 def _existing_task_numbers(artifact_root: Path) -> list[int]:
@@ -104,19 +139,7 @@ def main() -> int:
         "--user-script-count",
         type=int,
         default=3,
-        help="八阶段流程生成的用户剧本数量，默认 3",
-    )
-    parser.add_argument(
-        "--sessions-per-script",
-        type=int,
-        default=2,
-        help="每个用户剧本生成的多轮对话 session 数，至少 2，默认 2",
-    )
-    parser.add_argument(
-        "--max-dialogue-turns",
-        type=int,
-        default=12,
-        help="每个对话 session 的最大消息数，默认 12；达到后以 max_turns_reached 结束",
+        help="每个任务生成的用户 FSM 数量，默认 3",
     )
     parser.add_argument(
         "--noise-tool-max",
@@ -128,9 +151,10 @@ def main() -> int:
     parser.add_argument(
         "--training-mix",
         default="direct_response=0.20,simple_agentic=0.30,multi_step_agentic=0.50",
-        help="批次训练类别比例，默认 15/25/45/15",
+        help="批次训练类别比例，默认 20/30/50",
     )
     parser.add_argument("--route-attempts", type=int, default=3, help="每个训练路由候选最多重采样次数，默认 3")
+    parser.add_argument("--seed", type=int, help="实验随机种子；省略时生成并记录一个随机种子")
     parser.add_argument("--stage-cache-dir", type=Path, help="可选的阶段检查点目录；相同模型、代码、提示和输入复用结果，并重新执行语义校验")
     args = parser.parse_args()
     if args.count <= 0:
@@ -139,8 +163,6 @@ def main() -> int:
         parser.error("--max-workers 必须大于 0")
     if args.path_query_timeout <= 0:
         parser.error("--path-query-timeout 必须大于 0")
-    if args.max_dialogue_turns < 4:
-        parser.error("--max-dialogue-turns 必须至少为 4")
     if args.noise_tool_max < 0:
         parser.error("--noise-tool-max 不能小于 0")
     if args.route_attempts <= 0:
@@ -165,6 +187,13 @@ def main() -> int:
         handlers=[logging.StreamHandler(), logging.FileHandler(args.log_file, encoding="utf-8")],
     )
     llm = LLMClient.from_env("LLM", timeout=float(os.getenv("LLM_TIMEOUT", "60")))
+    external_fixture = os.getenv("SANDBOX_EXTERNAL_FIXTURES", "").strip()
+    external_available = bool(os.getenv("SANDBOX_EXTERNAL_CAPABILITY_URL", "").strip()) or bool(
+        external_fixture and Path(external_fixture).is_file()
+    )
+    available_environment_modes = ("stateless", "reference_data", "stateful") + (
+        ("external_capability",) if external_available else ()
+    )
     logging.getLogger(__name__).info(
         "task generation run started: count=%d max_workers=%d output=%s log_file=%s",
         args.count, args.max_workers, args.output, args.log_file,
@@ -180,10 +209,11 @@ def main() -> int:
             store,
             llm,
             user_script_count=args.user_script_count,
-            sessions_per_script=args.sessions_per_script,
-            maximum_dialogue_turns=args.max_dialogue_turns,
             noise_tool_max=args.noise_tool_max,
+            available_environment_modes=available_environment_modes,
         )
+        run_seed = args.seed if args.seed is not None else secrets.randbits(63)
+        run_rng = random.Random(run_seed)
         reserved_tasks = _reserve_task_directories(artifact_root, args.count)
         routes = (
             [args.training_category] * args.count
@@ -194,44 +224,87 @@ def main() -> int:
                     compatible_training_categories(args.task_intent)
                     if args.task_intent else None
                 ),
+                rng=run_rng,
             )
         )
+        sample_seeds = [run_rng.randrange(0, 2**63) for _ in reserved_tasks]
+        for batch_index, ((task_number, task_dir), training_category, sample_seed) in enumerate(
+            zip(reserved_tasks, routes, sample_seeds), start=1
+        ):
+            _write_json(task_dir / "sample_manifest.json", {
+                "version": "1.0",
+                "task_id": f"task-{task_number}",
+                "batch_index": batch_index,
+                "run_seed": run_seed,
+                "sample_seed": sample_seed,
+                "training_category": training_category,
+                "requested_task_intent": args.task_intent,
+                "requested_task_style": args.task_style,
+                "requested_task_type": args.task_type,
+                "hops": args.hops,
+                "available_environment_modes": list(available_environment_modes),
+                "status": "reserved",
+                "attempts": [],
+            })
         logging.getLogger(__name__).info(
             "reserved incremental task ids: %s",
             [task_number for task_number, _ in reserved_tasks],
         )
         with ThreadPoolExecutor(max_workers=min(args.max_workers, args.count)) as executor:
-            def generate_one(batch_index: int, task_number: int, task_dir: Path, training_category: str):
+            def generate_one(
+                batch_index: int, task_number: int, task_dir: Path,
+                training_category: str, sample_seed: int,
+            ):
                 logging.getLogger(__name__).info(
                     "task generation started: batch=%d/%d task_id=task-%d",
                     batch_index, args.count, task_number,
                 )
                 last_error = None
                 for route_attempt in range(1, args.route_attempts + 1):
+                    manifest_path = task_dir / "sample_manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    attempt_seed = sample_seed + route_attempt - 1
                     try:
-                        return generator.generate(
+                        task = generator.generate(
                             args.hops,
                             args.task_type,
                             args.task_style,
                             artifact_dir=task_dir,
                             task_intent=args.task_intent,
                             training_category=training_category,
+                            seed=attempt_seed,
                         )
+                        manifest["attempts"].append({"attempt": route_attempt, "seed": attempt_seed, "status": "completed"})
+                        manifest["status"] = "generated"
+                        _write_json(manifest_path, manifest)
+                        return task
                     except (TaskGenerationError, PipelineGenerationError) as exc:
                         last_error = exc
+                        manifest["attempts"].append({
+                            "attempt": route_attempt,
+                            "seed": attempt_seed,
+                            "status": "rejected",
+                            "failure_class": _generation_failure_class(exc),
+                            "error_type": type(exc).__name__,
+                            "message": str(exc)[:2000],
+                        })
+                        manifest["status"] = "retrying" if route_attempt < args.route_attempts else "failed"
+                        _write_json(manifest_path, manifest)
                         logging.getLogger(__name__).warning(
                             "training route candidate rejected: task_id=task-%d category=%s attempt=%d/%d reason=%s",
                             task_number, training_category, route_attempt, args.route_attempts, exc,
                         )
                         if route_attempt < args.route_attempts:
-                            shutil.rmtree(task_dir, ignore_errors=True)
-                            task_dir.mkdir()
+                            _reset_reserved_directory(task_dir)
                 raise TaskGenerationError(
                     f"{training_category} route exhausted {args.route_attempts} candidate(s): {last_error}"
                 )
 
             futures = {
-                executor.submit(generate_one, batch_index, task_number, task_dir, routes[batch_index - 1]): (
+                executor.submit(
+                    generate_one, batch_index, task_number, task_dir,
+                    routes[batch_index - 1], sample_seeds[batch_index - 1]
+                ): (
                     batch_index, task_number, task_dir, routes[batch_index - 1]
                 )
                 for batch_index, (task_number, task_dir) in enumerate(reserved_tasks, start=1)
@@ -243,17 +316,39 @@ def main() -> int:
                     task = future.result()
                 except TaskGenerationError as exc:
                     failed += 1
-                    if task_dir.exists():
-                        shutil.rmtree(task_dir)
+                    failure = {
+                        "failure_class": _generation_failure_class(exc),
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:4000],
+                        "training_category": training_category,
+                        "batch_index": batch_index,
+                    }
+                    _write_json(task_dir / "failure.json", failure)
                     logging.getLogger(__name__).warning(
                         "task generation skipped: batch=%d/%d task_id=task-%d reason=%s",
                         batch_index, args.count, task_number, exc,
                     )
                     continue
-                except Exception:
+                except Exception as exc:
                     failed += 1
-                    if task_dir.exists():
-                        shutil.rmtree(task_dir)
+                    manifest_path = task_dir / "sample_manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest["status"] = "failed"
+                    manifest["attempts"].append({
+                        "attempt": len(manifest.get("attempts", [])) + 1,
+                        "status": "failed",
+                        "failure_class": _generation_failure_class(exc),
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:2000],
+                    })
+                    _write_json(manifest_path, manifest)
+                    _write_json(task_dir / "failure.json", {
+                        "failure_class": _generation_failure_class(exc),
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:4000],
+                        "training_category": training_category,
+                        "batch_index": batch_index,
+                    })
                     logging.getLogger(__name__).exception(
                         "task generation failed: batch=%d/%d task_id=task-%d",
                         batch_index, args.count, task_number,
@@ -280,9 +375,13 @@ def main() -> int:
                             "task_intent": task.task_intent,
                             "training_category": pipeline_artifacts.get("training_category", training_category),
                             "training_contract": pipeline_artifacts.get("training_contract", {}),
+                            "runtime_capabilities": pipeline_artifacts.get("runtime_capabilities", {}),
                             "task_spec": pipeline_artifacts.get("task_spec", {}),
                             "complexity": task.complexity,
                             "requirements": pipeline_artifacts.get("requirements", {}),
+                            "public_input": pipeline_artifacts.get("public_input", {
+                                "initial_user_message": task.desc, "materials": []
+                            }),
                             "environment_plan": pipeline_artifacts.get("environment_plan", {}),
                             "environment": task.env,
                             "actions": pipeline_artifacts.get("actions", []),
@@ -306,6 +405,15 @@ def main() -> int:
                     + "\n",
                     encoding="utf-8",
                 )
+                manifest_path = task_dir / "sample_manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest.update({
+                    "status": "completed",
+                    "resolved_task_intent": task.task_intent,
+                    "complexity": task.complexity,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                })
+                _write_json(manifest_path, manifest)
                 logging.getLogger(__name__).info(
                     "task artifact written: batch=%d/%d task_id=task-%d complexity=%s task_file=%s",
                     batch_index, args.count, task_number, task.complexity, task_path,

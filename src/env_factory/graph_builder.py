@@ -172,13 +172,16 @@ class Neo4jGraphStore:
             )
         logger.debug("下位节点查询完成：关键词=%s，结果数=%d", word, len(children))
         return children
-    def random_scene_event_path(self, hops: int, *, attempts: int = 8) -> tuple[SceneNode, ...]:
+    def random_scene_event_path(
+        self, hops: int, *, attempts: int = 8, rng: random.Random | None = None
+    ) -> tuple[SceneNode, ...]:
         """Return a random Scene node or simple event-element path."""
 
         if hops < 0 or hops > 20:
             raise ValueError("hops must be between 0 and 20")
         if attempts <= 0:
             raise ValueError("attempts must be greater than zero")
+        random_source = rng or random
         logger.debug("开始随机抽取 Scene 路径：跳数=%d，最大尝试次数=%d", hops, attempts)
         with self.driver.session(database=self.database) as session:
             for _ in range(attempts):
@@ -192,7 +195,7 @@ class Neo4jGraphStore:
                     "MATCH (selected:Scene) "
                     "RETURN selected.id AS id "
                     "SKIP $offset LIMIT 1",
-                    offset=random.randrange(total),
+                    offset=random_source.randrange(total),
                 ).single()
                 if start is None:
                     logger.warning("随机抽取 Scene 路径失败：随机节点偏移无结果")
@@ -234,7 +237,7 @@ class Neo4jGraphStore:
                             name=str(item["name"]),
                             words=tuple(str(word) for word in (item.get("words") or [])),
                         )
-                        for item in random.choice(records)["path"]
+                        for item in random_source.choice(records)["path"]
                     )
         logger.info("未找到符合条件的 Scene 路径：跳数=%d，尝试次数=%d", hops, attempts)
         return ()
