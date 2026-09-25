@@ -68,9 +68,4 @@ __all__ = [
     "TaskGenerationPipeline",
     "TaskType",
     "TaskTypeNode",
-    "main",
 ]
-
-
-def main() -> None:
-    print("Hello from env-factory!")
