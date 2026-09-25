@@ -128,6 +128,19 @@ class BuildWorkflowTest(unittest.TestCase):
         self.assertTrue(validator.meaningful_result({"records": [{"id": 1}], "count": 1}))
         self.assertFalse(validator.meaningful_result({"records": [], "count": 0}))
 
+    def test_agentic_value_reorders_a_real_dependency_not_parallel_producers(self):
+        validator = load_script("validate_agentic_training_value.py")
+        steps = [
+            {"operation": "tool_call", "tool_name": "read_features"},
+            {"operation": "tool_call", "tool_name": "read_rules"},
+            {"operation": "tool_call", "tool_name": "decide"},
+        ]
+        dag = {"edges": [
+            {"from_tool": "read_features", "to_tool": "decide"},
+            {"from_tool": "read_rules", "to_tool": "decide"},
+        ]}
+        self.assertEqual(validator.dependency_swap_positions(steps, dag), (0, 2))
+
     def test_offline_scorer_requires_executable_business_semantics(self):
         scorer = load_script("score_sandbox_offline.py")
         with tempfile.TemporaryDirectory() as directory:

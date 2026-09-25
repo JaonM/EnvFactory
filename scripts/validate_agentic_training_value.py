@@ -94,6 +94,28 @@ def scenario_without_assertions(scenario: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def dependency_swap_positions(
+    steps: list[dict[str, Any]], capability_dag: Mapping[str, Any]
+) -> tuple[int, int] | None:
+    """Return one actual producer/consumer pair to reverse.
+
+    Multi-step routes may have independent prerequisite tools. Swapping two
+    such producers is valid and must not be reported as an order-sensitivity
+    failure. Only reverse a pair connected by a declared DAG edge.
+    """
+    positions: dict[str, int] = {}
+    for index, step in enumerate(steps):
+        if step.get("operation") == "tool_call" and isinstance(step.get("tool_name"), str):
+            positions.setdefault(str(step["tool_name"]), index)
+    for edge in capability_dag.get("edges", []):
+        if not isinstance(edge, Mapping):
+            continue
+        source, target = edge.get("from_tool"), edge.get("to_tool")
+        if source in positions and target in positions and positions[source] < positions[target]:
+            return positions[source], positions[target]
+    return None
+
+
 def validate(root: Path) -> dict[str, Any]:
     task = load(root / "task.json")
     contract = task.get("training_contract") if isinstance(task.get("training_contract"), Mapping) else {}
@@ -234,22 +256,26 @@ def validate(root: Path) -> dict[str, Any]:
                     "reward": skipped_reward,
                 })
         reordered = copy.deepcopy(bound_success)
-        positions = [
-            index for index, step in enumerate(reordered["steps"])
-            if step.get("operation") == "tool_call"
-        ]
-        first_pos, second_pos = positions[0], positions[1]
-        reordered["steps"][first_pos], reordered["steps"][second_pos] = (
-            reordered["steps"][second_pos], reordered["steps"][first_pos]
-        )
-        reordered_run, reordered_error = execute("reordered_tools", reordered)
-        reordered_reward = reward_of(reordered_run or {})
-        if reordered_error is None and (reordered_reward is None or reordered_reward > 0.2):
+        dag = task.get("task_spec", {}).get("capability_dag", {})
+        pair = dependency_swap_positions(reordered["steps"], dag if isinstance(dag, Mapping) else {})
+        if pair is None:
             failures.append({
-                "gate": "order_sensitivity",
-                "message": "reordering dependent tool calls must be rejected or reward <= 0.2",
-                "reward": reordered_reward,
+                "gate": "dependency_contract",
+                "message": "dependency-required task has no ordered tool pair in capability_dag",
             })
+        else:
+            first_pos, second_pos = pair
+            reordered["steps"][first_pos], reordered["steps"][second_pos] = (
+                reordered["steps"][second_pos], reordered["steps"][first_pos]
+            )
+            reordered_run, reordered_error = execute("reordered_tools", reordered)
+            reordered_reward = reward_of(reordered_run or {})
+            if reordered_error is None and (reordered_reward is None or reordered_reward > 0.2):
+                failures.append({
+                    "gate": "order_sensitivity",
+                    "message": "reordering dependent tool calls must be rejected or reward <= 0.2",
+                    "reward": reordered_reward,
+                })
 
     if task.get("noise_tools") and "noise_selection" in by_kind:
         noise_run, _ = execute("noise_selection", scenario_without_assertions(by_kind["noise_selection"]))

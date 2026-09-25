@@ -70,6 +70,34 @@ class IntegrityTest(unittest.TestCase):
             "business_data": {"orders": [{"id": 1}]},
         })
 
+    def test_model_metric_reads_declared_inputs_from_observation_envelope(self):
+        contract = {"metrics": [{
+            "id": "quality", "score_range": [0, 1],
+            "evaluation_inputs": ["recent_conversation", "public_observation"],
+            "evaluator": {
+                "kind": "external_llm_judge",
+                "score_mapping": {"pass": 1, "fail": 0},
+            },
+        }]}
+        evaluator = ContractModelMetricEvaluator(contract, self.store)
+        captured = {}
+
+        def fake_chat(client, messages, **kwargs):
+            captured["evidence"] = json.loads(messages[1]["content"])["runtime_evidence"]
+            return {"label": "pass"}
+
+        with patch.dict("os.environ", {"SANDBOX_EVALUATOR_MOCK": "0"}), patch(
+            "env_factory.sandbox_runtime.RuntimeLLMClient.json_chat", new=fake_chat,
+        ):
+            evaluator.evaluate_all({"observation": {
+                "conversation": [{"role": "user", "content": "hello"}],
+                "public_observation": {"task_input": {"id": 1}},
+            }}, {})
+        self.assertEqual(captured["evidence"], {
+            "recent_conversation": [{"role": "user", "content": "hello"}],
+            "public_observation": {"task_input": {"id": 1}},
+        })
+
     def test_hybrid_outcome_is_a_platform_model_metric(self):
         contract = {"metrics": [{"id": "quality", "score_range": [0, 1], "evaluator": {
             "kind": "hybrid_outcome",
@@ -149,6 +177,12 @@ class IntegrityTest(unittest.TestCase):
             self.assertEqual(self.data.table("items")[0]["quantity"], 2)
         with self.store.episode_context("A"):
             self.assertEqual(self.data.table("items")[0]["quantity"], 99)
+
+    def test_reset_selects_an_older_episode_as_current(self):
+        self.store.reset(episode_id="B", seed=2)
+        self.assertEqual(self.store.current().episode_id, "B")
+        self.store.reset(episode_id="A", seed=3)
+        self.assertEqual(self.store.current().episode_id, "A")
 
     def test_separate_store_instances_do_not_lose_updates(self):
         def increment(_):

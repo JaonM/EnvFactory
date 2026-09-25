@@ -217,7 +217,10 @@ class EpisodeStore:
             db.execute("DELETE FROM events WHERE episode_id = ?", (episode_id,))
             db.execute("DELETE FROM idempotency WHERE episode_id = ?", (episode_id,))
             db.execute("DELETE FROM episode_state WHERE episode_id = ?", (episode_id,))
-            db.execute("UPDATE episodes SET active=0 WHERE episode_id = ?", (episode_id,))
+            # Reset is also the Trainer's active-episode selection operation.
+            # Deactivate every episode so switching back to an older id cannot
+            # leave a newer episode selected by ``current()``.
+            db.execute("UPDATE episodes SET active=0")
             db.execute("INSERT OR REPLACE INTO episodes(episode_id,seed,data_hash,schema_version,created_at,active) VALUES(?,?,?,?,?,1)", (episode_id, seed, data_hash, self.schema_version, time.time()))
             return Episode(episode_id, seed, data_hash, self.schema_version)
 
@@ -1201,12 +1204,17 @@ class ContractModelMetricEvaluator:
                     "business_data": "business_state",
                 }
                 selected_context: dict[str, Any] = {}
+                observation = context.get("observation", {})
+                if not isinstance(observation, Mapping):
+                    observation = {}
                 for name in declared_inputs:
                     if not isinstance(name, str):
                         continue
                     source = aliases.get(name, name)
                     if source in context:
                         selected_context[name] = context[source]
+                    elif source in observation:
+                        selected_context[name] = observation[source]
                 # The judge must know what the public user actually requested.
                 # This is safe to add independently of model-authored
                 # ``evaluation_inputs`` because it contains no hidden truth.

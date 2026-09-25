@@ -75,7 +75,8 @@ class TaskHooks:
             "final_agent_response": self.episode_store.get_state("final_agent_response", ""),
         }
     def metric_context(self) -> dict[str, Any]:
-        return {"business_state": {name: self.data.table(name) for name in self.data.baseline}, "trajectory": self.episode_store.replay(), "final_agent_response": self.episode_store.get_state("final_agent_response", ""), "observation": self.observation()}
+        observation = self.observation()
+        return {"business_state": {name: self.data.table(name) for name in self.data.baseline}, "trajectory": self.episode_store.replay(), "final_agent_response": self.episode_store.get_state("final_agent_response", ""), "conversation": observation.get("conversation", []), "public_observation": observation.get("public_observation", {}), "observation": observation}
     def custom_metric_scores(self, context: Mapping[str, Any], existing: Mapping[str, float]) -> dict[str, float]: return {}
     def reset(self, episode) -> None: return None
 '''
