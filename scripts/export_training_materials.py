@@ -1183,6 +1183,7 @@ def verify_bundle(
         failures.append("trusted_attestation")
     return {
         "verified": not failures,
+        "bundle_version": manifest.get("version"),
         "bundle_sha256": manifest.get("bundle_sha256"),
         "source_dataset_sha256": manifest.get("source_dataset_sha256"),
         "items": manifest.get("item_count", 0),

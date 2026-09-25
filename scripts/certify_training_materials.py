@@ -45,6 +45,7 @@ from env_factory.generation_provenance import generation_provenance_snapshot
 from env_factory.runtime_provenance import valid_container_rollout_execution
 from env_factory.sandbox_scoring import valid_score_report
 from env_factory.task_quality import score_file
+from env_factory.material_consumer import BUNDLE_VERSION
 
 
 Z_95 = 1.959963984540054
@@ -1542,12 +1543,16 @@ def attach_bundle_verification(
     report["materials_bundle_verification"] = dict(verification)
     report["gates"]["portable_materials_bundle"] = (
         verification.get("verified") is True
+        and verification.get("bundle_version") == BUNDLE_VERSION
         and verification.get("production_contract_ready") is True
         and verification.get("trusted_attestation") is True
         and verification.get("dataset_split_ready") is True
         and verification.get("task_family_split_ready") is True
         and verification.get("generation_provenance_ready") is True
         and verification.get("container_rollout_ready") is True
+        and verification.get("container_reward_calibration_ready") is True
+        and verification.get("provider_identity_ready") is True
+        and verification.get("task_lineage_ready") is True
         and verification.get("source_dataset_sha256")
         == report.get("materials_manifest", {}).get("dataset_sha256")
     )

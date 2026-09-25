@@ -1173,26 +1173,58 @@ class ProductionReadinessTest(unittest.TestCase):
             "materials_manifest": {"dataset_sha256": "dataset"},
         }
         certifier.attach_bundle_verification(report, {
-            "verified": True, "production_contract_ready": True,
+            "verified": True, "bundle_version": "11.0",
+            "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
             "task_family_split_ready": True,
             "generation_provenance_ready": True,
             "container_rollout_ready": True,
+            "container_reward_calibration_ready": True,
+            "provider_identity_ready": True,
+            "task_lineage_ready": True,
             "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
         self.assertIn("portable_materials_bundle", report["failed_gates"])
         certifier.attach_bundle_verification(report, {
-            "verified": True, "production_contract_ready": True,
+            "verified": True, "bundle_version": "11.0",
+            "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
             "task_family_split_ready": True,
             "generation_provenance_ready": True,
             "container_rollout_ready": True,
+            "container_reward_calibration_ready": True,
+            "provider_identity_ready": True,
+            "task_lineage_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])
+
+    def test_verified_v10_bundle_cannot_satisfy_current_release_gate(self):
+        report = {
+            "certified": True,
+            "gates": {"base": True},
+            "failed_gates": [],
+            "materials_manifest": {"dataset_sha256": "dataset"},
+        }
+        certifier.attach_bundle_verification(report, {
+            "verified": True,
+            "bundle_version": "10.0",
+            "production_contract_ready": True,
+            "trusted_attestation": True,
+            "dataset_split_ready": True,
+            "task_family_split_ready": True,
+            "generation_provenance_ready": True,
+            "container_rollout_ready": True,
+            "container_reward_calibration_ready": True,
+            "provider_identity_ready": False,
+            "task_lineage_ready": False,
+            "source_dataset_sha256": "dataset",
+        })
+        self.assertFalse(report["certified"])
+        self.assertIn("portable_materials_bundle", report["failed_gates"])
 
     def test_legacy_bundle_cannot_satisfy_production_contract_gate(self):
         report = {
