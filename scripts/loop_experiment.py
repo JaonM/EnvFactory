@@ -125,10 +125,12 @@ def input_digest(path):
 def failure(stage, detail, **extra):
     targets = {"generation": "task_pipeline", "task_quality": "task_contract",
                "build": "sandbox_builder", "offline_validation": "runtime_or_contract",
+               "data_governance": "inspect_outbound_payload",
                "infrastructure": "runner_or_provider", "live_rollout": "inspect_live_trajectory",
                "live_reward_calibration": "inspect_reward_evaluator"}
     codes = {"generation": "GEN_SEMANTIC", "task_quality": "TASK_BUILDABILITY",
              "build": "BUILD_BUSINESS", "offline_validation": "REWARD_OR_RUNTIME",
+             "data_governance": "DATA_GOVERNANCE",
              "infrastructure": "INFRA", "live_rollout": "ROLLOUT_ENVIRONMENT",
              "live_reward_calibration": "LIVE_REWARD_CALIBRATION"}
     return {"passed": False, "failure_class": stage, "repair_target": targets.get(stage, "inspect"),
@@ -407,6 +409,38 @@ def build_one(project, task_path, output, config, seed=None):
             "detail": report.get("failed_critical_gates", []),
             "elapsed_seconds": time.monotonic() - started, "live_rollout_verified": False}
     if passed and config["validation"] == "live":
+        governance_path = output / "data_governance.json"
+        governance_run = run_process([
+            sys.executable,
+            str(project / "scripts/audit_data_governance.py"),
+            "--root", str(output),
+            "--output", str(governance_path),
+        ], project, output / "data_governance.log", config["score_timeout"])
+        try:
+            governance = json.loads(governance_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            governance = {}
+        governance_passed = (
+            governance_run["exit_code"] == 0
+            and governance.get("eligible_for_external_model_processing") is True
+        )
+        result.update(
+            data_governance=governance,
+            data_governance_process=governance_run,
+            data_governance_verified=governance_passed,
+        )
+        if not governance_passed:
+            result.update(failure(
+                "infrastructure" if governance_run["timed_out"] else "data_governance",
+                (
+                    "data governance audit timed out"
+                    if governance_run["timed_out"]
+                    else governance or "data governance report unavailable"
+                ),
+                **common,
+            ))
+            result["elapsed_seconds"] = time.monotonic() - started
+            return result
         live_path = output / "live_rollout.json"
         live_run = run_process([sys.executable, str(project / "scripts/run_live_rollout.py"), str(output),
                                "--output", str(live_path), "--episodes", str(config["rollout_episodes"]),

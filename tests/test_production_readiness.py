@@ -54,6 +54,33 @@ class ProductionReadinessTest(unittest.TestCase):
                 "no_tools": {"reward": 0.0},
             }},
         }))
+        (evidence / "data_governance.json").write_text(json.dumps({
+            "version": "1.0",
+            "eligible_for_external_model_processing": True,
+            "data_origin": {
+                "origin": "model_generated_synthetic",
+                "contains_real_user_data": False,
+                "intended_use": "agentic_rl_training_material",
+            },
+            "providers": {
+                "agent": {
+                    "host": "agent.example",
+                    "model": "policy-model",
+                    "identity_sha256": "a" * 64,
+                },
+                "user_simulator_and_reward": {
+                    "host": "runtime.example",
+                    "model": "simulator-model",
+                    "identity_sha256": "b" * 64,
+                },
+            },
+            "outbound_surfaces": {
+                name: sorted(values)
+                for name, values in certifier.REQUIRED_OUTBOUND_SURFACES.items()
+            },
+            "credential_findings": [],
+            "pii_findings": [],
+        }))
         holdouts = []
         for batch in range(batches):
             jobs = []
@@ -161,6 +188,7 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertTrue(report["gates"]["rollout_provenance"])
             self.assertTrue(report["gates"]["category_mix"])
             self.assertTrue(report["gates"]["user_simulator_outcome_coverage"])
+            self.assertTrue(report["gates"]["data_governance"])
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
             self.assertEqual(report["materials_manifest"]["version"], "2.0")
             self.assertEqual(
@@ -215,6 +243,20 @@ class ProductionReadinessTest(unittest.TestCase):
             live_report.write_text(json.dumps(value))
             report = certifier.certify(history, certifier.default_policy())
             self.assertFalse(report["gates"]["tool_and_reward_integrity"])
+
+    def test_credential_finding_breaks_data_governance_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = self.make_history(root)
+            path = root / "evidence/data_governance.json"
+            value = json.loads(path.read_text())
+            value["credential_findings"] = [{
+                "kind": "assigned_secret", "path": "$.data/config.txt",
+            }]
+            path.write_text(json.dumps(value))
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["gates"]["data_governance"])
+            self.assertIn("data_governance", report["failed_gates"])
 
     def test_category_mix_prevents_single_route_dataset(self):
         with tempfile.TemporaryDirectory() as directory:

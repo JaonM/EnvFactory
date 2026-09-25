@@ -249,6 +249,10 @@ class ExperimentTest(unittest.TestCase):
                             "evidence_fingerprint": "proof",
                         }],
                     }))
+                elif "audit_data_governance.py" in " ".join(command):
+                    (output / "data_governance.json").write_text(json.dumps({
+                        "eligible_for_external_model_processing": True,
+                    }))
                 elif "run_live_rollout.py" in " ".join(command):
                     (output / "live_rollout.json").write_text(json.dumps({
                         "passed": True, "live_rollout_verified": True,
@@ -274,7 +278,17 @@ class ExperimentTest(unittest.TestCase):
             ):
                 result = loop.build_one(ROOT, task_path, output, config)
             self.assertTrue(result["passed"])
+            self.assertTrue(result["data_governance_verified"])
             self.assertTrue(result["live_reward_calibration_verified"])
+            governance_index = next(
+                index for index, command in enumerate(commands)
+                if "audit_data_governance.py" in " ".join(command)
+            )
+            rollout_index = next(
+                index for index, command in enumerate(commands)
+                if "run_live_rollout.py" in " ".join(command)
+            )
+            self.assertLess(governance_index, rollout_index)
             calibration = next(
                 command for command in commands
                 if "validate_agentic_training_value.py" in " ".join(command)
@@ -282,6 +296,56 @@ class ExperimentTest(unittest.TestCase):
             self.assertEqual(
                 calibration[calibration.index("--evaluator-mode") + 1], "live"
             )
+
+    def test_data_governance_failure_prevents_live_rollout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_path = root / "task.json"
+            task_path.write_text("{}")
+            output = root / "sandbox"
+            output.mkdir()
+            quality = SimpleNamespace(to_dict=lambda: {
+                "eligible": True, "score": 9, "training_category": "simple_agentic",
+            })
+            commands = []
+
+            def process(command, cwd, log, timeout):
+                commands.append(command)
+                rendered = " ".join(command)
+                if "score_sandbox_offline.py" in rendered:
+                    (output / "score_summary.json").write_text(json.dumps({
+                        "sandboxes": [{
+                            "passed": True, "score": 10,
+                            "model": loop.MODEL, "review_model": loop.MODEL,
+                            "evidence_fingerprint": "proof",
+                        }],
+                    }))
+                    return {"exit_code": 0, "timed_out": False, "seconds": .1}
+                if "audit_data_governance.py" in rendered:
+                    (output / "data_governance.json").write_text(json.dumps({
+                        "eligible_for_external_model_processing": False,
+                        "credential_findings": [{"kind": "private_key", "path": "$.data"}],
+                    }))
+                    return {"exit_code": 1, "timed_out": False, "seconds": .1}
+                return {"exit_code": 0, "timed_out": False, "seconds": .1}
+
+            config = {
+                "threshold": 8, "max_attempts": 2, "build_timeout": 10,
+                "score_timeout": 10, "rollout_timeout": 10,
+                "build_mode": "clean", "validation": "live",
+                "rollout_episodes": 3, "rollout_steps": 20,
+                "rollout_min_success_rate": 0,
+            }
+            with (
+                patch("env_factory.task_quality.score_file", return_value=quality),
+                patch.object(loop, "run_process", side_effect=process),
+            ):
+                result = loop.build_one(ROOT, task_path, output, config)
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["failure_class"], "data_governance")
+            self.assertFalse(any(
+                "run_live_rollout.py" in " ".join(command) for command in commands
+            ))
 
     def test_holdout_requires_fresh_tasks_and_two_of_three_successes(self):
         with tempfile.TemporaryDirectory() as tmp:

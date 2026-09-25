@@ -30,6 +30,12 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 奖励反事实必须使用生产配置的真实 evaluator 重跑；mock 报告只用于离线构建测试，不能进入生产认证。
 - 每份 rollout 保存任务 SHA-256、沙箱可执行输入摘要、Agent/User/Judge 模型及 provider 摘要；认证时重新
   计算并拒绝把其他任务或沙箱的轨迹挂接到当前样本。
+- 每个任务必须声明业务数据为模型生成的合成数据且不包含真实用户数据。真实 rollout 前执行出站载荷
+  审计，记录 Agent、User Simulator 和 Reward Judge 的 provider 身份与可见字段，扫描凭证及疑似 PII；
+  发现凭证、缺少合成来源声明或缺少 provider 身份时禁止外发并取消样本资格。
+
+数据治理审计只证明素材满足项目内的技术门禁，不等同于组织层面的联网、供应商或数据出境授权。
+实际调用某个外部端点前，运行方仍须取得适用于该端点和这些载荷的明确授权。
 
 认证采用比率和置信区间双门禁，避免小样本的高点估计被误认为稳定良品率。任务生成失败仍计入
 总请求分母；沙箱构建率以通过任务门禁的任务为条件分母；端到端率使用所有请求作为分母。
@@ -47,6 +53,10 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 
 `validate_agentic_training_value.py` 进一步执行无工具回答、参数破坏、跳步、乱序和噪声工具等反事实，
 验证任务工具确实必要、参数会影响结果、依赖顺序真实存在，并防止只输出正确措辞骗取高奖励。
+
+`audit_data_governance.py` 在任何 live rollout 前验证任务的合成数据声明，扫描会进入公开任务、工具定义和
+业务 fixture 的凭证与疑似 PII，并将目标 provider、允许的出站面和禁止出站字段写入
+`data_governance.json`。报告只保存命中类型与 JSON 路径，不回写疑似敏感值。
 
 ## 结果解释
 

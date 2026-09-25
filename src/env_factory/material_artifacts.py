@@ -18,6 +18,7 @@ RUNTIME_DIRECTORIES = ("tests", "data", ".outer_conformance")
 EVIDENCE_NAMES = {
     "acceptance_result.json", "agentic_training_value.json",
     "agentic_training_value_live.json", "buildability.json",
+    "data_governance.json",
     "offline_sandbox_score.json", "review_report.json", "score_summary.json",
     "training_readiness.json",
 }

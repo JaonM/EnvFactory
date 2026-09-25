@@ -23,6 +23,7 @@ from env_factory.material_artifacts import (
     portable_artifact_digest,
     portable_artifact_digests,
 )
+from env_factory.data_governance import OUTBOUND_SURFACES
 
 
 Z_95 = 1.959963984540054
@@ -34,6 +35,9 @@ USER_OUTCOMES = {
 NEGATIVE_COUNTERFACTUALS = (
     "goal_failure", "no_tools", "noise_selection", "reordered_tools",
 )
+REQUIRED_OUTBOUND_SURFACES = {
+    name: set(values) for name, values in OUTBOUND_SURFACES.items()
+}
 
 
 def load(path: Path) -> Any:
@@ -93,6 +97,35 @@ def _artifact(result: Mapping[str, Any], name: str) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError, TypeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def valid_data_governance(report: Mapping[str, Any]) -> bool:
+    """Require a synthetic-data declaration and auditable provider boundary."""
+    origin = report.get("data_origin", {})
+    providers = report.get("providers", {})
+    surfaces = report.get("outbound_surfaces", {})
+    return (
+        report.get("eligible_for_external_model_processing") is True
+        and isinstance(origin, Mapping)
+        and origin.get("origin") == "model_generated_synthetic"
+        and origin.get("contains_real_user_data") is False
+        and origin.get("intended_use") == "agentic_rl_training_material"
+        and report.get("credential_findings") == []
+        and isinstance(providers, Mapping)
+        and all(
+            isinstance(providers.get(name), Mapping)
+            and bool(providers[name].get("host"))
+            and bool(providers[name].get("model"))
+            and isinstance(providers[name].get("identity_sha256"), str)
+            and len(providers[name]["identity_sha256"]) == 64
+            for name in ("agent", "user_simulator_and_reward")
+        )
+        and isinstance(surfaces, Mapping)
+        and all(
+            required <= set(surfaces.get(name, []))
+            for name, required in REQUIRED_OUTBOUND_SURFACES.items()
+        )
+    )
 
 
 def _counterfactual_counts(reports: Iterable[Mapping[str, Any]]) -> dict[str, int]:
@@ -411,6 +444,8 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
     agentic_reports = [
         _artifact(item, "agentic_training_value_live.json") for item in qualified
     ]
+    governance_reports = [_artifact(item, "data_governance.json") for item in qualified]
+    governed_materials = sum(valid_data_governance(report) for report in governance_reports)
     runtime_integrity = bool(readiness_reports) and all(
         report.get("training_ready") is True
         and report.get("evidence", {}).get("determinism") is True
@@ -576,6 +611,15 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "user_simulator_outcomes": dict(user_outcomes),
         "runtime_integrity": runtime_integrity,
         "tool_and_reward_integrity": tool_and_reward_integrity,
+        "data_governance": {
+            "reports": len(governance_reports),
+            "verified": governed_materials,
+            "all_verified": (
+                bool(qualified)
+                and len(governance_reports) == len(qualified)
+                and governed_materials == len(qualified)
+            ),
+        },
         "reward_counterfactuals": counterfactuals,
         "reward_false_positive_rate": false_positive_rate,
         "reward_false_negative_rate": false_negative_rate,
@@ -633,6 +677,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         ),
         "runtime_state_integrity": runtime_integrity,
         "tool_and_reward_integrity": tool_and_reward_integrity,
+        "data_governance": measurements["data_governance"]["all_verified"],
         "material_identity": (
             len(material_items) == len(qualified)
             and len(material_fingerprints) == len(set(material_fingerprints))
