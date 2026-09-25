@@ -1509,6 +1509,36 @@ class ContractUserSimulator:
 
     @staticmethod
     def _llm_render(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        transitions = {
+            item.get("transition_id"): item
+            for item in payload.get("transitions", [])
+            if isinstance(item, Mapping) and isinstance(item.get("transition_id"), str)
+        }
+
+        def validate_semantics(candidate: Mapping[str, Any]) -> None:
+            match_status = candidate.get("match_status")
+            outcome = candidate.get("outcome_category")
+            transition_id = candidate.get("transition_id")
+            selected = transitions.get(transition_id)
+            if not isinstance(candidate.get("user_query"), str) or not candidate["user_query"].strip():
+                raise RuntimeLLMError("user_query must be non-empty")
+            if outcome in ContractUserSimulator.NORMAL_OUTCOMES and (
+                match_status != "matched"
+                or selected is None
+                or selected.get("outcome_category") != outcome
+            ):
+                raise RuntimeLLMError(
+                    "normal outcome must select a current transition with the same category"
+                )
+            if outcome in ContractUserSimulator.RECOVERY_OUTCOMES and (
+                match_status == "matched" or transition_id not in {None, ""}
+            ):
+                raise RuntimeLLMError("recovery outcome must not select a transition")
+            if outcome in {"agent_off_topic", "agent_premature_completion"} and match_status != "unmatched":
+                raise RuntimeLLMError("recognized recovery outcome must be unmatched")
+            if outcome == "unrecognized" and match_status not in {"unmatched", "ambiguous"}:
+                raise RuntimeLLMError("unrecognized outcome must be unmatched or ambiguous")
+
         return RuntimeLLMClient().json_chat(
             [
                 {
@@ -1520,6 +1550,8 @@ class ContractUserSimulator:
                         "Recovery outcomes are agent_off_topic, agent_premature_completion, unrecognized. "
                         "Normal outcomes require match_status=matched and one listed transition with the same category. "
                         "Recovery outcomes require unmatched, except unrecognized may be ambiguous, and no transition. Return only JSON. "
+                        "The simulated user sees the dialogue, not hidden tool traces. Never reject an otherwise verifiable answer only "
+                        "because raw tool-call records are absent; judge the visible answer and public evidence. "
                         "Do not answer the user's own task, reveal hidden state, or invent business facts."
                     ),
                 },
@@ -1532,10 +1564,17 @@ class ContractUserSimulator:
                     "user_query": {"type": "string"},
                     "transition_id": {"type": "string"},
                     "match_status": {"type": "string", "enum": ["matched", "unmatched", "ambiguous"]},
-                    "outcome_category": {"type": "string"},
+                    "outcome_category": {
+                        "type": "string",
+                        "enum": sorted(
+                            ContractUserSimulator.NORMAL_OUTCOMES
+                            | ContractUserSimulator.RECOVERY_OUTCOMES
+                        ),
+                    },
                     "reason_code": {"type": "string"},
                 },
             },
+            semantic_validator=validate_semantics,
         )
 
     @classmethod

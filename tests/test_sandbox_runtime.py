@@ -53,6 +53,29 @@ class SandboxRuntimeTest(unittest.TestCase):
         rows["entries"].append({"name": "固有词", "definition": "conflict"})
         self.assertEqual(resolve(rows, "$.entries[?(@.name=='固有词')].definition"), ["new", "conflict"])
 
+    def test_user_simulator_semantics_are_inside_feedback_retry_boundary(self):
+        payload = {
+            "profile": {}, "messages": [], "transitions": [{
+                "transition_id": "accept", "outcome_category": "user_acceptance",
+            }],
+        }
+        with patch("env_factory.sandbox_runtime.RuntimeLLMClient") as client:
+            client.return_value.json_chat.return_value = {
+                "user_query": "收到", "match_status": "matched",
+                "outcome_category": "user_acceptance", "reason_code": "accepted",
+                "transition_id": "accept",
+            }
+            ContractUserSimulator._llm_render(payload)
+        kwargs = client.return_value.json_chat.call_args.kwargs
+        self.assertIn("semantic_validator", kwargs)
+        self.assertIn("not hidden tool traces", client.return_value.json_chat.call_args.args[0][0]["content"])
+        with self.assertRaisesRegex(Exception, "same category"):
+            kwargs["semantic_validator"]({
+                "user_query": "收到", "match_status": "matched",
+                "outcome_category": "goal_satisfied", "reason_code": "wrong",
+                "transition_id": "accept",
+            })
+
     def test_metric_paths_reject_unsupported_expressions(self):
         for path in ("$.entries[?(@.x>1)]", "$.entries[-1]"):
             with self.subTest(path=path), self.assertRaises(SandboxError):

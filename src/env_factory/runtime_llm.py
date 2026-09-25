@@ -28,7 +28,7 @@ class RuntimeLLMConfig:
     base_url: str
     model: str
     timeout_seconds: float = 60.0
-    max_retries: int = 2
+    max_retries: int = 3
     mock: bool = False
 
     @classmethod
@@ -39,7 +39,7 @@ class RuntimeLLMConfig:
         base_url = (os.getenv("SANDBOX_LLM_BASE_URL") or os.getenv("LLM_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
         model = os.getenv("SANDBOX_LLM_MODEL") or os.getenv("LLM_MODEL", "")
         timeout = float(os.getenv("SANDBOX_LLM_TIMEOUT_SECONDS") or os.getenv("LLM_TIMEOUT") or "60")
-        retries = int(os.getenv("SANDBOX_LLM_MAX_RETRIES") or "2")
+        retries = int(os.getenv("SANDBOX_LLM_MAX_RETRIES") or "3")
         mock = os.getenv("SANDBOX_EVALUATOR_MOCK", "").lower() in {"1", "true", "yes"}
         if not api_key and not mock:
             raise RuntimeLLMError("neither SANDBOX_LLM_API_KEY nor LLM_API_KEY is configured")
@@ -55,7 +55,13 @@ class RuntimeLLMClient:
         self.config = config or RuntimeLLMConfig.from_env()
         self.mock_handler = mock_handler
 
-    def json_chat(self, messages: Sequence[Mapping[str, Any]], *, response_schema: Mapping[str, Any]) -> dict[str, Any]:
+    def json_chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        response_schema: Mapping[str, Any],
+        semantic_validator: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         if not messages:
             raise RuntimeLLMError("messages must not be empty")
         if self.config.mock:
@@ -65,6 +71,8 @@ class RuntimeLLMClient:
             if not isinstance(value, dict):
                 raise RuntimeLLMError("mock evaluator must return an object")
             self._validate_response(value, response_schema)
+            if semantic_validator is not None:
+                semantic_validator(value)
             return value
         body = {
             "model": self.config.model,
@@ -88,6 +96,8 @@ class RuntimeLLMClient:
                 if not isinstance(value, dict):
                     raise RuntimeLLMError("runtime LLM JSON response must be an object")
                 self._validate_response(value, response_schema)
+                if semantic_validator is not None:
+                    semantic_validator(value)
                 return value
             except HTTPError as exc:
                 if exc.code in {408, 409, 425, 429, 500, 502, 503, 504} and attempt < self.config.max_retries:

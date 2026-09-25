@@ -102,6 +102,11 @@ Define entities, relationships, types, visibility, defaults, and invariants. Pre
 
 Read `artifacts.data_manifest` and the files it references: `data_document.md`, one schema JSON per table, and one rows JSONL file per table. The manifest is the persistence handoff for the Code Agent and keeps `task.json` compact. The document describes each business entity/table, atomic fields, types, visibility, primary/foreign keys, constraints, initialization order, relationships, and persistence requirements. Initialize the database from every non-empty rows JSONL file; do not replace these files with a state/data-model proposal. Tables may be generated and loaded independently, but cross-table foreign-key and business-consistency checks must run before the sandbox is considered ready. If the task requires media, read `artifacts.media_generation`, install only its declared dependencies, run its declared Python entrypoint during sandbox build/startup as specified, and persist only the task-relevant generated media files. Do not add binding tables, truth references, media-evidence mappings, OCR, or multimodal recognition solely because media exists. The Agent is evaluated through tool schema, process transitions, and task-goal completion. If an external LLM is used for user simulation or data proposal, define its adapter, prompt/output schema, timeout, retry, fallback, and configuration. Runtime simulation uses only externally supplied model credentials, never Code Agent credentials.
 
+Business handlers must not inspect replay/tool-call history to enforce capability-DAG ordering or raise
+`PRECONDITION_FAILED` based on an earlier call position. They validate declared arguments and current business state.
+The shared reward gate and compiled process metrics own causal order and must recognize a later correct retry after an
+early mistake; otherwise the sandbox teaches an unrecoverable implementation artifact instead of the business task.
+
 ## 5. LLM user simulator
 
 Use `sandbox_runtime.ContractUserSimulator` for seeded profile/FSM selection,
@@ -114,6 +119,10 @@ to implement a separate simulator in task_impl.py.
 Design an independent, stateful user simulator, separate from the Agent and from business tools. Read the profile and FSM script files referenced by `artifacts.user_simulation_manifest`; they are not embedded in `task.json`. Initialize the runtime user state from these validated inputs. The external LLM classifies and renders each live turn, but must not regenerate or replace the FSM.
 
 At runtime, only a successful `POST /v1/user_simulator` call starts one simulator turn. The Trainer passes the complete ordered `messages` array; an external LLM classifies the dialogue outcome and renders one natural-language `user_query` from the current profile, FSM state, legal transitions, variables, and complete conversation; a validator checks the outcome/transition pairing and output schema; then the Trainer persists the response, `should_end` flag, attachments, and user state. The simulator emits exactly one user message per endpoint call. Reset, observation reads, timers, and business-tool calls must not invoke it. Infrastructure failure cannot establish acceptance, rejection, correction, or goal completion: emit the FSM recovery policy's non-advancing `unrecognized` outcome, preserve normal state and variables, increment the bounded recovery counter, and terminate as `unresolved_dialogue` only when that bound is reached. The simulator must not read hidden truth, credentials or evaluation data, and must not act as the Code Agent.
+
+The simulated user sees the dialogue and public evidence, not internal tool traces. It must not reject an otherwise
+verifiable answer merely because raw tool-call records are absent. Validate both JSON shape and FSM cross-field semantics
+inside the bounded RuntimeLLMClient feedback/retry loop; only exhausted retries may use the conservative fallback.
 
 ## 6. Real-time simulation
 

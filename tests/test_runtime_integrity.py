@@ -219,6 +219,29 @@ class IntegrityTest(unittest.TestCase):
             corrected_request = json.loads(request.call_args_list[1].args[0].data)
             self.assertIn("failed validation", corrected_request["messages"][-1]["content"])
 
+    def test_runtime_llm_semantic_failure_gets_feedback_retry(self):
+        from env_factory.runtime_llm import RuntimeLLMClient, RuntimeLLMConfig, RuntimeLLMError
+        replies = [io.BytesIO(json.dumps({"choices": [{"message": {"content": json.dumps(value)}}]}).encode())
+                   for value in ({"outcome": "wrong"}, {"outcome": "accepted"})]
+
+        def semantic(value):
+            if value["outcome"] != "accepted":
+                raise RuntimeLLMError("outcome does not match transition")
+
+        with patch("env_factory.runtime_llm.urlopen", side_effect=replies) as request:
+            client = RuntimeLLMClient(RuntimeLLMConfig("test", "http://unused", "test", max_retries=1))
+            result = client.json_chat(
+                [{"role": "user", "content": "test"}],
+                response_schema={
+                    "type": "object", "required": ["outcome"],
+                    "properties": {"outcome": {"type": "string"}},
+                },
+                semantic_validator=semantic,
+            )
+            self.assertEqual(result, {"outcome": "accepted"})
+            corrected_request = json.loads(request.call_args_list[1].args[0].data)
+            self.assertIn("outcome does not match transition", corrected_request["messages"][-1]["content"])
+
     def test_acceptance_compiler_preserves_calls_but_owns_assertions(self):
         from env_factory.task_pipeline import TaskGenerationPipeline
         baseline = [{"kind": "goal_success", "steps": [{"operation": "reset"},
