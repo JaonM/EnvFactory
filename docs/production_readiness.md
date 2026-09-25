@@ -99,7 +99,7 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 
 生产认证还会原子生成 `training_materials_bundle/`。该目录不保留本机绝对路径，按内容身份保存每个
 环境的任务、运行时代码、业务数据、验收证据和 `live_rollout.json`，并生成 `transitions.jsonl` 与
-`bundle_manifest.json`。Bundle v6 同时包含去除本机路径的 `certification.json`、机器可读
+`bundle_manifest.json`。Bundle v7 同时包含去除本机路径的 `certification.json`、机器可读
 `dataset_card.json`。JSONL 每行是一条可重建的 schema v2 transition，并携带任务、类别、episode、
 Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bundle_sha256` 再次校验；导出失败或包校验
 失败时，即使此前统计门禁通过，也不会产生 `production_prepared_for_agentic_rl`。
@@ -110,7 +110,7 @@ Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bun
 就让语义损坏的轨迹通过。JSONL 由固定字段白名单投影产生；完整 trainer-only 证据仍保存在对应环境目录，
 并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。
 
-Bundle v6 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
+Bundle v7 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
 记录身份与排序、环境目录和 Docker 重建入口、运行接口来源，以及 policy input/output、环境反馈和
 trainer-only 证据边界。验证器使用内置规范与文件逐项比较；即使同时修改契约并重算所有外层哈希，也不能
 把 trainer-only 字段伪装成策略输入。历史 v3/v4 包仍可验证完整性，但不能满足当前生产认证的受信发布门禁。
@@ -121,9 +121,12 @@ trainer-only 证据边界。验证器使用内置规范与文件逐项比较；�
 `trusted_attestation=false`，不能触发 `production_prepared_for_agentic_rl`。
 
 任务按内容身份在每个任务类别内确定性分配到 `train`、`validation`、`test`，目标比例为 80/10/10。
-split 的最小单位是任务而不是 transition：同一沙箱的所有 episode 和 transition 永远属于同一集合。
+split 的最小单位是近重复任务家族而不是 transition：认证器使用与近重复率门禁相同的标准化与
+3-shingle Jaccard 规则聚类，同一数字变体、轻微措辞变体和传递相似链整体进入同一集合；同一沙箱的
+所有 episode 和 transition 也永远属于同一集合。
 生产门禁要求三个集合都非空且每个任务类别在三个集合中均有覆盖；分组同时写入 item、JSONL、数据集卡
-和消费契约，并由验证器独立重算，避免下游训练/评估泄漏或靠重写清单改变分组。
+和消费契约，并由验证器独立重算。跨类别家族或跨 split 家族重叠都会使生产认证失败，避免下游
+训练/评估泄漏或靠重写清单改变分组。
 
 数据集卡记录任务类别、模型组合、同模型评估数量、episode 成败和 transition 数量，并明确只适合重建
 沙箱、验证数据适配器、收集新鲜 on-policy rollout 和准备 policy-visible 输入。它显式禁止把本认证解释为

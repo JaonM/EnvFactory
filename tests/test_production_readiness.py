@@ -444,6 +444,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "verified": True, "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
+            "task_family_split_ready": True,
             "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
@@ -452,6 +453,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "verified": True, "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
+            "task_family_split_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])
@@ -468,6 +470,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "production_contract_ready": False,
             "trusted_attestation": True,
             "dataset_split_ready": True,
+            "task_family_split_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertFalse(report["certified"])

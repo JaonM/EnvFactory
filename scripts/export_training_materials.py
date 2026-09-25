@@ -35,6 +35,7 @@ from env_factory.material_attestation import (
 from env_factory.material_privacy import audit_rollout_privacy
 from env_factory.trajectory_schema import episode_errors, policy_transition
 from env_factory.execution_provenance import valid_execution_provenance
+from env_factory.task_similarity import task_family_ids
 
 
 def file_sha256(path: Path) -> str:
@@ -91,6 +92,7 @@ def _dataset_card(
     category_splits = Counter(
         (str(item.get("category")), str(item.get("split"))) for item in items
     )
+    family_count = len({str(item.get("task_family_id")) for item in items})
     same_model_items = sum(
         count for (agent, runtime), count in model_pairs.items() if agent == runtime
     )
@@ -101,7 +103,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "1.2",
+        "version": "1.3",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -142,6 +144,9 @@ def _dataset_card(
                 }
                 for category in sorted(categories)
             },
+            "task_families": family_count,
+            "near_duplicate_items": len(items) - family_count,
+            "cross_split_family_overlap": 0,
         },
         "data_boundary": {
             "origin": "model_generated_synthetic",
@@ -160,7 +165,8 @@ def _dataset_card(
 
 
 def _transition_records(
-    item_id: str, item: Mapping[str, Any], rollout: Mapping[str, Any], *, split: str = ""
+    item_id: str, item: Mapping[str, Any], rollout: Mapping[str, Any], *,
+    split: str = "", task_family_id: str = "",
 ) -> list[dict[str, Any]]:
     if rollout.get("schema_version") != "2.0":
         raise ValueError("rollout schema_version must be 2.0")
@@ -198,6 +204,7 @@ def _transition_records(
                 "runtime_model": rollout.get("runtime_model"),
                 "agent_usage": episode["usage"][transition_index],
                 **({"split": split} if split else {}),
+                **({"task_family_id": task_family_id} if task_family_id else {}),
                 "transition": policy_transition(transition),
             })
     return records
@@ -251,6 +258,22 @@ def _export_bundle_uncommitted(
             str(value.get("sandbox_evidence_fingerprint", "")),
         ) if isinstance(value, Mapping) else ("", ""),
     )
+    family_inputs = []
+    for item in ordered_source_items:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = (
+            f"{item['task_sha256'][:16]}-"
+            f"{item['sandbox_evidence_fingerprint'][:16]}"
+        )
+        task_document = json.loads(
+            Path(str(item["task_path"])).read_text(encoding="utf-8")
+        )
+        family_inputs.append({
+            "item_id": item_id,
+            "task": task_document.get("task") if isinstance(task_document, Mapping) else None,
+        })
+    family_assignments = task_family_ids(family_inputs)
     split_assignments = assign_dataset_splits([
         {
             "item_id": (
@@ -258,6 +281,10 @@ def _export_bundle_uncommitted(
                 f"{item['sandbox_evidence_fingerprint'][:16]}"
             ),
             "category": str(item.get("category", "unknown")),
+            "task_family_id": family_assignments[
+                f"{item['task_sha256'][:16]}-"
+                f"{item['sandbox_evidence_fingerprint'][:16]}"
+            ],
         }
         for item in ordered_source_items if isinstance(item, Mapping)
     ])
@@ -269,6 +296,7 @@ def _export_bundle_uncommitted(
             if item_id in seen_item_ids:
                 raise ValueError(f"duplicate portable item identity: {item_id}")
             seen_item_ids.add(item_id)
+            task_family_id = family_assignments[item_id]
             split = split_assignments[item_id]
             source_root = Path(str(item["sandbox_root"]))
             destination_root = output / "environments" / item_id
@@ -294,7 +322,10 @@ def _export_bundle_uncommitted(
                 encoding="utf-8", newline="\n",
             )
             copied["live_rollout.json"] = file_sha256(rollout_destination)
-            records = _transition_records(item_id, item, rollout, split=split)
+            records = _transition_records(
+                item_id, item, rollout, split=split,
+                task_family_id=task_family_id,
+            )
             for record in records:
                 stream.write(json.dumps(
                     record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -314,6 +345,7 @@ def _export_bundle_uncommitted(
                 "item_id": item_id,
                 "category": item["category"],
                 "split": split,
+                "task_family_id": task_family_id,
                 "score": item["score"],
                 "task_sha256": item["task_sha256"],
                 "environment_path": f"environments/{item_id}",
@@ -405,14 +437,16 @@ def verify_bundle(
     if manifest.get("bundle_sha256") != digest_json(unsigned):
         failures.append("bundle_digest")
     if (
-        manifest.get("version") not in {"3.0", "4.0", "5.0", BUNDLE_VERSION}
+        manifest.get("version") not in {
+            "3.0", "4.0", "5.0", "6.0", BUNDLE_VERSION,
+        }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
         or not isinstance(manifest.get("source_dataset_sha256"), str)
         or len(manifest["source_dataset_sha256"]) != 64
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", BUNDLE_VERSION,
+        "4.0", "5.0", "6.0", BUNDLE_VERSION,
     }
     if production_contract_ready:
         try:
@@ -505,6 +539,27 @@ def verify_bundle(
     if not isinstance(items, list) or not items:
         failures.append("bundle_items")
         items = []
+    family_inputs = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = str(item.get("item_id", ""))
+        try:
+            environment = _safe_relative(str(item.get("environment_path", "")))
+            task_document = json.loads(
+                (root / environment / "task.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError, ValueError):
+            task_document = {}
+        family_inputs.append({
+            "item_id": item_id,
+            "task": task_document.get("task") if isinstance(task_document, Mapping) else None,
+        })
+    try:
+        recomputed_families = task_family_ids(family_inputs)
+    except ValueError:
+        recomputed_families = {}
+        failures.append("task_family_identity")
     expected_records = []
     seen_item_ids = set()
     verified_episode_count = 0
@@ -524,6 +579,12 @@ def verify_bundle(
             failures.append("item_identity")
             continue
         seen_item_ids.add(item_id)
+        expected_family_id = recomputed_families.get(item_id, "")
+        if (
+            manifest.get("version") == BUNDLE_VERSION
+            and item.get("task_family_id") != expected_family_id
+        ):
+            failures.append("task_family_identity")
         try:
             environment = _safe_relative(str(item.get("environment_path", "")))
         except ValueError:
@@ -565,7 +626,11 @@ def verify_bundle(
         try:
             rollout = json.loads(rollout_path.read_text(encoding="utf-8"))
             projected = _transition_records(
-                item_id, item, rollout, split=str(item.get("split", ""))
+                item_id, item, rollout, split=str(item.get("split", "")),
+                task_family_id=(
+                    expected_family_id
+                    if manifest.get("version") == BUNDLE_VERSION else ""
+                ),
             )
         except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
             failures.append("transition_schema")
@@ -600,7 +665,14 @@ def verify_bundle(
     if item_ids != sorted(item_ids) or len(record_identities) != len(set(record_identities)):
         failures.append("consumer_record_order_or_identity")
     expected_splits = assign_dataset_splits([
-        {"item_id": str(item.get("item_id")), "category": str(item.get("category"))}
+        {
+            "item_id": str(item.get("item_id")),
+            "category": str(item.get("category")),
+            "task_family_id": (
+                recomputed_families.get(str(item.get("item_id")), "")
+                if manifest.get("version") == BUNDLE_VERSION else ""
+            ),
+        }
         for item in items if isinstance(item, Mapping)
     ])
     split_counts = Counter(
@@ -610,7 +682,7 @@ def verify_bundle(
         (str(item.get("category")), str(item.get("split")))
         for item in items if isinstance(item, Mapping)
     )
-    if any(
+    if manifest.get("version") in {"6.0", BUNDLE_VERSION} and any(
         item.get("split") != expected_splits.get(str(item.get("item_id")))
         for item in items if isinstance(item, Mapping)
     ):
@@ -622,6 +694,20 @@ def verify_bundle(
             category_split_counts.get((category, split), 0) > 0
             for category in verified_category_names for split in DATASET_SPLITS
         )
+    )
+    family_categories: dict[str, set[str]] = {}
+    family_splits: dict[str, set[str]] = {}
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        family = recomputed_families.get(str(item.get("item_id")), "")
+        family_categories.setdefault(family, set()).add(str(item.get("category")))
+        family_splits.setdefault(family, set()).add(str(item.get("split")))
+    family_split_ready = (
+        manifest.get("version") == BUNDLE_VERSION
+        and bool(family_categories)
+        and all(len(values) == 1 for values in family_categories.values())
+        and all(len(values) == 1 for values in family_splits.values())
     )
     if (
         len(records) != manifest.get("transition_count")
@@ -654,10 +740,12 @@ def verify_bundle(
         }
         for category in sorted(verified_category_names)
     }
+    expected_family_count = len(set(recomputed_families.values()))
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "1.2" if manifest.get("version") == BUNDLE_VERSION
+            "1.3" if manifest.get("version") == BUNDLE_VERSION
+            else "1.2" if manifest.get("version") == "6.0"
             else "1.1" if manifest.get("version") in {"4.0", "5.0"}
             else "1.0"
         )
@@ -673,7 +761,9 @@ def verify_bundle(
             == "internal_only_until_legal_and_security_review"
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
-            manifest.get("version") not in {"4.0", "5.0", BUNDLE_VERSION}
+            manifest.get("version") not in {
+                "4.0", "5.0", "6.0", BUNDLE_VERSION,
+            }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
         )
         and card_composition.get("items") == len(items)
@@ -693,6 +783,10 @@ def verify_bundle(
                 card_composition.get("splits") == expected_split_counts
                 and card_composition.get("category_splits")
                     == expected_category_splits
+                and card_composition.get("task_families") == expected_family_count
+                and card_composition.get("near_duplicate_items")
+                    == len(items) - expected_family_count
+                and card_composition.get("cross_split_family_overlap") == 0
             )
         )
         and required_limitations <= card_limits
@@ -714,7 +808,7 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     attestation = manifest.get("attestation")
     trusted_attestation = (
-        manifest.get("version") in {"5.0", BUNDLE_VERSION}
+        manifest.get("version") in {"5.0", "6.0", BUNDLE_VERSION}
         and trusted_public_key is not None
         and verify_file(
             root / BUNDLE_MANIFEST,
@@ -734,6 +828,7 @@ def verify_bundle(
         "production_contract_ready": production_contract_ready,
         "trusted_attestation": trusted_attestation,
         "dataset_split_ready": dataset_split_ready,
+        "task_family_split_ready": family_split_ready,
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None

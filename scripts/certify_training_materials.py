@@ -34,6 +34,7 @@ from env_factory.data_governance import (
 )
 from env_factory.container_provenance import verify_container_provenance
 from env_factory.execution_provenance import verify_execution_provenance
+from env_factory.task_similarity import near_duplicate_rate
 
 
 Z_95 = 1.959963984540054
@@ -70,33 +71,6 @@ def wilson_lower(successes: int, total: int, *, z: float = Z_95) -> float:
         proportion * (1 - proportion) / total + z * z / (4 * total * total)
     )
     return max(0.0, (centre - margin) / denominator)
-
-
-def _normal_text(value: Any) -> str:
-    text = str(value or "").casefold()
-    text = re.sub(r"\d+(?:\.\d+)?", "#", text)
-    return re.sub(r"[^\w\u4e00-\u9fff]+", "", text)
-
-
-def _shingles(text: str, size: int = 3) -> set[str]:
-    if len(text) <= size:
-        return {text} if text else set()
-    return {text[index:index + size] for index in range(len(text) - size + 1)}
-
-
-def near_duplicate_rate(tasks: Iterable[Mapping[str, Any]], threshold: float = 0.9) -> float:
-    """Count later tasks that are near duplicates of an earlier task."""
-    vectors: list[set[str]] = []
-    duplicates = 0
-    for task in tasks:
-        vector = _shingles(_normal_text(task.get("task")))
-        if vector and any(
-            len(vector & previous) / len(vector | previous) >= threshold
-            for previous in vectors if previous
-        ):
-            duplicates += 1
-        vectors.append(vector)
-    return duplicates / len(vectors) if vectors else 0.0
 
 
 def _artifact(result: Mapping[str, Any], name: str) -> dict[str, Any]:
@@ -775,6 +749,7 @@ def attach_bundle_verification(
         and verification.get("production_contract_ready") is True
         and verification.get("trusted_attestation") is True
         and verification.get("dataset_split_ready") is True
+        and verification.get("task_family_split_ready") is True
         and verification.get("source_dataset_sha256")
         == report.get("materials_manifest", {}).get("dataset_sha256")
     )

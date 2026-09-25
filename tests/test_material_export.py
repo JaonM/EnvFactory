@@ -147,6 +147,10 @@ class MaterialExportTest(unittest.TestCase):
             self.assertEqual(record["transition"]["reward"], 1.0)
             self.assertEqual(record["episode_final_reward"], 1.0)
             self.assertEqual(record["agent_usage"], {})
+            manifest = json.loads((bundle / "bundle_manifest.json").read_text())
+            self.assertEqual(
+                record["task_family_id"], manifest["items"][0]["task_family_id"]
+            )
             self.assertNotIn("trainer_metadata", record["transition"])
             card = json.loads((bundle / "dataset_card.json").read_text())
             self.assertEqual(card["composition"]["items"], 1)
@@ -168,7 +172,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "6.0")
+            self.assertEqual(contract["bundle_version"], "7.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -289,7 +293,17 @@ class MaterialExportTest(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text())
             manifest["version"] = "3.0"
             manifest.pop("consumer_contract_file")
+            manifest["items"][0].pop("split")
+            manifest["items"][0].pop("task_family_id")
+            transition_path = bundle / "transitions.jsonl"
+            record = json.loads(transition_path.read_text())
+            record.pop("split")
+            record.pop("task_family_id")
+            transition_path.write_text(json.dumps(record) + "\n")
             manifest["files_sha256"].pop("consumer_contract.json")
+            manifest["files_sha256"]["transitions.jsonl"] = exporter.file_sha256(
+                transition_path
+            )
             manifest["files_sha256"]["dataset_card.json"] = exporter.file_sha256(
                 card_path
             )
@@ -320,11 +334,21 @@ class MaterialExportTest(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text())
             manifest["version"] = "4.0"
             manifest.pop("attestation")
+            manifest["items"][0].pop("split")
+            manifest["items"][0].pop("task_family_id")
+            transition_path = bundle / "transitions.jsonl"
+            record = json.loads(transition_path.read_text())
+            record.pop("split")
+            record.pop("task_family_id")
+            transition_path.write_text(json.dumps(record) + "\n")
             manifest["files_sha256"]["consumer_contract.json"] = exporter.file_sha256(
                 contract_path
             )
             manifest["files_sha256"]["dataset_card.json"] = exporter.file_sha256(
                 card_path
+            )
+            manifest["files_sha256"]["transitions.jsonl"] = exporter.file_sha256(
+                transition_path
             )
             unsigned = {
                 key: value for key, value in manifest.items()
@@ -427,6 +451,32 @@ class MaterialExportTest(unittest.TestCase):
             report = exporter.verify_bundle(bundle)
             self.assertFalse(report["verified"])
             self.assertIn("dataset_split_assignment", report["failed_gates"])
+
+    def test_rehashed_bundle_cannot_forge_task_family_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["items"][0]["task_family_id"] = "0" * 64
+            transition_path = bundle / "transitions.jsonl"
+            record = json.loads(transition_path.read_text())
+            record["task_family_id"] = "0" * 64
+            transition_path.write_text(json.dumps(record) + "\n")
+            manifest["files_sha256"]["transitions.jsonl"] = exporter.file_sha256(
+                transition_path
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertIn("task_family_identity", report["failed_gates"])
 
     def test_uncertified_report_cannot_be_exported(self):
         with tempfile.TemporaryDirectory() as directory:

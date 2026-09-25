@@ -13,7 +13,7 @@ CERTIFICATION_FILE = "certification.json"
 DATASET_CARD_FILE = "dataset_card.json"
 CONSUMER_CONTRACT_FILE = "consumer_contract.json"
 BUNDLE_SIGNATURE_FILE = "bundle_manifest.sig"
-BUNDLE_VERSION = "6.0"
+BUNDLE_VERSION = "7.0"
 DATASET_SPLITS = ("train", "validation", "test")
 
 
@@ -24,30 +24,37 @@ def assign_dataset_splits(items: list[dict[str, Any]]) -> dict[str, str]:
         groups.setdefault(str(item.get("category", "unknown")), []).append(item)
     assignments = {}
     for members in groups.values():
-        ordered = sorted(members, key=lambda item: str(item.get("item_id", "")))
+        families: dict[str, list[dict[str, Any]]] = {}
+        for item in members:
+            family = str(item.get("task_family_id") or item.get("item_id", ""))
+            families.setdefault(family, []).append(item)
+        ordered = sorted(families.items())
         count = len(ordered)
         validation_count = max(1, count // 10) if count >= 3 else 0
         test_count = max(1, count // 10) if count >= 3 else 0
         train_end = count - validation_count - test_count
-        for index, item in enumerate(ordered):
+        for index, (_, family_members) in enumerate(ordered):
             split = (
                 "train" if index < train_end
                 else "validation" if index < count - test_count
                 else "test"
             )
-            assignments[str(item["item_id"])] = split
+            for item in family_members:
+                assignments[str(item["item_id"])] = split
     return assignments
 
 
 def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
     """Return the exact portable handoff; consumers need no prompt conventions."""
-    supports_splits = bundle_version == BUNDLE_VERSION
+    supports_splits = bundle_version in {"6.0", BUNDLE_VERSION}
+    supports_families = bundle_version == BUNDLE_VERSION
     record_fields = [
         "schema_version", "item_id", "task_sha256", "category",
         "episode_index", "episode_seed", "episode_success",
         "episode_termination", "episode_initial_reward", "episode_final_reward",
         "agent_model", "runtime_model", "agent_usage",
-        *(["split"] if supports_splits else []), "transition",
+        *(["split"] if supports_splits else []),
+        *(["task_family_id"] if supports_families else []), "transition",
     ]
     return {
         "version": "1.0",
@@ -60,6 +67,7 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
             "ordering": ["item_id", "episode_index", "transition.step"],
             "identity": ["item_id", "episode_index", "transition.step"],
             **({"split_unit": "item_id"} if supports_splits else {}),
+            **({"near_duplicate_split_unit": "task_family_id"} if supports_families else {}),
             "required_fields": record_fields,
             "policy_transition_fields": list(POLICY_TRANSITION_FIELDS),
             "json_schema": {
@@ -74,6 +82,11 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
                     **(
                         {"split": {"enum": list(DATASET_SPLITS)}}
                         if supports_splits else {}
+                    ),
+                    **(
+                        {"task_family_id": {
+                            "type": "string", "pattern": "^[0-9a-f]{64}$",
+                        }} if supports_families else {}
                     ),
                     "episode_index": {"type": "integer", "minimum": 0},
                     "episode_seed": {"type": "integer"},
