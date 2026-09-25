@@ -168,7 +168,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "5.0")
+            self.assertEqual(contract["bundle_version"], "6.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -310,15 +310,21 @@ class MaterialExportTest(unittest.TestCase):
             bundle = root / "bundle"
             exporter.export_bundle(certification, bundle, ROOT)
             contract_path = bundle / "consumer_contract.json"
-            contract = json.loads(contract_path.read_text())
-            contract["bundle_version"] = "4.0"
+            contract = exporter.consumer_contract("4.0")
             contract_path.write_text(json.dumps(contract))
+            card_path = bundle / "dataset_card.json"
+            card = json.loads(card_path.read_text())
+            card["version"] = "1.1"
+            card_path.write_text(json.dumps(card))
             manifest_path = bundle / "bundle_manifest.json"
             manifest = json.loads(manifest_path.read_text())
             manifest["version"] = "4.0"
             manifest.pop("attestation")
             manifest["files_sha256"]["consumer_contract.json"] = exporter.file_sha256(
                 contract_path
+            )
+            manifest["files_sha256"]["dataset_card.json"] = exporter.file_sha256(
+                card_path
             )
             unsigned = {
                 key: value for key, value in manifest.items()
@@ -379,6 +385,48 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(changed["verified"])
             self.assertFalse(changed["trusted_attestation"])
             self.assertIn("trusted_attestation", changed["failed_gates"])
+
+    def test_rehashed_item_and_records_cannot_change_content_based_split(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            item = manifest["items"][0]
+            self.assertEqual(item["split"], "train")
+            item["split"] = "test"
+
+            transition_path = bundle / "transitions.jsonl"
+            record = json.loads(transition_path.read_text())
+            record["split"] = "test"
+            transition_path.write_text(json.dumps(record) + "\n")
+            manifest["files_sha256"]["transitions.jsonl"] = exporter.file_sha256(
+                transition_path
+            )
+
+            card_path = bundle / "dataset_card.json"
+            card = json.loads(card_path.read_text())
+            card["composition"]["splits"] = {
+                "train": 0, "validation": 0, "test": 1,
+            }
+            card["composition"]["category_splits"]["simple_agentic"] = {
+                "train": 0, "validation": 0, "test": 1,
+            }
+            card_path.write_text(json.dumps(card))
+            manifest["files_sha256"]["dataset_card.json"] = exporter.file_sha256(
+                card_path
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertIn("dataset_split_assignment", report["failed_gates"])
 
     def test_uncertified_report_cannot_be_exported(self):
         with tempfile.TemporaryDirectory() as directory:

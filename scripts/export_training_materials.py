@@ -21,8 +21,10 @@ from env_factory.material_consumer import (
     BUNDLE_VERSION,
     CERTIFICATION_FILE,
     CONSUMER_CONTRACT_FILE,
+    DATASET_SPLITS,
     DATASET_CARD_FILE,
     TRANSITIONS_FILE,
+    assign_dataset_splits,
     consumer_contract,
 )
 from env_factory.material_attestation import (
@@ -85,6 +87,10 @@ def _dataset_card(
     episode_count: int,
 ) -> dict[str, Any]:
     categories = Counter(str(item.get("category")) for item in items)
+    splits = Counter(str(item.get("split")) for item in items)
+    category_splits = Counter(
+        (str(item.get("category")), str(item.get("split"))) for item in items
+    )
     same_model_items = sum(
         count for (agent, runtime), count in model_pairs.items() if agent == runtime
     )
@@ -95,7 +101,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "1.1",
+        "version": "1.2",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -128,6 +134,14 @@ def _dataset_card(
                 for pair, count in sorted(model_pairs.items())
             ],
             "same_model_pair_items": same_model_items,
+            "splits": {name: splits.get(name, 0) for name in DATASET_SPLITS},
+            "category_splits": {
+                category: {
+                    split: category_splits.get((category, split), 0)
+                    for split in DATASET_SPLITS
+                }
+                for category in sorted(categories)
+            },
         },
         "data_boundary": {
             "origin": "model_generated_synthetic",
@@ -146,7 +160,7 @@ def _dataset_card(
 
 
 def _transition_records(
-    item_id: str, item: Mapping[str, Any], rollout: Mapping[str, Any]
+    item_id: str, item: Mapping[str, Any], rollout: Mapping[str, Any], *, split: str = ""
 ) -> list[dict[str, Any]]:
     if rollout.get("schema_version") != "2.0":
         raise ValueError("rollout schema_version must be 2.0")
@@ -183,6 +197,7 @@ def _transition_records(
                 "agent_model": rollout.get("agent_model"),
                 "runtime_model": rollout.get("runtime_model"),
                 "agent_usage": episode["usage"][transition_index],
+                **({"split": split} if split else {}),
                 "transition": policy_transition(transition),
             })
     return records
@@ -226,23 +241,35 @@ def _export_bundle_uncommitted(
     episode_count = 0
     successful_episodes = 0
     model_pairs: Counter[tuple[str, str]] = Counter()
+    source_items = source_manifest.get("items", [])
+    if not isinstance(source_items, list):
+        raise ValueError("material items must be a list")
+    ordered_source_items = sorted(
+        source_items,
+        key=lambda value: (
+            str(value.get("task_sha256", "")),
+            str(value.get("sandbox_evidence_fingerprint", "")),
+        ) if isinstance(value, Mapping) else ("", ""),
+    )
+    split_assignments = assign_dataset_splits([
+        {
+            "item_id": (
+                f"{item['task_sha256'][:16]}-"
+                f"{item['sandbox_evidence_fingerprint'][:16]}"
+            ),
+            "category": str(item.get("category", "unknown")),
+        }
+        for item in ordered_source_items if isinstance(item, Mapping)
+    ])
     with transition_path.open("w", encoding="utf-8", newline="\n") as stream:
-        source_items = source_manifest.get("items", [])
-        if not isinstance(source_items, list):
-            raise ValueError("material items must be a list")
-        for item in sorted(
-            source_items,
-            key=lambda value: (
-                str(value.get("task_sha256", "")),
-                str(value.get("sandbox_evidence_fingerprint", "")),
-            ) if isinstance(value, Mapping) else ("", ""),
-        ):
+        for item in ordered_source_items:
             if not isinstance(item, Mapping):
                 raise ValueError("material item is not an object")
             item_id = f"{item['task_sha256'][:16]}-{item['sandbox_evidence_fingerprint'][:16]}"
             if item_id in seen_item_ids:
                 raise ValueError(f"duplicate portable item identity: {item_id}")
             seen_item_ids.add(item_id)
+            split = split_assignments[item_id]
             source_root = Path(str(item["sandbox_root"]))
             destination_root = output / "environments" / item_id
             copied = {}
@@ -267,7 +294,7 @@ def _export_bundle_uncommitted(
                 encoding="utf-8", newline="\n",
             )
             copied["live_rollout.json"] = file_sha256(rollout_destination)
-            records = _transition_records(item_id, item, rollout)
+            records = _transition_records(item_id, item, rollout, split=split)
             for record in records:
                 stream.write(json.dumps(
                     record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -286,6 +313,7 @@ def _export_bundle_uncommitted(
             exported_items.append({
                 "item_id": item_id,
                 "category": item["category"],
+                "split": split,
                 "score": item["score"],
                 "task_sha256": item["task_sha256"],
                 "environment_path": f"environments/{item_id}",
@@ -377,13 +405,15 @@ def verify_bundle(
     if manifest.get("bundle_sha256") != digest_json(unsigned):
         failures.append("bundle_digest")
     if (
-        manifest.get("version") not in {"3.0", "4.0", BUNDLE_VERSION}
+        manifest.get("version") not in {"3.0", "4.0", "5.0", BUNDLE_VERSION}
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
         or not isinstance(manifest.get("source_dataset_sha256"), str)
         or len(manifest["source_dataset_sha256"]) != 64
     ):
         failures.append("bundle_schema")
-    production_contract_ready = manifest.get("version") in {"4.0", BUNDLE_VERSION}
+    production_contract_ready = manifest.get("version") in {
+        "4.0", "5.0", BUNDLE_VERSION,
+    }
     if production_contract_ready:
         try:
             contract_relative = _safe_relative(
@@ -534,7 +564,9 @@ def verify_bundle(
         rollout_path = root / environment / "live_rollout.json"
         try:
             rollout = json.loads(rollout_path.read_text(encoding="utf-8"))
-            projected = _transition_records(item_id, item, rollout)
+            projected = _transition_records(
+                item_id, item, rollout, split=str(item.get("split", ""))
+            )
         except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
             failures.append("transition_schema")
             continue
@@ -567,6 +599,30 @@ def verify_bundle(
     ]
     if item_ids != sorted(item_ids) or len(record_identities) != len(set(record_identities)):
         failures.append("consumer_record_order_or_identity")
+    expected_splits = assign_dataset_splits([
+        {"item_id": str(item.get("item_id")), "category": str(item.get("category"))}
+        for item in items if isinstance(item, Mapping)
+    ])
+    split_counts = Counter(
+        str(item.get("split")) for item in items if isinstance(item, Mapping)
+    )
+    category_split_counts = Counter(
+        (str(item.get("category")), str(item.get("split")))
+        for item in items if isinstance(item, Mapping)
+    )
+    if any(
+        item.get("split") != expected_splits.get(str(item.get("item_id")))
+        for item in items if isinstance(item, Mapping)
+    ):
+        failures.append("dataset_split_assignment")
+    verified_category_names = set(verified_categories)
+    dataset_split_ready = (
+        all(split_counts.get(split, 0) > 0 for split in DATASET_SPLITS)
+        and all(
+            category_split_counts.get((category, split), 0) > 0
+            for category in verified_category_names for split in DATASET_SPLITS
+        )
+    )
     if (
         len(records) != manifest.get("transition_count")
         or len(items) != manifest.get("item_count")
@@ -588,10 +644,23 @@ def verify_bundle(
     card_limits = set(dataset_card.get("prohibited_interpretations", [])) if isinstance(
         dataset_card, Mapping
     ) else set()
+    expected_split_counts = {
+        name: split_counts.get(name, 0) for name in DATASET_SPLITS
+    }
+    expected_category_splits = {
+        category: {
+            split: category_split_counts.get((category, split), 0)
+            for split in DATASET_SPLITS
+        }
+        for category in sorted(verified_category_names)
+    }
     if not (
         isinstance(dataset_card, Mapping)
-        and dataset_card.get("version")
-            == ("1.1" if manifest.get("version") in {"4.0", BUNDLE_VERSION} else "1.0")
+        and dataset_card.get("version") == (
+            "1.2" if manifest.get("version") == BUNDLE_VERSION
+            else "1.1" if manifest.get("version") in {"4.0", "5.0"}
+            else "1.0"
+        )
         and dataset_card.get("kind") == "agentic_rl_pretraining_material_dataset_card"
         and dataset_card.get("source_dataset_sha256")
             == manifest.get("source_dataset_sha256")
@@ -604,7 +673,7 @@ def verify_bundle(
             == "internal_only_until_legal_and_security_review"
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
-            manifest.get("version") not in {"4.0", BUNDLE_VERSION}
+            manifest.get("version") not in {"4.0", "5.0", BUNDLE_VERSION}
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
         )
         and card_composition.get("items") == len(items)
@@ -618,6 +687,14 @@ def verify_bundle(
         and card_composition.get("model_pairs") == expected_model_pairs
         and card_composition.get("same_model_pair_items")
             == verified_same_model_items
+        and (
+            manifest.get("version") != BUNDLE_VERSION
+            or (
+                card_composition.get("splits") == expected_split_counts
+                and card_composition.get("category_splits")
+                    == expected_category_splits
+            )
+        )
         and required_limitations <= card_limits
         and "offline_rl_algorithm_compatibility" in card_limits
         and dataset_card.get("data_boundary", {}).get("policy_transitions")
@@ -637,7 +714,7 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     attestation = manifest.get("attestation")
     trusted_attestation = (
-        manifest.get("version") == BUNDLE_VERSION
+        manifest.get("version") in {"5.0", BUNDLE_VERSION}
         and trusted_public_key is not None
         and verify_file(
             root / BUNDLE_MANIFEST,
@@ -656,6 +733,7 @@ def verify_bundle(
         "transitions": len(records),
         "production_contract_ready": production_contract_ready,
         "trusted_attestation": trusted_attestation,
+        "dataset_split_ready": dataset_split_ready,
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None

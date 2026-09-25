@@ -443,6 +443,7 @@ class ProductionReadinessTest(unittest.TestCase):
         certifier.attach_bundle_verification(report, {
             "verified": True, "production_contract_ready": True,
             "trusted_attestation": True,
+            "dataset_split_ready": True,
             "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
@@ -450,6 +451,7 @@ class ProductionReadinessTest(unittest.TestCase):
         certifier.attach_bundle_verification(report, {
             "verified": True, "production_contract_ready": True,
             "trusted_attestation": True,
+            "dataset_split_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])
@@ -465,6 +467,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "verified": True,
             "production_contract_ready": False,
             "trusted_attestation": True,
+            "dataset_split_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertFalse(report["certified"])

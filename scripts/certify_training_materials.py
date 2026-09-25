@@ -774,6 +774,7 @@ def attach_bundle_verification(
         verification.get("verified") is True
         and verification.get("production_contract_ready") is True
         and verification.get("trusted_attestation") is True
+        and verification.get("dataset_split_ready") is True
         and verification.get("source_dataset_sha256")
         == report.get("materials_manifest", {}).get("dataset_sha256")
     )
