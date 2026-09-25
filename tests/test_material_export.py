@@ -417,6 +417,41 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["production_preflight_ready"])
             self.assertIn("portable_certification", report["failed_gates"])
 
+    def test_v12_verifier_binds_preflight_to_environment_providers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            certification_path = bundle / "certification.json"
+            portable = json.loads(certification_path.read_text())
+            checks = portable["measurements"]["production_preflight"]["checks"]
+            model_evidence = next(
+                check["evidence"] for check in checks
+                if check["name"] == "model_configuration"
+            )
+            model_evidence["agent_provider"] = {
+                "host": "other.example",
+                "model": "other-policy",
+                "identity_sha256": "d" * 64,
+            }
+            certification_path.write_text(json.dumps(portable))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files_sha256"]["certification.json"] = (
+                exporter.file_sha256(certification_path)
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["production_preflight_ready"])
+            self.assertIn("preflight_provider_binding", report["failed_gates"])
+
     def test_bundle_verifier_rejects_semantically_rewritten_transition_jsonl(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

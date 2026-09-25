@@ -694,6 +694,7 @@ class ProductionReadinessTest(unittest.TestCase):
             report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertIn("production_preflight", report["failed_gates"])
+            self.assertFalse(report["gates"]["provider_identity_consistency"])
 
     def test_rollout_agent_provider_drift_cannot_certify(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -705,6 +706,7 @@ class ProductionReadinessTest(unittest.TestCase):
             report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertIn("production_preflight", report["failed_gates"])
+            self.assertFalse(report["gates"]["provider_identity_consistency"])
 
     def test_preflight_signing_key_drift_cannot_certify(self):
         with tempfile.TemporaryDirectory() as directory:

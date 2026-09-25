@@ -588,12 +588,31 @@ def valid_rollout_provenance(item: Mapping[str, Any]) -> bool:
     )
 
 
-def valid_provider_binding(item: Mapping[str, Any]) -> bool:
+def valid_provider_binding(
+    item: Mapping[str, Any],
+    *,
+    expected_agent_provider: Mapping[str, Any] | None = None,
+    expected_runtime_provider: Mapping[str, Any] | None = None,
+) -> bool:
     """Bind rollout model identities to the provider governance authorization."""
-    return valid_governed_provider_binding(
-        item.get("live_rollout"),
-        _artifact(item, "agentic_training_value_live.json"),
-        _artifact(item, "data_governance.json"),
+    governance = _artifact(item, "data_governance.json")
+    providers = governance.get("providers") if isinstance(governance, Mapping) else None
+    return (
+        valid_governed_provider_binding(
+            item.get("live_rollout"),
+            _artifact(item, "agentic_training_value_live.json"),
+            governance,
+        )
+        and isinstance(providers, Mapping)
+        and (
+            expected_agent_provider is None
+            or providers.get("agent") == dict(expected_agent_provider)
+        )
+        and (
+            expected_runtime_provider is None
+            or providers.get("user_simulator_and_reward")
+                == dict(expected_runtime_provider)
+        )
     )
 
 
@@ -1101,7 +1120,12 @@ def certify(
         valid_rollout_provenance(item) for item in qualified
     )
     provider_bindings_verified = sum(
-        valid_provider_binding(item) for item in qualified
+        valid_provider_binding(
+            item,
+            expected_agent_provider=expected_agent_provider,
+            expected_runtime_provider=expected_runtime_provider,
+        )
+        for item in qualified
     )
     provider_identity_consistency = (
         bool(qualified) and provider_bindings_verified == len(qualified)

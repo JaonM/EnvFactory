@@ -195,6 +195,9 @@ provider、容器奖励校准和 task lineage 契约验证，但缺少 v12 的 p
 更早版本也只能
 验证各自声明的历史契约，不能满足当前受信发布门禁。
 
+v12 验证器还会把 preflight 的 generation、Rollout Agent、User/Judge 三个 provider 分别与每个环境中的
+生成 provenance 和 `data_governance.json` 交叉核对；三个各自格式合法但来自不同实验的身份不能拼成合格包。
+
 生产发布还要求使用组织持有的 Ed25519 私钥对最终 `bundle_manifest.json` 生成 detached signature，并由
 显式指定的受信任公钥复验。报告和包中只保存公钥 SHA-256 身份，不保存私钥、私钥路径或公钥内容。
 因此重写整个包并重算所有普通哈希仍不能伪造认证来源。开发检查可以导出未签名包，但

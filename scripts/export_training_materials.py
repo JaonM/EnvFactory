@@ -643,6 +643,17 @@ def verify_bundle(
     except (OSError, json.JSONDecodeError, ValueError):
         portable_certification = {}
         failures.append("portable_certification")
+    preflight_report = portable_certification.get("measurements", {}).get(
+        "production_preflight"
+    ) if isinstance(portable_certification, Mapping) else None
+    preflight_checks = {
+        check.get("name"): check
+        for check in preflight_report.get("checks", [])
+        if isinstance(check, Mapping)
+    } if isinstance(preflight_report, Mapping) else {}
+    preflight_model_evidence = preflight_checks.get(
+        "model_configuration", {}
+    ).get("evidence", {})
     required_limitations = {
         "rl_training_execution",
         "downstream_training_system_compatibility",
@@ -758,6 +769,7 @@ def verify_bundle(
     verified_container_rollouts = 0
     verified_container_reward_calibrations = 0
     verified_provider_bindings = 0
+    verified_preflight_provider_bindings = 0
     verified_task_lineages = 0
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
@@ -908,10 +920,37 @@ def verify_bundle(
                     )
                 except (OSError, json.JSONDecodeError):
                     governance = {}
-                if valid_provider_binding(rollout, calibration, governance):
+                governed_binding_valid = valid_provider_binding(
+                    rollout, calibration, governance
+                )
+                if governed_binding_valid:
                     verified_provider_bindings += 1
                 else:
                     failures.append("provider_identity_binding")
+                if supports_bundle_feature(
+                    str(manifest.get("version")), "production_preflight"
+                ):
+                    providers = (
+                        governance.get("providers")
+                        if isinstance(governance, Mapping) else None
+                    )
+                    preflight_binding_valid = (
+                        governed_binding_valid
+                        and isinstance(generation, Mapping)
+                        and isinstance(providers, Mapping)
+                        and generation.get("generator_provider")
+                            == preflight_model_evidence.get(
+                                "generation_provider"
+                            )
+                        and providers.get("agent")
+                            == preflight_model_evidence.get("agent_provider")
+                        and providers.get("user_simulator_and_reward")
+                            == preflight_model_evidence.get("runtime_provider")
+                    )
+                    if preflight_binding_valid:
+                        verified_preflight_provider_bindings += 1
+                    else:
+                        failures.append("preflight_provider_binding")
         if item.get("episode_count") != len(rollout.get("episodes", [])):
             failures.append("item_episode_count")
         if item.get("transition_count") != len(projected):
@@ -1046,6 +1085,8 @@ def verify_bundle(
             ),
             expected_signing_key_identity=expected_attestation_key,
         )
+        and bool(items)
+        and verified_preflight_provider_bindings == len(items)
     )
     if (
         len(records) != manifest.get("transition_count")
@@ -1266,6 +1307,7 @@ def verify_bundle(
         "provider_identity_ready": provider_identity_ready,
         "task_lineage_ready": task_lineage_ready,
         "production_preflight_ready": production_preflight_ready,
+        "preflight_provider_bindings": verified_preflight_provider_bindings,
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None
