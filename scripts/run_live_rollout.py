@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import os
@@ -17,7 +18,7 @@ from env_factory.sandbox_runtime import BusinessGoalEvaluator
 def episode(app, task, client, seed, max_steps):
     headers = {"Authorization": "Bearer " + os.environ["SANDBOX_TRAINER_API_KEY"],
                "X-Episode-ID": f"live-{seed}"}
-    trace, usage = [], []
+    trace, transitions, usage = [], [], []
 
     def request(method, path, body=None):
         status, value, _ = app.handle(method, path, body, headers)
@@ -29,6 +30,7 @@ def episode(app, task, client, seed, max_steps):
     request("POST", "/v1/reset", {"episode_id": headers["X-Episode-ID"], "seed": seed})
     baseline = app.business_snapshot()
     initial_reward = request("GET", "/v1/reward")[1]["reward"]
+    current_reward = initial_reward
     tools = request("GET", "/v1/tools")[1]["tools"]
     observation = request("GET", "/v1/observation")[1]
     names = {tool["function"]["name"] for tool in tools}
@@ -50,36 +52,68 @@ def episode(app, task, client, seed, max_steps):
         {"role": "user", "content": json.dumps({"observation": observation}, ensure_ascii=False)}]
     termination = "step_budget"
     protocol_errors = 0
-    for _ in range(max_steps):
+    for step in range(max_steps):
+        agent_input = copy.deepcopy(messages)
         response = client.chat(messages, response_format={"type": "json_object"})
         usage.append(dict(response.usage or {}))
         messages.append({"role": "assistant", "content": response.content})
+        transition = {
+            "step": step,
+            "agent_input": agent_input,
+            "assistant_output": response.content,
+            "observation": copy.deepcopy(observation),
+            "action": None,
+            "result": None,
+            "next_observation": None,
+            "reward": None,
+            "terminated": False,
+            "truncated": False,
+        }
         try:
             action = json.loads(response.content)
             if not isinstance(action, dict):
                 raise ValueError("action must be an object")
+            transition["action"] = copy.deepcopy(action)
             if action.get("kind") == "tool":
                 if action.get("name") not in names or not isinstance(action.get("arguments"), dict):
                     raise ValueError("unknown tool or invalid arguments")
                 status, result = request("POST", "/v1/tools/" + action["name"], action["arguments"])
                 messages.append({"role": "user", "content": json.dumps({"tool_result": result, "status": status}, ensure_ascii=False)})
+                transition["result"] = {"status": status, "tool_result": copy.deepcopy(result)}
             elif action.get("kind") == "respond" and isinstance(action.get("content"), str) and action["content"].strip():
                 request("POST", "/v1/agent_response", {"content": action["content"]})
                 conversation.append({"role": "assistant", "content": action["content"]})
                 user = request("POST", "/v1/user_simulator", {"messages": conversation})[1]
                 conversation.append({"role": "user", "content": user["user_query"]})
                 messages.append({"role": "user", "content": user["user_query"]})
+                transition["result"] = {"status": 200, "user_simulator": copy.deepcopy(user)}
                 if user.get("should_end"):
                     termination = user.get("termination_reason", "user_ended")
-                    break
             else:
                 raise ValueError("expected tool or respond action")
+            observation = request("GET", "/v1/observation")[1]
+            transition["next_observation"] = copy.deepcopy(observation)
+            current_reward = request("GET", "/v1/reward")[1]["reward"]
+            transition["reward"] = current_reward
+            transition["terminated"] = bool(user.get("should_end")) if action.get("kind") == "respond" else False
+            transitions.append(transition)
+            if transition["terminated"]:
+                break
         except (ValueError, TypeError) as exc:
             protocol_errors += 1
+            transition["result"] = {
+                "status": 422,
+                "protocol_error": str(exc),
+            }
+            transition["next_observation"] = copy.deepcopy(observation)
+            transition["reward"] = current_reward
+            transitions.append(transition)
             messages.append({"role": "user", "content": f"Invalid action: {exc}. Return a corrected JSON action."})
             if protocol_errors >= 3:
                 termination = "agent_protocol_error"
                 break
+    if transitions and termination == "step_budget":
+        transitions[-1]["truncated"] = True
     final_reward = request("GET", "/v1/reward")[1]["reward"]
     repeated_reward = request("GET", "/v1/reward")[1]["reward"]
     replay = request("GET", "/v1/replay")[1]
@@ -101,10 +135,11 @@ def episode(app, task, client, seed, max_steps):
     if fallbacks:
         issues.append("runtime_llm_fallback")
     success = termination == "completed" and final_reward >= 0.8 and state_success is not False and not issues
-    return {"seed": seed, "agent_success": success, "termination": termination,
+    return {"schema_version": "2.0", "seed": seed, "agent_success": success, "termination": termination,
             "initial_reward": initial_reward, "final_reward": final_reward,
             "state_goal_satisfied": state_success, "issues": issues, "usage": usage,
-            "protocol_errors": protocol_errors, "trajectory": trace, "replay": replay,
+            "protocol_errors": protocol_errors, "trajectory": trace,
+            "transitions": transitions, "replay": replay,
             "initial_state": baseline, "final_state": state}
 
 
@@ -192,7 +227,7 @@ def main():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     task = json.loads((root / "task.json").read_text())
-    report = {"mode": "live_rollout", "agent_model": client.model,
+    report = {"schema_version": "2.0", "mode": "live_rollout", "agent_model": client.model,
               "runtime_model": runtime.model, "episodes": [],
               "same_model_bias_possible": client.model == runtime.model,
               "live_rollout_verified": False, "passed": False}

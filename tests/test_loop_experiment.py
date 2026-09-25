@@ -334,6 +334,11 @@ class RolloutTest(unittest.TestCase):
         result = self.run_episode(FakeApp())
         self.assertTrue(result["agent_success"])
         self.assertEqual(sum(item["total_tokens"] for item in result["usage"]), 20)
+        self.assertEqual(result["schema_version"], "2.0")
+        self.assertEqual(len(result["transitions"]), 2)
+        self.assertEqual(result["transitions"][0]["action"]["kind"], "tool")
+        self.assertIsInstance(result["transitions"][0]["next_observation"], dict)
+        self.assertTrue(result["transitions"][-1]["terminated"])
 
     def test_high_reward_with_wrong_state_is_rejected(self):
         result = self.run_episode(FakeApp(correct=False))
