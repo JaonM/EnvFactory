@@ -7,6 +7,20 @@ from env_factory.data_governance import audit, provider_identity
 
 
 class DataGovernanceTest(unittest.TestCase):
+    def test_content_digests_do_not_randomly_match_pii_patterns(self):
+        from env_factory.data_governance import scan_payloads
+
+        digest = "a" * 20 + "13812345678" + "b" * 33
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(
+            scan_payloads({"digest": digest})["pii_findings"], []
+        )
+        self.assertTrue(
+            scan_payloads({"text": f"contact 13812345678 about {digest}"})[
+                "pii_findings"
+            ]
+        )
+
     def make_root(self, root: Path, *, governance=None, material=None) -> None:
         (root / "data").mkdir()
         (root / "task.json").write_text(json.dumps({

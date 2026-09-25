@@ -219,6 +219,37 @@ class IntegrityTest(unittest.TestCase):
             corrected_request = json.loads(request.call_args_list[1].args[0].data)
             self.assertIn("failed validation", corrected_request["messages"][-1]["content"])
 
+    def test_runtime_llm_trace_records_actual_provider_model_without_raw_id(self):
+        from env_factory.runtime_llm import (
+            RuntimeLLMClient, RuntimeLLMConfig, capture_runtime_llm_trace,
+            summarize_runtime_llm_trace,
+        )
+        payload = {
+            "id": "provider-secret-response-id",
+            "model": "actual-runtime-snapshot",
+            "usage": {"total_tokens": 7},
+            "choices": [{"message": {"content": '{"ok":true}'}}],
+        }
+        with patch(
+            "env_factory.runtime_llm.urlopen",
+            return_value=io.BytesIO(json.dumps(payload).encode()),
+        ):
+            client = RuntimeLLMClient(
+                RuntimeLLMConfig("test", "http://unused", "configured-alias")
+            )
+            with capture_runtime_llm_trace() as trace:
+                client.json_chat(
+                    [{"role": "user", "content": "test"}],
+                    response_schema={
+                        "type": "object", "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}},
+                    },
+                )
+        summary = summarize_runtime_llm_trace(trace)
+        self.assertEqual(summary["models"], {"actual-runtime-snapshot": 1})
+        self.assertEqual(summary["usage"], {"total_tokens": 7})
+        self.assertNotIn("provider-secret-response-id", str(summary))
+
     def test_runtime_llm_semantic_failure_gets_feedback_retry(self):
         from env_factory.runtime_llm import RuntimeLLMClient, RuntimeLLMConfig, RuntimeLLMError
         replies = [io.BytesIO(json.dumps({"choices": [{"message": {"content": json.dumps(value)}}]}).encode())

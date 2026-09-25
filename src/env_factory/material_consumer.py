@@ -13,19 +13,20 @@ CERTIFICATION_FILE = "certification.json"
 DATASET_CARD_FILE = "dataset_card.json"
 CONSUMER_CONTRACT_FILE = "consumer_contract.json"
 BUNDLE_SIGNATURE_FILE = "bundle_manifest.sig"
-BUNDLE_VERSION = "14.0"
+BUNDLE_VERSION = "15.0"
 DATASET_SPLITS = ("train", "validation", "test")
 FEATURE_VERSIONS = {
-    "splits": {"6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0"},
-    "families": {"7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0"},
-    "generation": {"8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0"},
-    "container_rollout": {"9.0", "10.0", "11.0", "12.0", "13.0", "14.0"},
-    "reward_calibration": {"10.0", "11.0", "12.0", "13.0", "14.0"},
-    "provider_binding": {"11.0", "12.0", "13.0", "14.0"},
-    "task_lineage": {"11.0", "12.0", "13.0", "14.0"},
-    "production_preflight": {"12.0", "13.0", "14.0"},
-    "experiment_binding": {"13.0", "14.0"},
-    "trajectory_purpose": {"14.0"},
+    "splits": {"6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0"},
+    "families": {"7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0"},
+    "generation": {"8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0"},
+    "container_rollout": {"9.0", "10.0", "11.0", "12.0", "13.0", "14.0", "15.0"},
+    "reward_calibration": {"10.0", "11.0", "12.0", "13.0", "14.0", "15.0"},
+    "provider_binding": {"11.0", "12.0", "13.0", "14.0", "15.0"},
+    "task_lineage": {"11.0", "12.0", "13.0", "14.0", "15.0"},
+    "production_preflight": {"12.0", "13.0", "14.0", "15.0"},
+    "experiment_binding": {"13.0", "14.0", "15.0"},
+    "trajectory_purpose": {"14.0", "15.0"},
+    "model_response_provenance": {"15.0"},
 }
 
 
@@ -68,6 +69,9 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
     supports_lineage = supports_bundle_feature(bundle_version, "task_lineage")
     supports_trajectory_purpose = supports_bundle_feature(
         bundle_version, "trajectory_purpose"
+    )
+    supports_response_provenance = supports_bundle_feature(
+        bundle_version, "model_response_provenance"
     )
     record_fields = [
         "schema_version", "item_id", "task_sha256", "category",
@@ -201,6 +205,11 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
                     "role": "certification_evidence",
                     "direct_policy_optimization": "not_certified",
                     "requires_downstream_approval": True,
+                    **({
+                        "actual_model_identity_source": (
+                            "agent_usage.response_model_and_runtime_replay"
+                        ),
+                    } if supports_response_provenance else {}),
                 },
             },
         } if supports_trajectory_purpose else {}),

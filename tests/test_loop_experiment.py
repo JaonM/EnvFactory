@@ -555,7 +555,13 @@ class RolloutTest(unittest.TestCase):
         actions = iter([{"kind": "tool", "name": "finish", "arguments": {}}, {"kind": "respond", "content": "done"}])
         def chat(messages, **kwargs):
             calls.append(json.dumps(messages))
-            return SimpleNamespace(content=json.dumps(next(actions)), usage={"total_tokens": 10})
+            return SimpleNamespace(
+                content=json.dumps(next(actions)),
+                model="actual-policy-snapshot",
+                id="response-id",
+                finish_reason="stop",
+                usage={"total_tokens": 10},
+            )
         with patch.dict(os.environ, {"SANDBOX_TRAINER_API_KEY": "test"}):
             result = rollout.episode(app, task, SimpleNamespace(chat=chat), 0, 4)
         self.assertTrue(all("do not show" not in call for call in calls))
@@ -565,7 +571,14 @@ class RolloutTest(unittest.TestCase):
     def test_live_agent_uses_only_public_inputs_and_records_usage(self):
         result = self.run_episode(FakeApp())
         self.assertTrue(result["agent_success"])
-        self.assertEqual(sum(item["total_tokens"] for item in result["usage"]), 20)
+        self.assertEqual(
+            sum(item["token_usage"]["total_tokens"] for item in result["usage"]),
+            20,
+        )
+        self.assertEqual(
+            {item["response_model"] for item in result["usage"]},
+            {"actual-policy-snapshot"},
+        )
         self.assertEqual(result["schema_version"], "2.0")
         self.assertEqual(len(result["transitions"]), 2)
         self.assertEqual(result["transitions"][0]["action"]["kind"], "tool")

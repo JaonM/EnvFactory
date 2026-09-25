@@ -33,6 +33,7 @@ from env_factory.material_attestation import (
     signed_metadata,
     verify_file,
 )
+from env_factory.model_response_provenance import response_provenance
 from env_factory.material_privacy import audit_rollout_privacy
 from env_factory.trajectory_schema import episode_errors, policy_transition
 from env_factory.execution_provenance import valid_execution_provenance
@@ -131,6 +132,12 @@ def _dataset_card(
         for item in items
         for attempt in item.get("generation_provenance", {}).get("attempts", [])
     )
+    agent_response_models: Counter[str] = Counter()
+    runtime_response_models: Counter[str] = Counter()
+    for item in items:
+        provenance = item.get("model_response_provenance", {})
+        agent_response_models.update(provenance.get("agent_response_models", {}))
+        runtime_response_models.update(provenance.get("runtime_response_models", {}))
     runtime_modes = Counter(
         str(item.get("runtime_execution", {}).get("mode")) for item in items
     )
@@ -157,7 +164,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "2.0",
+        "version": "2.1",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -207,6 +214,10 @@ def _dataset_card(
                 "provider_identities": dict(sorted(generation_providers.items())),
                 "attempts": generation_attempts,
                 "responses": generation_responses,
+            },
+            "rollout_response_provenance": {
+                "agent_models": dict(sorted(agent_response_models.items())),
+                "runtime_models": dict(sorted(runtime_response_models.items())),
             },
             "runtime_execution": {
                 "modes": dict(sorted(runtime_modes.items())),
@@ -463,6 +474,11 @@ def _export_bundle_uncommitted(
                 raise ValueError(
                     f"rollout did not execute in the validated container for {item_id}"
                 )
+            rollout_response_provenance = response_provenance(rollout)
+            if rollout_response_provenance["verified"] is not True:
+                raise ValueError(
+                    f"model response provenance is invalid for {item_id}"
+                )
             calibration = json.loads(
                 (source_root / "agentic_training_value_live.json").read_text(
                     encoding="utf-8"
@@ -516,6 +532,7 @@ def _export_bundle_uncommitted(
                 "task_family_id": task_family_id,
                 "generation_provenance": generation,
                 "runtime_execution": rollout["runtime_execution"],
+                "model_response_provenance": rollout_response_provenance,
                 "reward_runtime_execution": calibration["runtime_execution"],
                 "score": item["score"],
                 "task_sha256": item["task_sha256"],
@@ -622,7 +639,7 @@ def verify_bundle(
         failures.append("bundle_digest")
     if (
         manifest.get("version") not in {
-            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0",
+            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0",
             BUNDLE_VERSION,
         }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
@@ -631,7 +648,7 @@ def verify_bundle(
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0",
+        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0",
         BUNDLE_VERSION,
     }
     if production_contract_ready:
@@ -773,6 +790,24 @@ def verify_bundle(
                 )
             )
         )
+        and (
+            not supports_bundle_feature(
+                str(manifest.get("version")), "model_response_provenance"
+            )
+            or (
+                portable_certification.get("gates", {}).get(
+                    "model_response_provenance"
+                ) is True
+                and isinstance(
+                    portable_certification.get("measurements", {}).get(
+                        "model_response_provenance"
+                    ), Mapping
+                )
+                and portable_certification["measurements"][
+                    "model_response_provenance"
+                ].get("all_verified") is True
+            )
+        )
     ):
         failures.append("portable_certification")
     try:
@@ -823,6 +858,9 @@ def verify_bundle(
     verified_categories: Counter[str] = Counter()
     verified_model_pairs: Counter[tuple[str, str]] = Counter()
     verified_container_rollouts = 0
+    verified_model_response_provenance = 0
+    verified_agent_response_models: Counter[str] = Counter()
+    verified_runtime_response_models: Counter[str] = Counter()
     verified_container_reward_calibrations = 0
     verified_provider_bindings = 0
     verified_preflight_provider_bindings = 0
@@ -940,6 +978,24 @@ def verify_bundle(
                 ),
                 bundle_version=str(manifest.get("version")),
             )
+            if supports_bundle_feature(
+                str(manifest.get("version")), "model_response_provenance"
+            ):
+                actual_response_provenance = response_provenance(rollout)
+                if (
+                    actual_response_provenance["verified"] is True
+                    and item.get("model_response_provenance")
+                        == actual_response_provenance
+                ):
+                    verified_model_response_provenance += 1
+                    verified_agent_response_models.update(
+                        actual_response_provenance["agent_response_models"]
+                    )
+                    verified_runtime_response_models.update(
+                        actual_response_provenance["runtime_response_models"]
+                    )
+                else:
+                    failures.append("model_response_provenance")
         except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
             failures.append("transition_schema")
             continue
@@ -1182,6 +1238,30 @@ def verify_bundle(
             for record in records
         )
     )
+    model_response_provenance_ready = (
+        supports_bundle_feature(
+            str(manifest.get("version")), "model_response_provenance"
+        )
+        and bool(items)
+        and verified_model_response_provenance == len(items)
+        and portable_certification.get("measurements", {}).get(
+            "model_response_provenance"
+        ) == {
+            "verified": len(items),
+            "expected": len(items),
+            "all_verified": True,
+            "agent_response_models": dict(
+                sorted(verified_agent_response_models.items())
+            ),
+            "runtime_response_models": dict(
+                sorted(verified_runtime_response_models.items())
+            ),
+        }
+    )
+    if supports_bundle_feature(
+        str(manifest.get("version")), "model_response_provenance"
+    ) and not model_response_provenance_ready:
+        failures.append("model_response_provenance")
     if supports_bundle_feature(
         str(manifest.get("version")), "trajectory_purpose"
     ) and not trajectory_purpose_ready:
@@ -1262,6 +1342,19 @@ def verify_bundle(
         for value in generation_values if isinstance(value, Mapping)
         for attempt in value.get("attempts", [])
     )
+    expected_agent_response_models: Counter[str] = Counter()
+    expected_runtime_response_models: Counter[str] = Counter()
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        provenance = item.get("model_response_provenance", {})
+        if isinstance(provenance, Mapping):
+            expected_agent_response_models.update(
+                provenance.get("agent_response_models", {})
+            )
+            expected_runtime_response_models.update(
+                provenance.get("runtime_response_models", {})
+            )
     expected_runtime_modes = Counter(
         str(item.get("runtime_execution", {}).get("mode"))
         for item in items if isinstance(item, Mapping)
@@ -1310,6 +1403,15 @@ def verify_bundle(
                 "responses": expected_generation_responses,
             }
         )
+    if supports_bundle_feature(str(version), "model_response_provenance"):
+        versioned_card_composition = versioned_card_composition and (
+            card_composition.get("rollout_response_provenance") == {
+                "agent_models": dict(sorted(expected_agent_response_models.items())),
+                "runtime_models": dict(
+                    sorted(expected_runtime_response_models.items())
+                ),
+            }
+        )
     if supports_bundle_feature(str(version), "container_rollout"):
         versioned_card_composition = versioned_card_composition and (
             card_composition.get("runtime_execution") == {
@@ -1335,7 +1437,8 @@ def verify_bundle(
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "2.0" if manifest.get("version") == BUNDLE_VERSION
+            "2.1" if manifest.get("version") == BUNDLE_VERSION
+            else "2.0" if manifest.get("version") == "14.0"
             else "1.9" if manifest.get("version") == "13.0"
             else "1.8" if manifest.get("version") == "12.0"
             else "1.7" if manifest.get("version") == "11.0"
@@ -1360,7 +1463,7 @@ def verify_bundle(
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
             manifest.get("version") not in {
-                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0",
+                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0",
                 BUNDLE_VERSION,
             }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
@@ -1407,7 +1510,7 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     trusted_attestation = (
         manifest.get("version") in {
-            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0",
+            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0",
             BUNDLE_VERSION,
         }
         and trusted_public_key is not None
@@ -1439,6 +1542,7 @@ def verify_bundle(
         "production_preflight_ready": production_preflight_ready,
         "experiment_config_ready": experiment_config_ready,
         "trajectory_purpose_ready": trajectory_purpose_ready,
+        "model_response_provenance_ready": model_response_provenance_ready,
         "preflight_provider_bindings": verified_preflight_provider_bindings,
         "metadata_privacy_ready": portable_metadata_privacy["safe"],
         "evaluator_independence_ready": evaluator_independence_ready,

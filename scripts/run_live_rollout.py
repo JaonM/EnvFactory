@@ -62,7 +62,15 @@ def episode(app, task, client, seed, max_steps):
     for step in range(max_steps):
         agent_input = copy.deepcopy(messages)
         response = client.chat(messages, response_format={"type": "json_object"})
-        usage.append(dict(response.usage or {}))
+        usage.append({
+            "response_model": response.model,
+            "response_id_sha256": (
+                hashlib.sha256(response.id.encode("utf-8")).hexdigest()
+                if response.id else None
+            ),
+            "finish_reason": response.finish_reason,
+            "token_usage": dict(response.usage or {}),
+        })
         messages.append({"role": "assistant", "content": response.content})
         transition = {
             "step": step,

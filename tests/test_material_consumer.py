@@ -58,7 +58,7 @@ class MaterialConsumerTest(unittest.TestCase):
     def test_consumer_schema_makes_split_part_of_every_record(self):
         contract = consumer_contract()
         records = contract["records"]
-        self.assertEqual(contract["bundle_version"], "14.0")
+        self.assertEqual(contract["bundle_version"], "15.0")
         self.assertIn("task_lineage", contract["environments"])
         self.assertIn("generated_task_equals_runtime_task", contract["invariants"])
         self.assertEqual(records["split_unit"], "item_id")

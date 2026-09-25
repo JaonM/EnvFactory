@@ -61,6 +61,7 @@ PII_PATTERNS = {
     "mainland_phone": re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
     "mainland_id": re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)"),
 }
+CONTENT_IDENTITY = re.compile(r"(?:sha256:)?[0-9a-f]{64}", re.I)
 
 
 def provider_identity(base_url: str, model: str) -> dict[str, str]:
@@ -134,9 +135,13 @@ def scan_payloads(payloads: Mapping[str, Any]) -> dict[str, Any]:
             for name, pattern in CREDENTIAL_PATTERNS.items():
                 if pattern.search(text):
                     credentials.append({"kind": name, "path": path})
-            for name, pattern in PII_PATTERNS.items():
-                if pattern.search(text):
-                    pii.append({"kind": name, "path": path})
+            # A complete content identity is opaque machine metadata. Random
+            # digit runs inside it can resemble a phone or national ID, but
+            # exempting only the full digest does not weaken free-text scans.
+            if CONTENT_IDENTITY.fullmatch(text) is None:
+                for name, pattern in PII_PATTERNS.items():
+                    if pattern.search(text):
+                        pii.append({"kind": name, "path": path})
     return {"credential_findings": credentials, "pii_findings": pii}
 
 

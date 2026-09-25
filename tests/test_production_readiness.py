@@ -62,7 +62,7 @@ class ProductionReadinessTest(unittest.TestCase):
                         }
                         if name == "model_configuration" else {
                             "key_identity_sha256": "e" * 64,
-                            "bundle_version": "14.0",
+                            "bundle_version": "15.0",
                         }
                         if name == "bundle_signing_identity" else {}
                         if name != "evaluator_role_separation" else {
@@ -464,8 +464,22 @@ class ProductionReadinessTest(unittest.TestCase):
                     "schema_version": "2.0", "seed": episode, "agent_success": episode < 8,
                     "termination": "completed" if episode < 8 else "step_budget",
                     "initial_reward": 0.0, "final_reward": 1.0 if episode < 8 else 0.0,
-                    "issues": [], "usage": [{}], "initial_state": {}, "final_state": {},
-                    "replay": {"events": []},
+                    "issues": [], "usage": [{
+                        "response_model": "policy-model",
+                        "response_id_sha256": "9" * 64,
+                        "finish_reason": "stop",
+                        "token_usage": {"total_tokens": 10},
+                    }], "initial_state": {}, "final_state": {},
+                    "replay": {"events": [{
+                        "event": "runtime_llm_call",
+                        "payload": {"summary": {
+                            "version": "1.0", "responses": 1,
+                            "mock_responses": 0,
+                            "models": {"simulator-model": 1},
+                            "usage": {"total_tokens": 5},
+                            "response_id_sha256": ["8" * 64],
+                        }},
+                    }]},
                     "transitions": [{
                         "step": 0,
                         "agent_input": [{"role": "user", "content": "do it"}],
@@ -711,6 +725,17 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertFalse(report["certified"])
             self.assertIn("production_preflight", report["failed_gates"])
             self.assertFalse(report["gates"]["provider_identity_consistency"])
+
+    def test_missing_actual_model_response_provenance_cannot_certify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            rollout = history["holdouts"][0]["jobs"][0]["result"][
+                "live_rollout"
+            ]
+            rollout["episodes"][0]["usage"][0].pop("response_model")
+            report = self.certify(history)
+            self.assertFalse(report["gates"]["model_response_provenance"])
+            self.assertIn("model_response_provenance", report["failed_gates"])
 
     def test_preflight_signing_key_drift_cannot_certify(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1326,7 +1351,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "materials_manifest": {"dataset_sha256": "dataset"},
         }
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "14.0",
+            "verified": True, "bundle_version": "15.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1339,6 +1364,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "production_preflight_ready": True,
             "experiment_config_ready": True,
             "trajectory_purpose_ready": True,
+            "model_response_provenance_ready": True,
             "metadata_privacy_ready": True,
             "evaluator_independence_ready": True,
             "source_dataset_sha256": "different",
@@ -1346,7 +1372,7 @@ class ProductionReadinessTest(unittest.TestCase):
         self.assertFalse(report["certified"])
         self.assertIn("portable_materials_bundle", report["failed_gates"])
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "14.0",
+            "verified": True, "bundle_version": "15.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1359,6 +1385,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "production_preflight_ready": True,
             "experiment_config_ready": True,
             "trajectory_purpose_ready": True,
+            "model_response_provenance_ready": True,
             "metadata_privacy_ready": True,
             "evaluator_independence_ready": True,
             "source_dataset_sha256": "dataset",

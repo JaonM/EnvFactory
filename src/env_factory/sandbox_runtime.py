@@ -26,9 +26,15 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.request import Request, urlopen
 
 try:
-    from .runtime_llm import RuntimeLLMClient, RuntimeLLMConfig, RuntimeLLMError
+    from .runtime_llm import (
+        RuntimeLLMClient, RuntimeLLMConfig, RuntimeLLMError,
+        capture_runtime_llm_trace, summarize_runtime_llm_trace,
+    )
 except ImportError:  # copied as a flat module into a generated sandbox
-    from runtime_llm import RuntimeLLMClient, RuntimeLLMConfig, RuntimeLLMError
+    from runtime_llm import (
+        RuntimeLLMClient, RuntimeLLMConfig, RuntimeLLMError,
+        capture_runtime_llm_trace, summarize_runtime_llm_trace,
+    )
 
 
 class SandboxError(RuntimeError):
@@ -1098,7 +1104,9 @@ class ContractEvaluatorRuntime:
                         if key not in {"timestamp", "duration_ms", "created_at", "trace_hash", "request_id", "tool_call_id", "sequence"}}
             if isinstance(value, list):
                 return [stable(item) for item in value if not (
-                    isinstance(item, Mapping) and (item.get("event") or item.get("kind")) == "evaluator_call"
+                    isinstance(item, Mapping)
+                    and (item.get("event") or item.get("kind"))
+                        in {"evaluator_call", "runtime_llm_call"}
                 )]
             return value
         stable_context = stable(context)
@@ -1787,7 +1795,17 @@ class SandboxApplication:
             episode_id = self._header(supplied, "X-Episode-ID")
             with self.episode_store.episode_context(episode_id):
                 with self.episode_store.transaction():
-                    payload = self._dispatch(method.upper(), path, body, supplied)
+                    with capture_runtime_llm_trace() as llm_trace:
+                        payload = self._dispatch(method.upper(), path, body, supplied)
+                    if llm_trace and path != "/health":
+                        self.episode_store.event(
+                            "runtime_llm_call",
+                            {
+                                "request_path": path,
+                                "summary": summarize_runtime_llm_trace(llm_trace),
+                            },
+                            {"recorded": True},
+                        )
             status, response = 200, dict(payload)
         except SandboxError as exc:
             status, response = exc.status, exc.body(request)

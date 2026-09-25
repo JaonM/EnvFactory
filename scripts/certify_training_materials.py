@@ -46,6 +46,7 @@ from env_factory.runtime_provenance import valid_container_rollout_execution
 from env_factory.sandbox_scoring import valid_score_report
 from env_factory.task_quality import score_file
 from env_factory.material_consumer import BUNDLE_VERSION
+from env_factory.model_response_provenance import response_provenance
 from env_factory.production_preflight import (
     REQUIRED_CHECKS,
     run_production_preflight,
@@ -592,6 +593,7 @@ def valid_rollout_provenance(item: Mapping[str, Any]) -> bool:
             for name in ("agent_provider_sha256", "runtime_provider_sha256")
         )
         and valid_container_rollout_execution(live, root)
+        and response_provenance(live)["verified"] is True
     )
 
 
@@ -1130,6 +1132,39 @@ def certify(
     rollout_provenance = bool(qualified) and all(
         valid_rollout_provenance(item) for item in qualified
     )
+    response_provenance_reports = [
+        response_provenance(item.get("live_rollout")) for item in qualified
+    ]
+    response_provenance_verified = (
+        bool(qualified)
+        and all(report["verified"] is True for report in response_provenance_reports)
+    )
+    actual_agent_models = Counter(
+        {
+            model: sum(
+                report["agent_response_models"].get(model, 0)
+                for report in response_provenance_reports
+            )
+            for model in {
+                model
+                for report in response_provenance_reports
+                for model in report["agent_response_models"]
+            }
+        }
+    )
+    actual_runtime_models = Counter(
+        {
+            model: sum(
+                report["runtime_response_models"].get(model, 0)
+                for report in response_provenance_reports
+            )
+            for model in {
+                model
+                for report in response_provenance_reports
+                for model in report["runtime_response_models"]
+            }
+        }
+    )
     provider_bindings_verified = sum(
         valid_provider_binding(
             item,
@@ -1398,6 +1433,16 @@ def certify(
             "all_verified": rollout_outcome_integrity,
         },
         "rollout_provenance": rollout_provenance,
+        "model_response_provenance": {
+            "verified": sum(
+                report["verified"] is True
+                for report in response_provenance_reports
+            ),
+            "expected": len(qualified),
+            "all_verified": response_provenance_verified,
+            "agent_response_models": dict(sorted(actual_agent_models.items())),
+            "runtime_response_models": dict(sorted(actual_runtime_models.items())),
+        },
         "provider_identity_consistency": {
             "verified": provider_bindings_verified,
             "expected": len(qualified),
@@ -1519,6 +1564,7 @@ def certify(
         "rollout_coverage": rollout_coverage and len(episodes) >= policy["min_total_episodes"],
         "rollout_outcome_integrity": rollout_outcome_integrity,
         "rollout_provenance": rollout_provenance,
+        "model_response_provenance": response_provenance_verified,
         "provider_identity_consistency": provider_identity_consistency,
         "evaluator_independence": (
             bool(qualified)
@@ -1655,6 +1701,7 @@ def attach_bundle_verification(
         and verification.get("production_preflight_ready") is True
         and verification.get("experiment_config_ready") is True
         and verification.get("trajectory_purpose_ready") is True
+        and verification.get("model_response_provenance_ready") is True
         and verification.get("metadata_privacy_ready") is True
         and verification.get("evaluator_independence_ready") is True
         and verification.get("source_dataset_sha256")

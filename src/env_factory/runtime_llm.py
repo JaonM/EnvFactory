@@ -8,6 +8,9 @@ credential-redaction behavior.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+import hashlib
 import json
 import os
 import time
@@ -20,6 +23,50 @@ from urllib.request import Request, urlopen
 
 class RuntimeLLMError(RuntimeError):
     pass
+
+
+_TRACE: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "envfactory_runtime_llm_trace", default=None
+)
+
+
+@contextmanager
+def capture_runtime_llm_trace():
+    """Capture non-secret provider response metadata for one runtime request."""
+    records: list[dict[str, Any]] = []
+    token = _TRACE.set(records)
+    try:
+        yield records
+    finally:
+        _TRACE.reset(token)
+
+
+def summarize_runtime_llm_trace(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    models: dict[str, int] = {}
+    usage: dict[str, float | int] = {}
+    for record in records:
+        model = str(record.get("model", ""))
+        if model:
+            models[model] = models.get(model, 0) + 1
+        values = record.get("usage")
+        if isinstance(values, Mapping):
+            for name, value in values.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    usage[str(name)] = usage.get(str(name), 0) + value
+    return {
+        "version": "1.0",
+        "responses": len(records),
+        "mock_responses": sum(record.get("mock") is True for record in records),
+        "models": dict(sorted(models.items())),
+        "usage": dict(sorted(usage.items())),
+        "response_id_sha256": sorted(
+            str(record["response_id_sha256"])
+            for record in records
+            if isinstance(record.get("response_id_sha256"), str)
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -73,6 +120,9 @@ class RuntimeLLMClient:
             self._validate_response(value, response_schema)
             if semantic_validator is not None:
                 semantic_validator(value)
+            trace = _TRACE.get()
+            if trace is not None:
+                trace.append({"model": self.config.model, "usage": {}, "mock": True})
             return value
         body = {
             "model": self.config.model,
@@ -91,6 +141,19 @@ class RuntimeLLMClient:
                 request = Request(f"{self.config.base_url}/chat/completions", data=encoded, headers=headers, method="POST")
                 with urlopen(request, timeout=self.config.timeout_seconds) as response:
                     payload = json.load(response)
+                trace = _TRACE.get()
+                if trace is not None:
+                    response_id = payload.get("id")
+                    trace.append({
+                        "model": str(payload.get("model") or self.config.model),
+                        "usage": dict(payload.get("usage") or {}),
+                        **({
+                            "response_id_sha256": hashlib.sha256(
+                                response_id.encode("utf-8")
+                            ).hexdigest(),
+                        } if isinstance(response_id, str) and response_id else {}),
+                        "mock": False,
+                    })
                 content = payload["choices"][0]["message"]["content"]
                 value = json.loads(content)
                 if not isinstance(value, dict):
