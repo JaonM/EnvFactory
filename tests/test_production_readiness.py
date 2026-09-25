@@ -1132,6 +1132,14 @@ class ProductionReadinessTest(unittest.TestCase):
             }},
         }
         self.assertTrue(certifier.valid_reward_calibration(report, task))
+        failure = report["evidence"]["counterfactuals"]["goal_failure"]
+        failure.update(reward=None, status="rejected")
+        self.assertFalse(certifier.valid_reward_calibration(report, task))
+        failure.update(http_status=422, error_type="ScenarioRejected")
+        self.assertTrue(certifier.valid_reward_calibration(report, task))
+        failure["message"] = "untrusted provider response"
+        self.assertFalse(certifier.valid_reward_calibration(report, task))
+        failure.pop("message")
         del report["evidence"]["counterfactuals"]["skipped_tool_2"]
         self.assertFalse(certifier.valid_reward_calibration(report, task))
 

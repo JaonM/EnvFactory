@@ -399,7 +399,14 @@ def valid_reward_calibration(
                 or reward > limit
             ):
                 return False
-        elif reward is not None:
+        elif (
+            reward is not None
+            or not isinstance(case.get("http_status"), int)
+            or not 400 <= case["http_status"] < 500
+            or not isinstance(case.get("error_type"), str)
+            or not case["error_type"]
+            or "message" in case
+        ):
             return False
     return (
         report.get("curriculum_training_ready") is True

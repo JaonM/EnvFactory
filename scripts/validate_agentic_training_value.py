@@ -229,14 +229,23 @@ def validate(
             evidence["counterfactuals"][name] = {"reward": reward_of(result), "status": "completed"}
             return result, None
         except Exception as exc:  # rejected counterfactuals are valid evidence
-            evidence["counterfactuals"][name] = {"reward": None, "status": "rejected", "message": str(exc)}
             # Only an actual 4xx response is evidence of environment rejection.
             # A runner error, missing capture or server failure is not a proof.
             details = getattr(exc, "details", None)
             status = details.get("actual_status") if isinstance(details, Mapping) else None
+            evidence["counterfactuals"][name] = {
+                "reward": None,
+                "status": "rejected",
+                "http_status": status if isinstance(status, int) else None,
+                "error_type": type(exc).__name__,
+            }
             if not isinstance(status, int) or not 400 <= status < 500:
-                failures.append({"gate": "counterfactual_execution", "message": f"{name}: {exc}"})
-            return None, str(exc)
+                failures.append({
+                    "gate": "counterfactual_execution",
+                    "message": f"{name}: execution did not produce a client rejection",
+                    "error_type": type(exc).__name__,
+                })
+            return None, type(exc).__name__
 
     success_run, success_error = execute("goal_success", success_scenario)
     failure_run, _ = execute("goal_failure", scenario_without_assertions(by_kind["goal_failure"]))

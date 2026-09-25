@@ -134,6 +134,8 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 
 `validate_agentic_training_value.py` 进一步执行无工具回答、参数破坏、跳步、乱序和噪声工具等反事实，
 验证任务工具确实必要、参数会影响结果、依赖顺序真实存在，并防止只输出正确措辞骗取高奖励。
+负反事实可以被环境拒绝，但只有真实 HTTP 4xx 才算有效拒绝证据；报告保存结构化 `http_status` 与
+`error_type`，不保存可能含敏感内容的异常正文。认证器会独立拒绝缺少 4xx 状态的伪造 `rejected` 记录。
 
 `audit_data_governance.py` 在任何 live rollout 前验证任务的合成数据声明，扫描会进入公开任务、工具定义和
 业务 fixture 的凭证与疑似 PII，并将目标 provider、允许的出站面和禁止出站字段写入
