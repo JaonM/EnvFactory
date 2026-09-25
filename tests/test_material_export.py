@@ -56,6 +56,14 @@ class MaterialExportTest(unittest.TestCase):
             "episodes": [{
                 "schema_version": "2.0", "seed": 1, "agent_success": True,
                 "termination": "completed", "transitions": [transition],
+                "initial_reward": 0.0, "final_reward": 1.0,
+                "trajectory": [{
+                    "method": "GET", "path": "/v1/reward", "status": 200,
+                    "result": {"reward": 1.0},
+                }],
+                "replay": {"events": []},
+                "initial_state": {}, "final_state": {},
+                "usage": [{}], "issues": [],
             }],
         }
         (sandbox / "live_rollout.json").write_text(json.dumps(rollout))
@@ -97,11 +105,34 @@ class MaterialExportTest(unittest.TestCase):
             self.assertEqual(report["transitions"], 1)
             record = json.loads((bundle / "transitions.jsonl").read_text())
             self.assertEqual(record["transition"]["reward"], 1.0)
+            self.assertEqual(record["episode_final_reward"], 1.0)
+            self.assertEqual(record["agent_usage"], {})
             copied_app = next((bundle / "environments").glob("*/app.py"))
             copied_app.write_text("# tampered\n")
             changed = exporter.verify_bundle(bundle)
             self.assertFalse(changed["verified"])
             self.assertIn("bundle_files", changed["failed_gates"])
+
+    def test_bundle_verifier_rejects_semantically_rewritten_transition_jsonl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            record = json.loads((bundle / "transitions.jsonl").read_text())
+            record["transition"]["terminated"] = False
+            (bundle / "transitions.jsonl").write_text(json.dumps(record) + "\n")
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files_sha256"]["transitions.jsonl"] = exporter.file_sha256(
+                bundle / "transitions.jsonl"
+            )
+            unsigned = {key: value for key, value in manifest.items() if key != "bundle_sha256"}
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertIn("transition_projection", report["failed_gates"])
 
     def test_uncertified_report_cannot_be_exported(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -110,6 +141,20 @@ class MaterialExportTest(unittest.TestCase):
             certification["certified"] = False
             with self.assertRaisesRegex(ValueError, "certified"):
                 exporter.export_bundle(certification, root / "bundle", ROOT)
+
+    def test_export_rejects_action_that_does_not_match_raw_model_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            item = certification["materials_manifest"]["items"][0]
+            rollout = json.loads(
+                (Path(item["sandbox_root"]) / "live_rollout.json").read_text()
+            )
+            rollout["episodes"][0]["transitions"][0]["action"] = {
+                "kind": "respond", "content": "fabricated",
+            }
+            with self.assertRaisesRegex(ValueError, "parsed_action_mismatch"):
+                exporter._transition_records("a" * 16 + "-" + "b" * 16, item, rollout)
 
 
 if __name__ == "__main__":

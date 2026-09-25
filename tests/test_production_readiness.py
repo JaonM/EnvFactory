@@ -78,6 +78,7 @@ class ProductionReadinessTest(unittest.TestCase):
                 name: sorted(values)
                 for name, values in certifier.REQUIRED_OUTBOUND_SURFACES.items()
             },
+            "forbidden_outbound": certifier.FORBIDDEN_OUTBOUND,
             "credential_findings": [],
             "pii_findings": [],
         }))
@@ -91,14 +92,21 @@ class ProductionReadinessTest(unittest.TestCase):
                 # semantic near-duplicate detector in this passing fixture.
                 description = __import__("hashlib").sha256(
                     f"task-{global_index}".encode()
-                ).hexdigest()
-                task.write_text(json.dumps({"task": description}))
+                ).hexdigest().translate(str.maketrans("0123456789", "ghijklmnop"))
+                task.write_text(json.dumps({
+                    "task": description,
+                    "artifacts": {"data_manifest": {"data_governance": {
+                        "origin": "model_generated_synthetic",
+                        "contains_real_user_data": False,
+                        "intended_use": "agentic_rl_training_material",
+                    }}},
+                }))
                 episodes = [
                 {
                     "schema_version": "2.0", "seed": episode, "agent_success": episode < 8,
                     "termination": "completed" if episode < 8 else "step_budget",
                     "initial_reward": 0.0, "final_reward": 1.0 if episode < 8 else 0.0,
-                    "issues": [], "usage": [], "initial_state": {}, "final_state": {},
+                    "issues": [], "usage": [{}], "initial_state": {}, "final_state": {},
                     "replay": {"events": []},
                     "transitions": [{
                         "step": 0,
@@ -257,6 +265,25 @@ class ProductionReadinessTest(unittest.TestCase):
             report = certifier.certify(history, certifier.default_policy())
             self.assertFalse(report["gates"]["data_governance"])
             self.assertIn("data_governance", report["failed_gates"])
+
+    def test_governance_report_cannot_hide_a_credential_in_the_frozen_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = self.make_history(root)
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            task_path = Path(result["task_path"])
+            task = json.loads(task_path.read_text())
+            task["public_input"] = {
+                "initial_user_message": "use api_key=abcdefghijklmnopqrstuvwx",
+                "materials": [],
+            }
+            task_path.write_text(json.dumps(task))
+            result["live_rollout"]["task_sha256"] = __import__("hashlib").sha256(
+                task_path.read_bytes()
+            ).hexdigest()
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["gates"]["data_governance"])
+            self.assertFalse(report["measurements"]["data_governance"]["all_verified"])
 
     def test_category_mix_prevents_single_route_dataset(self):
         with tempfile.TemporaryDirectory() as directory:

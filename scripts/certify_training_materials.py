@@ -23,7 +23,14 @@ from env_factory.material_artifacts import (
     portable_artifact_digest,
     portable_artifact_digests,
 )
-from env_factory.data_governance import OUTBOUND_SURFACES
+from env_factory.trajectory_schema import complete_episode
+from env_factory.data_governance import (
+    FORBIDDEN_OUTBOUND,
+    OUTBOUND_SURFACES,
+    SYNTHETIC_ORIGIN,
+    sandbox_payloads,
+    scan_payloads,
+)
 
 
 Z_95 = 1.959963984540054
@@ -99,25 +106,37 @@ def _artifact(result: Mapping[str, Any], name: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def valid_data_governance(report: Mapping[str, Any]) -> bool:
-    """Require a synthetic-data declaration and auditable provider boundary."""
+def valid_data_governance(
+    report: Mapping[str, Any], sandbox_root: Path, task_path: Path
+) -> bool:
+    """Independently recompute claims over the frozen task and fixture payloads."""
     origin = report.get("data_origin", {})
     providers = report.get("providers", {})
     surfaces = report.get("outbound_surfaces", {})
+    try:
+        task = load(task_path)
+        declared = task.get("artifacts", {}).get("data_manifest", {}).get(
+            "data_governance", {}
+        )
+        rescanned = scan_payloads(sandbox_payloads(sandbox_root, task))
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+        return False
     return (
-        report.get("eligible_for_external_model_processing") is True
+        report.get("version") == "1.0"
+        and report.get("eligible_for_external_model_processing") is True
         and isinstance(origin, Mapping)
-        and origin.get("origin") == "model_generated_synthetic"
-        and origin.get("contains_real_user_data") is False
-        and origin.get("intended_use") == "agentic_rl_training_material"
-        and report.get("credential_findings") == []
+        and dict(origin) == SYNTHETIC_ORIGIN
+        and isinstance(declared, Mapping)
+        and dict(declared) == SYNTHETIC_ORIGIN
+        and report.get("credential_findings") == rescanned["credential_findings"] == []
+        and report.get("pii_findings") == rescanned["pii_findings"]
         and isinstance(providers, Mapping)
         and all(
             isinstance(providers.get(name), Mapping)
             and bool(providers[name].get("host"))
             and bool(providers[name].get("model"))
             and isinstance(providers[name].get("identity_sha256"), str)
-            and len(providers[name]["identity_sha256"]) == 64
+            and re.fullmatch(r"[0-9a-f]{64}", providers[name]["identity_sha256"])
             for name in ("agent", "user_simulator_and_reward")
         )
         and isinstance(surfaces, Mapping)
@@ -125,6 +144,7 @@ def valid_data_governance(report: Mapping[str, Any]) -> bool:
             required <= set(surfaces.get(name, []))
             for name, required in REQUIRED_OUTBOUND_SURFACES.items()
         )
+        and set(FORBIDDEN_OUTBOUND) <= set(report.get("forbidden_outbound", []))
     )
 
 
@@ -159,73 +179,6 @@ def _counterfactual_counts(reports: Iterable[Mapping[str, Any]]) -> dict[str, in
         "negative_total": negative_total,
         "negative_errors": negative_errors,
     }
-
-
-def complete_episode(episode: Mapping[str, Any]) -> bool:
-    """Require the fields needed to reconstruct a future RL transition stream."""
-    transitions = episode.get("transitions")
-    transition_schema_complete = (
-        episode.get("schema_version") == "2.0"
-        and isinstance(transitions, list)
-        and bool(transitions)
-        and all(
-            isinstance(item, Mapping)
-            and isinstance(item.get("step"), int)
-            and isinstance(item.get("agent_input"), list)
-            and bool(item["agent_input"])
-            and all(
-                isinstance(message, Mapping)
-                and message.get("role") in {"system", "user", "assistant"}
-                and isinstance(message.get("content"), str)
-                for message in item["agent_input"]
-            )
-            and isinstance(item.get("assistant_output"), str)
-            and isinstance(item.get("observation"), Mapping)
-            and isinstance(item.get("result"), Mapping)
-            and isinstance(item.get("next_observation"), Mapping)
-            and isinstance(item.get("reward"), (int, float))
-            and isinstance(item.get("terminated"), bool)
-            and isinstance(item.get("truncated"), bool)
-            for item in transitions
-        )
-    )
-    if transition_schema_complete:
-        markers = [
-            bool(item["terminated"] or item["truncated"]) for item in transitions
-        ]
-        transition_schema_complete = (
-            [item["step"] for item in transitions] == list(range(len(transitions)))
-            and not any(markers[:-1])
-            and markers[-1]
-            and not (transitions[-1]["terminated"] and transitions[-1]["truncated"])
-            and (
-                (episode.get("termination") == "step_budget" and transitions[-1]["truncated"])
-                or (episode.get("termination") != "step_budget" and transitions[-1]["terminated"])
-            )
-            and transitions[-1]["reward"] == episode.get("final_reward")
-        )
-    return (
-        transition_schema_complete
-        and isinstance(episode.get("seed"), int)
-        and isinstance(episode.get("agent_success"), bool)
-        and isinstance(episode.get("termination"), str)
-        and isinstance(episode.get("initial_reward"), (int, float))
-        and isinstance(episode.get("final_reward"), (int, float))
-        and isinstance(episode.get("trajectory"), list)
-        and bool(episode["trajectory"])
-        and all(
-            isinstance(step, Mapping)
-            and isinstance(step.get("method"), str)
-            and isinstance(step.get("path"), str)
-            and isinstance(step.get("status"), int)
-            and "result" in step
-            for step in episode["trajectory"]
-        )
-        and isinstance(episode.get("replay"), Mapping)
-        and isinstance(episode.get("initial_state"), Mapping)
-        and isinstance(episode.get("final_state"), Mapping)
-        and isinstance(episode.get("usage"), list)
-    )
 
 
 def valid_user_turn(step: Mapping[str, Any]) -> bool:
@@ -445,7 +398,14 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         _artifact(item, "agentic_training_value_live.json") for item in qualified
     ]
     governance_reports = [_artifact(item, "data_governance.json") for item in qualified]
-    governed_materials = sum(valid_data_governance(report) for report in governance_reports)
+    governed_materials = sum(
+        valid_data_governance(
+            report,
+            Path(str(item.get("output", ""))),
+            Path(str(item.get("task_path", ""))),
+        )
+        for item, report in zip(qualified, governance_reports)
+    )
     runtime_integrity = bool(readiness_reports) and all(
         report.get("training_ready") is True
         and report.get("evidence", {}).get("determinism") is True

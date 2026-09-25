@@ -33,6 +33,8 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 每个任务必须声明业务数据为模型生成的合成数据且不包含真实用户数据。真实 rollout 前执行出站载荷
   审计，记录 Agent、User Simulator 和 Reward Judge 的 provider 身份与可见字段，扫描凭证及疑似 PII；
   发现凭证、缺少合成来源声明或缺少 provider 身份时禁止外发并取消样本资格。
+  最终认证不会信任流水线写出的审计结论，而是对冻结的任务与业务 fixture 重新扫描，并要求命中路径、
+  合成来源声明和报告完全一致。
 
 数据治理审计只证明素材满足项目内的技术门禁，不等同于组织层面的联网、供应商或数据出境授权。
 实际调用某个外部端点前，运行方仍须取得适用于该端点和这些载荷的明确授权。
@@ -79,6 +81,11 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 `bundle_manifest.json`。JSONL 每行是一条可重建的 schema v2 transition，并携带任务、类别、episode、
 Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bundle_sha256` 再次校验；导出失败或包校验
 失败时，即使此前统计门禁通过，也不会产生 `production_prepared_for_agentic_rl`。
+
+便携包 v2 还会从每个环境内的原始 `live_rollout.json` 重新生成预期 transition 流，并与
+`transitions.jsonl` 逐条精确比较。校验范围包含 item/episode/step 引用、模型身份、parsed action 与原始
+输出的一致性、observation 链、reward、usage 以及 terminated/truncated 终止语义，防止只重算文件哈希
+就让语义损坏的轨迹通过。
 
 导入前执行：
 
