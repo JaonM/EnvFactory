@@ -25,6 +25,9 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 真实 User Simulator 轨迹至少覆盖 3 类结果，同时包含成功/接受类结果和需要继续交互或恢复的结果，
   防止只验证“用户永远接受”的退化模拟器。
 - 每个合格沙箱的固定 seed reset、episode 隔离、replay 稳定性、隐藏字段扫描和确定性验证全部通过。
+- 每个合格沙箱必须实际完成 Docker 构建，并在禁网、只读根文件系统、非 root、丢弃全部 capabilities、
+  `no-new-privileges` 和资源上限下通过容器内 pytest smoke test。基础镜像必须解析并固化为
+  `sha256` 内容地址，测试依赖必须精确锁版本；镜像 ID、平台、Dockerfile 和依赖摘要由认证器独立复核。
 - 工具契约、真实业务结果、mutation resistance 和奖励反事实全部通过。
 - 奖励假阳性率不高于 0.5%，假阴性率不高于 2%。
 - 奖励反事实必须使用生产配置的真实 evaluator 重跑；mock 报告只用于离线构建测试，不能进入生产认证。
@@ -59,6 +62,10 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 `audit_data_governance.py` 在任何 live rollout 前验证任务的合成数据声明，扫描会进入公开任务、工具定义和
 业务 fixture 的凭证与疑似 PII，并将目标 provider、允许的出站面和禁止出站字段写入
 `data_governance.json`。报告只保存命中类型与 JSON 路径，不回写疑似敏感值。
+
+`build_docker_sandbox_image.sh` 将可达镜像标签解析为当前 Docker 平台的 manifest digest，以该内容地址
+构建并回写最终 Dockerfile；随后在生产安全参数下执行镜像内测试，成功后才写
+`docker_image_metadata.json`。没有这份可复核证据的沙箱不能通过生产准备认证。
 
 ## 结果解释
 

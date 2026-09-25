@@ -31,6 +31,7 @@ from env_factory.data_governance import (
     sandbox_payloads,
     scan_payloads,
 )
+from env_factory.container_provenance import verify_container_provenance
 
 
 Z_95 = 1.959963984540054
@@ -406,6 +407,13 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         )
         for item, report in zip(qualified, governance_reports)
     )
+    container_reports = [
+        verify_container_provenance(Path(str(item.get("output", ""))))
+        for item in qualified
+    ]
+    reproducible_containers = sum(
+        report.get("verified") is True for report in container_reports
+    )
     runtime_integrity = bool(readiness_reports) and all(
         report.get("training_ready") is True
         and report.get("evidence", {}).get("determinism") is True
@@ -580,6 +588,20 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
                 and governed_materials == len(qualified)
             ),
         },
+        "container_reproducibility": {
+            "reports": len(container_reports),
+            "verified": reproducible_containers,
+            "all_verified": (
+                bool(qualified)
+                and len(container_reports) == len(qualified)
+                and reproducible_containers == len(qualified)
+            ),
+            "failed_gates": dict(Counter(
+                gate
+                for report in container_reports
+                for gate in report.get("failed_gates", [])
+            )),
+        },
         "reward_counterfactuals": counterfactuals,
         "reward_false_positive_rate": false_positive_rate,
         "reward_false_negative_rate": false_negative_rate,
@@ -638,6 +660,9 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "runtime_state_integrity": runtime_integrity,
         "tool_and_reward_integrity": tool_and_reward_integrity,
         "data_governance": measurements["data_governance"]["all_verified"],
+        "container_reproducibility": measurements["container_reproducibility"][
+            "all_verified"
+        ],
         "material_identity": (
             len(material_items) == len(qualified)
             and len(material_fingerprints) == len(set(material_fingerprints))

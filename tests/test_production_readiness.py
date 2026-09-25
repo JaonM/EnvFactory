@@ -25,6 +25,33 @@ class ProductionReadinessTest(unittest.TestCase):
         evidence = root / "evidence"
         evidence.mkdir()
         (evidence / "app.py").write_text("# immutable sandbox\n")
+        pinned_image = "registry.example/python@sha256:" + "c" * 64
+        (evidence / "Dockerfile").write_text(
+            f"FROM {pinned_image}\nUSER sandbox\n"
+        )
+        (evidence / "requirements-dev.txt").write_text("pytest==9.1.1\n")
+        (evidence / "docker_image_metadata.json").write_text(json.dumps({
+            "version": "2.0",
+            "tag": "fixture",
+            "base_image": pinned_image,
+            "image_id": "sha256:" + "d" * 64,
+            "platform": {"os": "linux", "architecture": "arm64"},
+            "runtime_user": "sandbox",
+            "dockerfile_sha256": __import__("hashlib").sha256(
+                (evidence / "Dockerfile").read_bytes()
+            ).hexdigest(),
+            "requirements_sha256": __import__("hashlib").sha256(
+                (evidence / "requirements-dev.txt").read_bytes()
+            ).hexdigest(),
+            "smoke_test": {
+                "passed": True,
+                "network": "none",
+                "read_only_root": True,
+                "cap_drop": "ALL",
+                "no_new_privileges": True,
+                "non_root_user": True,
+            },
+        }))
         (evidence / "training_readiness.json").write_text(json.dumps({
             "training_ready": True,
             "evidence": {
@@ -197,6 +224,7 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertTrue(report["gates"]["category_mix"])
             self.assertTrue(report["gates"]["user_simulator_outcome_coverage"])
             self.assertTrue(report["gates"]["data_governance"])
+            self.assertTrue(report["gates"]["container_reproducibility"])
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
             self.assertEqual(report["materials_manifest"]["version"], "2.0")
             self.assertEqual(
@@ -284,6 +312,15 @@ class ProductionReadinessTest(unittest.TestCase):
             report = certifier.certify(history, certifier.default_policy())
             self.assertFalse(report["gates"]["data_governance"])
             self.assertFalse(report["measurements"]["data_governance"]["all_verified"])
+
+    def test_unpinned_container_dependency_breaks_production_certification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = self.make_history(root)
+            (root / "evidence/requirements-dev.txt").write_text("pytest>=8,<10\n")
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["gates"]["container_reproducibility"])
+            self.assertIn("container_reproducibility", report["failed_gates"])
 
     def test_category_mix_prevents_single_route_dataset(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -353,7 +353,8 @@ def build_one(project, task_path, output, config, seed=None):
     command = ["bash", str(project / "scripts/develop_sandbox_with_agent.sh"),
                "--input", str(task_path), "--output", str(output), "--agent", "codex",
                "--review-agent", "codex", "--model", MODEL, "--review-model", MODEL,
-               "--runtime", "none", "--max-attempts", str(config["max_attempts"]),
+               "--runtime", config.get("sandbox_runtime", "none"),
+               "--max-attempts", str(config["max_attempts"]),
                "--foreground", "--skip-auto-score"]
     if seed:
         command.append("--resume")
@@ -660,6 +661,10 @@ def main():
     parser.add_argument("--threshold", type=float, default=8)
     parser.add_argument("--consecutive-rounds", type=int, default=2)
     parser.add_argument("--build-mode", choices=("clean", "repair"), default="clean")
+    parser.add_argument(
+        "--sandbox-runtime", choices=("none", "docker"), default="docker",
+        help="production 必须实际构建并安全冒烟验证 Docker 镜像；pilot 可显式使用 none",
+    )
     parser.add_argument("--build-timeout", type=int, default=3600)
     parser.add_argument("--score-timeout", type=int, default=1800)
     parser.add_argument("--generation-timeout", type=int, default=3600)
@@ -718,6 +723,8 @@ def main():
         or args.holdout_rollout_episodes < 10
     ):
         parser.error("production certification requires 3 batches, 300 requests per batch and 10 episodes per sandbox")
+    if args.certification_profile == "production" and args.sandbox_runtime != "docker":
+        parser.error("production certification requires --sandbox-runtime docker")
     project = args.project.resolve()
     from dotenv import load_dotenv
     load_dotenv(project / ".env")

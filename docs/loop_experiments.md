@@ -11,6 +11,7 @@
 uv run python scripts/run_sandbox_build_loop.py \
   --generate-count 10 --max-rounds 0 --consecutive-rounds 2 \
   --validation live --build-mode clean \
+  --sandbox-runtime docker \
   --experiment-seed 20260925 \
   --target-task-yield 0.85 --target-build-yield 0.80 \
   --target-end-to-end-rate 0.70 --target-qualified-mean 8.5 \
@@ -39,6 +40,9 @@ Pilot 通过只表示可以进入更大规模认证，
 
 - `--threshold` 默认 8，统一采用大于等于；任务静态评分也是前置筛选。失败任务仍计入总请求数。
 - `--validation offline` 只执行离线门禁，不能证明真实训练质量；默认 `live` 会追加真实模型 rollout。
+- `--certification-profile production` 强制 `--sandbox-runtime docker`，每个候选环境必须实际构建内容寻址
+  镜像并通过安全容器 smoke test；不能用 `none` 生成生产认证。pilot 可显式设置
+  `--sandbox-runtime none`，但其结果仍只表示候选流程验证。
 - `--rollout-episodes 3 --rollout-steps 20` 控制开发阶段每个沙箱的轨迹次数和步数。开发阶段默认只要求至少
   一条成功证据；`--rollout-min-success-rate` 可提高该门槛。生产留出集默认使用 10 次 episode 和
   `--holdout-rollout-success-rate 0.6666666666666666`。

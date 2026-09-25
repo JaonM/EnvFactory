@@ -269,6 +269,7 @@ class ExperimentTest(unittest.TestCase):
                 "threshold": 8, "max_attempts": 2, "build_timeout": 10,
                 "score_timeout": 10, "rollout_timeout": 10,
                 "build_mode": "clean", "validation": "live",
+                "sandbox_runtime": "docker",
                 "rollout_episodes": 3, "rollout_steps": 20,
                 "rollout_min_success_rate": 0,
             }
@@ -280,6 +281,10 @@ class ExperimentTest(unittest.TestCase):
             self.assertTrue(result["passed"])
             self.assertTrue(result["data_governance_verified"])
             self.assertTrue(result["live_reward_calibration_verified"])
+            build_command = commands[0]
+            self.assertEqual(
+                build_command[build_command.index("--runtime") + 1], "docker"
+            )
             governance_index = next(
                 index for index, command in enumerate(commands)
                 if "audit_data_governance.py" in " ".join(command)
@@ -346,6 +351,23 @@ class ExperimentTest(unittest.TestCase):
             self.assertFalse(any(
                 "run_live_rollout.py" in " ".join(command) for command in commands
             ))
+
+    def test_production_profile_cannot_disable_container_build(self):
+        completed = __import__("subprocess").run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/loop_experiment.py"),
+                "--certification-profile", "production",
+                "--sandbox-runtime", "none",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            "production certification requires --sandbox-runtime docker",
+            completed.stderr,
+        )
 
     def test_holdout_requires_fresh_tasks_and_two_of_three_successes(self):
         with tempfile.TemporaryDirectory() as tmp:
