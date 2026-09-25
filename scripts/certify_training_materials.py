@@ -1580,6 +1580,7 @@ def certify(
             "post_training_policy_improvement",
             "cross_model_generalization",
             "offline_rl_algorithm_compatibility",
+            "exported_rollouts_as_direct_policy_optimization_targets",
             "data_license_or_distribution_rights",
             "absence_of_same_model_evaluation_bias",
         ],
@@ -1653,6 +1654,7 @@ def attach_bundle_verification(
         and verification.get("task_lineage_ready") is True
         and verification.get("production_preflight_ready") is True
         and verification.get("experiment_config_ready") is True
+        and verification.get("trajectory_purpose_ready") is True
         and verification.get("metadata_privacy_ready") is True
         and verification.get("evaluator_independence_ready") is True
         and verification.get("source_dataset_sha256")

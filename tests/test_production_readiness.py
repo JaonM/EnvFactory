@@ -62,7 +62,7 @@ class ProductionReadinessTest(unittest.TestCase):
                         }
                         if name == "model_configuration" else {
                             "key_identity_sha256": "e" * 64,
-                            "bundle_version": "13.0",
+                            "bundle_version": "14.0",
                         }
                         if name == "bundle_signing_identity" else {}
                         if name != "evaluator_role_separation" else {
@@ -1326,7 +1326,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "materials_manifest": {"dataset_sha256": "dataset"},
         }
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "13.0",
+            "verified": True, "bundle_version": "14.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1338,6 +1338,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "task_lineage_ready": True,
             "production_preflight_ready": True,
             "experiment_config_ready": True,
+            "trajectory_purpose_ready": True,
             "metadata_privacy_ready": True,
             "evaluator_independence_ready": True,
             "source_dataset_sha256": "different",
@@ -1345,7 +1346,7 @@ class ProductionReadinessTest(unittest.TestCase):
         self.assertFalse(report["certified"])
         self.assertIn("portable_materials_bundle", report["failed_gates"])
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "13.0",
+            "verified": True, "bundle_version": "14.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1357,6 +1358,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "task_lineage_ready": True,
             "production_preflight_ready": True,
             "experiment_config_ready": True,
+            "trajectory_purpose_ready": True,
             "metadata_privacy_ready": True,
             "evaluator_independence_ready": True,
             "source_dataset_sha256": "dataset",

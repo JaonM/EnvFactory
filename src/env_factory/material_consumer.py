@@ -13,18 +13,19 @@ CERTIFICATION_FILE = "certification.json"
 DATASET_CARD_FILE = "dataset_card.json"
 CONSUMER_CONTRACT_FILE = "consumer_contract.json"
 BUNDLE_SIGNATURE_FILE = "bundle_manifest.sig"
-BUNDLE_VERSION = "13.0"
+BUNDLE_VERSION = "14.0"
 DATASET_SPLITS = ("train", "validation", "test")
 FEATURE_VERSIONS = {
-    "splits": {"6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0"},
-    "families": {"7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0"},
-    "generation": {"8.0", "9.0", "10.0", "11.0", "12.0", "13.0"},
-    "container_rollout": {"9.0", "10.0", "11.0", "12.0", "13.0"},
-    "reward_calibration": {"10.0", "11.0", "12.0", "13.0"},
-    "provider_binding": {"11.0", "12.0", "13.0"},
-    "task_lineage": {"11.0", "12.0", "13.0"},
-    "production_preflight": {"12.0", "13.0"},
-    "experiment_binding": {"13.0"},
+    "splits": {"6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0"},
+    "families": {"7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0"},
+    "generation": {"8.0", "9.0", "10.0", "11.0", "12.0", "13.0", "14.0"},
+    "container_rollout": {"9.0", "10.0", "11.0", "12.0", "13.0", "14.0"},
+    "reward_calibration": {"10.0", "11.0", "12.0", "13.0", "14.0"},
+    "provider_binding": {"11.0", "12.0", "13.0", "14.0"},
+    "task_lineage": {"11.0", "12.0", "13.0", "14.0"},
+    "production_preflight": {"12.0", "13.0", "14.0"},
+    "experiment_binding": {"13.0", "14.0"},
+    "trajectory_purpose": {"14.0"},
 }
 
 
@@ -65,11 +66,18 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
     supports_families = supports_bundle_feature(bundle_version, "families")
     supports_generation = supports_bundle_feature(bundle_version, "generation")
     supports_lineage = supports_bundle_feature(bundle_version, "task_lineage")
+    supports_trajectory_purpose = supports_bundle_feature(
+        bundle_version, "trajectory_purpose"
+    )
     record_fields = [
         "schema_version", "item_id", "task_sha256", "category",
         "episode_index", "episode_seed", "episode_success",
         "episode_termination", "episode_initial_reward", "episode_final_reward",
         "agent_model", "runtime_model", "agent_usage",
+        *(
+            ["trajectory_role", "direct_training_status"]
+            if supports_trajectory_purpose else []
+        ),
         *(["split"] if supports_splits else []),
         *(["task_family_id"] if supports_families else []),
         *([] if not supports_generation else [
@@ -125,6 +133,10 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
                     "agent_model": {"type": "string", "minLength": 1},
                     "runtime_model": {"type": "string", "minLength": 1},
                     "agent_usage": {"type": "object"},
+                    **({
+                        "trajectory_role": {"const": "certification_evidence"},
+                        "direct_training_status": {"const": "not_certified"},
+                    } if supports_trajectory_purpose else {}),
                     "transition": {
                         "type": "object",
                         "required": list(POLICY_TRANSITION_FIELDS),
@@ -179,6 +191,19 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
                 "trainer_metadata", "trajectory", "replay", "initial_state", "final_state",
             ],
         },
+        **({
+            "material_roles": {
+                "environments": {
+                    "status": "certified_for_fresh_rollout_collection",
+                    "entrypoint": "environments/{item_id}/Dockerfile",
+                },
+                "exported_trajectories": {
+                    "role": "certification_evidence",
+                    "direct_policy_optimization": "not_certified",
+                    "requires_downstream_approval": True,
+                },
+            },
+        } if supports_trajectory_purpose else {}),
         "invariants": [
             "records_are_ordered_and_unique_by_identity",
             "assistant_output_parses_to_action",
@@ -186,6 +211,10 @@ def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
             "only_final_transition_is_terminal_or_truncated",
             "final_transition_reward_equals_episode_final_reward",
             "trainer_only_fields_are_not_policy_inputs",
+            *(
+                ["acceptance_rollouts_are_not_certified_training_targets"]
+                if supports_trajectory_purpose else []
+            ),
             *(["generated_task_equals_runtime_task"] if supports_lineage else []),
         ],
     }

@@ -31,6 +31,23 @@ exporter = load_exporter()
 
 
 class MaterialExportTest(unittest.TestCase):
+    @staticmethod
+    def remove_current_trajectory_purpose(bundle: Path, manifest: dict) -> None:
+        manifest.pop("trajectory_purpose", None)
+        transition_path = bundle / "transitions.jsonl"
+        records = [
+            json.loads(line) for line in transition_path.read_text().splitlines()
+        ]
+        for record in records:
+            record.pop("trajectory_role", None)
+            record.pop("direct_training_status", None)
+        transition_path.write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n"
+        )
+        manifest["files_sha256"]["transitions.jsonl"] = exporter.file_sha256(
+            transition_path
+        )
+
     def generation_provenance(self):
         return {
             "version": "1.0",
@@ -246,6 +263,7 @@ class MaterialExportTest(unittest.TestCase):
                 "rl_training_convergence",
                 "post_training_policy_improvement",
                 "cross_model_generalization",
+                "exported_rollouts_as_direct_policy_optimization_targets",
             ],
             "policy": {"score_threshold": 8.0},
             "measurements": {
@@ -287,7 +305,7 @@ class MaterialExportTest(unittest.TestCase):
                                 }
                                 if name == "model_configuration" else {
                                     "key_identity_sha256": "e" * 64,
-                                    "bundle_version": "13.0",
+                                    "bundle_version": "14.0",
                                 }
                                 if name == "bundle_signing_identity" else {}
                                 if name != "evaluator_role_separation" else {
@@ -379,7 +397,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "13.0")
+            self.assertEqual(contract["bundle_version"], "14.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -433,7 +451,7 @@ class MaterialExportTest(unittest.TestCase):
                     certification, root / "bundle", ROOT
                 )
 
-    def test_v13_verifier_rejects_rehashed_missing_preflight_evidence(self):
+    def test_v14_verifier_rejects_rehashed_missing_preflight_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             certification = self.source(root)
@@ -460,7 +478,7 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["production_preflight_ready"])
             self.assertIn("portable_certification", report["failed_gates"])
 
-    def test_v13_verifier_binds_preflight_to_environment_providers(self):
+    def test_v14_verifier_binds_preflight_to_environment_providers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             certification = self.source(root)
@@ -495,7 +513,7 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["production_preflight_ready"])
             self.assertIn("preflight_provider_binding", report["failed_gates"])
 
-    def test_v13_verifier_rejects_rehashed_experiment_binding_drift(self):
+    def test_v14_verifier_rejects_rehashed_experiment_binding_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = root / "bundle"
@@ -514,7 +532,32 @@ class MaterialExportTest(unittest.TestCase):
             self.assertFalse(report["experiment_config_ready"])
             self.assertIn("portable_certification", report["failed_gates"])
 
-    def test_v13_verifier_rejects_rehashed_local_metadata(self):
+    def test_v14_verifier_rejects_direct_training_relabeling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "bundle"
+            exporter.export_bundle(self.source(root), bundle, ROOT)
+            transition_path = bundle / "transitions.jsonl"
+            record = json.loads(transition_path.read_text())
+            record["direct_training_status"] = "certified"
+            transition_path.write_text(json.dumps(record) + "\n")
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files_sha256"]["transitions.jsonl"] = (
+                exporter.file_sha256(transition_path)
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["trajectory_purpose_ready"])
+            self.assertIn("transition_projection", report["failed_gates"])
+
+    def test_v14_verifier_rejects_rehashed_local_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             certification = self.source(root)
@@ -808,6 +851,7 @@ class MaterialExportTest(unittest.TestCase):
             record.pop("generation_provider_identity_sha256")
             record.pop("generation_sample_seed")
             transition_path.write_text(json.dumps(record) + "\n")
+            self.remove_current_trajectory_purpose(bundle, manifest)
             manifest["files_sha256"].pop("consumer_contract.json")
             manifest["files_sha256"]["transitions.jsonl"] = exporter.file_sha256(
                 transition_path
@@ -853,6 +897,7 @@ class MaterialExportTest(unittest.TestCase):
             record.pop("generation_provider_identity_sha256")
             record.pop("generation_sample_seed")
             transition_path.write_text(json.dumps(record) + "\n")
+            self.remove_current_trajectory_purpose(bundle, manifest)
             manifest["files_sha256"]["consumer_contract.json"] = exporter.file_sha256(
                 contract_path
             )
@@ -890,6 +935,7 @@ class MaterialExportTest(unittest.TestCase):
             manifest_path = bundle / "bundle_manifest.json"
             manifest = json.loads(manifest_path.read_text())
             manifest["version"] = "8.0"
+            self.remove_current_trajectory_purpose(bundle, manifest)
             manifest["items"][0].pop("runtime_execution")
             manifest["items"][0].pop("reward_runtime_execution")
             manifest["files_sha256"]["consumer_contract.json"] = (
@@ -925,6 +971,7 @@ class MaterialExportTest(unittest.TestCase):
             manifest_path = bundle / "bundle_manifest.json"
             manifest = json.loads(manifest_path.read_text())
             manifest["version"] = "9.0"
+            self.remove_current_trajectory_purpose(bundle, manifest)
             manifest["items"][0].pop("reward_runtime_execution")
             manifest["files_sha256"]["consumer_contract.json"] = (
                 exporter.file_sha256(contract_path)
@@ -958,6 +1005,7 @@ class MaterialExportTest(unittest.TestCase):
             manifest_path = bundle / "bundle_manifest.json"
             manifest = json.loads(manifest_path.read_text())
             manifest["version"] = "10.0"
+            self.remove_current_trajectory_purpose(bundle, manifest)
             item = manifest["items"][0]
             lineage_path = bundle / item["environment_path"] / "task_lineage.json"
             lineage_relative = str(lineage_path.relative_to(bundle))

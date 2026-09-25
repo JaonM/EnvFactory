@@ -174,7 +174,7 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 
 生产认证还会原子生成 `training_materials_bundle/`。该目录不保留本机绝对路径，按内容身份保存每个
 环境的任务、运行时代码、业务数据、验收证据和 `live_rollout.json`，并生成 `transitions.jsonl` 与
-`bundle_manifest.json`。Bundle v13 同时包含去除本机路径的 `certification.json`、机器可读
+`bundle_manifest.json`。Bundle v14 同时包含去除本机路径的 `certification.json`、机器可读
 `dataset_card.json`，并要求便携认证保留及验证 production profile 与新鲜 preflight 证据。JSONL 每行
 是一条可重建的 schema v2 transition，并携带任务、类别、episode、
 任务生成模型与 provider 身份、生成 seed、Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与
@@ -185,22 +185,26 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 `transitions.jsonl` 逐条精确比较。校验范围包含 item/episode/step 引用、模型身份、parsed action 与原始
 输出的一致性、observation 链、reward、usage 以及 terminated/truncated 终止语义，防止只重算文件哈希
 就让语义损坏的轨迹通过。JSONL 由固定字段白名单投影产生；完整 trainer-only 证据仍保存在对应环境目录，
-并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。
+并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。Bundle v14 进一步把
+这些已导出的 rollout 标记为 `certification_evidence` 与 `direct_training_status=not_certified`：它们证明环境
+和奖励可以工作，但不自动成为策略优化目标。通过认证的是可重建环境及其新鲜 rollout 采集能力；下游若要
+复用验收轨迹做离线训练，必须另行完成算法、分布偏差和行为策略兼容性审批。
 
-Bundle v13 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
+Bundle v14 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
 记录身份与排序、环境目录和 Docker 重建入口、运行接口来源，以及 policy input/output、环境反馈和
 trainer-only 证据边界。验证器使用内置规范与文件逐项比较；即使同时修改契约并重算所有外层哈希，也不能
-把 trainer-only 字段伪装成策略输入。Bundle v13 还要求每个环境携带并校验
+把 trainer-only 字段伪装成策略输入。Bundle v14 还要求每个环境携带并校验
 `agentic_training_value_live.json` 的容器执行身份；rollout 与奖励校准都必须匹配同一份 v4 镜像
 provenance，并重新读取 `data_governance.json` 复核 Agent、User Simulator 与 Reward Judge 的模型和
-provider 摘要授权，并校验 `task_lineage.json`。仅同步重算文件哈希不能绕过这些关系。v12 包仍按原有
-production preflight 契约验证，但没有 v13 的完整冻结实验配置绑定；v11 包缺少 production preflight
+provider 摘要授权，并校验 `task_lineage.json`。仅同步重算文件哈希不能绕过这些关系。v13 包仍验证完整
+冻结实验配置绑定，但没有 v14 的验收轨迹用途隔离；v12 包仅按原有 production preflight 契约验证；
+v11 包缺少 production preflight
 语义，v10 包仍按其
 原有容器奖励校准契约验证，v9 包仍按 rollout 容器契约验证。这些历史版本都不能满足当前生产准备认证。
 更早版本也只能
 验证各自声明的历史契约，不能满足当前受信发布门禁。
 
-v13 验证器还会把 preflight 的 generation、Rollout Agent、User/Judge 三个 provider 分别与每个环境中的
+v14 验证器还会把 preflight 的 generation、Rollout Agent、User/Judge 三个 provider 分别与每个环境中的
 生成 provenance 和 `data_governance.json` 交叉核对；三个各自格式合法但来自不同实验的身份不能拼成合格包。
 认证阶段生成的 preflight v1.1 还会绑定完整冻结实验配置的 SHA-256；任务配比、门禁阈值、holdout 参数或
 其他配置发生变化后，旧 preflight 不能复用。启动阶段的 v1.0 preflight 仅作环境诊断，不构成认证证据。

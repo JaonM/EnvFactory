@@ -58,13 +58,19 @@ class MaterialConsumerTest(unittest.TestCase):
     def test_consumer_schema_makes_split_part_of_every_record(self):
         contract = consumer_contract()
         records = contract["records"]
-        self.assertEqual(contract["bundle_version"], "13.0")
+        self.assertEqual(contract["bundle_version"], "14.0")
         self.assertIn("task_lineage", contract["environments"])
         self.assertIn("generated_task_equals_runtime_task", contract["invariants"])
         self.assertEqual(records["split_unit"], "item_id")
         self.assertIn("split", records["required_fields"])
         self.assertIn("task_family_id", records["required_fields"])
         self.assertIn("generation_model", records["required_fields"])
+        self.assertIn("trajectory_role", records["required_fields"])
+        self.assertEqual(
+            contract["material_roles"]["exported_trajectories"]
+                ["direct_policy_optimization"],
+            "not_certified",
+        )
         self.assertEqual(records["near_duplicate_split_unit"], "task_family_id")
         self.assertEqual(
             records["json_schema"]["properties"]["split"]["enum"],

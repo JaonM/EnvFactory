@@ -157,7 +157,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "1.9",
+        "version": "2.0",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -227,6 +227,8 @@ def _dataset_card(
             "policy_transitions": TRANSITIONS_FILE,
             "trainer_only_evidence": "environments/*/live_rollout.json",
             "visibility_contract": "bundle_manifest.json#transition_visibility",
+            "exported_trajectory_role": "certification_evidence",
+            "direct_training_status": "not_certified",
         },
         "consumer_requirements": [
             "verify_bundle_before_use",
@@ -241,6 +243,7 @@ def _transition_records(
     item_id: str, item: Mapping[str, Any], rollout: Mapping[str, Any], *,
     split: str = "", task_family_id: str = "",
     generation_provenance: Mapping[str, Any] | None = None,
+    bundle_version: str = BUNDLE_VERSION,
 ) -> list[dict[str, Any]]:
     if rollout.get("schema_version") != "2.0":
         raise ValueError("rollout schema_version must be 2.0")
@@ -281,6 +284,12 @@ def _transition_records(
                 "agent_model": rollout.get("agent_model"),
                 "runtime_model": rollout.get("runtime_model"),
                 "agent_usage": episode["usage"][transition_index],
+                **({
+                    "trajectory_role": "certification_evidence",
+                    "direct_training_status": "not_certified",
+                } if supports_bundle_feature(
+                    bundle_version, "trajectory_purpose"
+                ) else {}),
                 **({"split": split} if split else {}),
                 **({"task_family_id": task_family_id} if task_family_id else {}),
                 **({
@@ -520,7 +529,8 @@ def _export_bundle_uncommitted(
     portable_metadata_privacy = audit_portable_metadata(portable_certification)
     if not portable_metadata_privacy["safe"]:
         raise ValueError(
-            "portable certification contains non-portable or sensitive metadata"
+            "portable certification contains non-portable or sensitive metadata: "
+            f"{portable_metadata_privacy}"
         )
     (output / CERTIFICATION_FILE).write_text(
         json.dumps(portable_certification, ensure_ascii=False, indent=2) + "\n",
@@ -571,6 +581,11 @@ def _export_bundle_uncommitted(
             "policy_projection": "env_factory.trajectory_schema.policy_transition",
             "trainer_only_evidence": "environments/*/live_rollout.json",
         },
+        "trajectory_purpose": {
+            "role": "certification_evidence",
+            "direct_training_status": "not_certified",
+            "environment_status": "certified_for_fresh_rollout_collection",
+        },
         "files_sha256": files,
     }
     manifest["bundle_sha256"] = digest_json(manifest)
@@ -607,7 +622,7 @@ def verify_bundle(
         failures.append("bundle_digest")
     if (
         manifest.get("version") not in {
-            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0",
+            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0",
             BUNDLE_VERSION,
         }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
@@ -616,7 +631,7 @@ def verify_bundle(
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0",
+        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0",
         BUNDLE_VERSION,
     }
     if production_contract_ready:
@@ -685,6 +700,7 @@ def verify_bundle(
         "rl_training_convergence",
         "post_training_policy_improvement",
         "cross_model_generalization",
+        "exported_rollouts_as_direct_policy_optimization_targets",
     }
     if not (
         isinstance(portable_certification, Mapping)
@@ -922,6 +938,7 @@ def verify_bundle(
                     )
                     else None
                 ),
+                bundle_version=str(manifest.get("version")),
             )
         except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
             failures.append("transition_schema")
@@ -1151,6 +1168,24 @@ def verify_bundle(
         and preflight_report.get("experiment_config_sha256")
             == manifest.get("experiment_config_sha256")
     )
+    trajectory_purpose_ready = (
+        supports_bundle_feature(str(manifest.get("version")), "trajectory_purpose")
+        and manifest.get("trajectory_purpose") == {
+            "role": "certification_evidence",
+            "direct_training_status": "not_certified",
+            "environment_status": "certified_for_fresh_rollout_collection",
+        }
+        and bool(records)
+        and all(
+            record.get("trajectory_role") == "certification_evidence"
+            and record.get("direct_training_status") == "not_certified"
+            for record in records
+        )
+    )
+    if supports_bundle_feature(
+        str(manifest.get("version")), "trajectory_purpose"
+    ) and not trajectory_purpose_ready:
+        failures.append("trajectory_purpose")
     evaluator_independence_ready = (
         supports_bundle_feature(
             str(manifest.get("version")), "production_preflight"
@@ -1300,7 +1335,8 @@ def verify_bundle(
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "1.9" if manifest.get("version") == BUNDLE_VERSION
+            "2.0" if manifest.get("version") == BUNDLE_VERSION
+            else "1.9" if manifest.get("version") == "13.0"
             else "1.8" if manifest.get("version") == "12.0"
             else "1.7" if manifest.get("version") == "11.0"
             else "1.6" if manifest.get("version") == "10.0"
@@ -1324,7 +1360,7 @@ def verify_bundle(
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
             manifest.get("version") not in {
-                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0",
+                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0",
                 BUNDLE_VERSION,
             }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
@@ -1349,6 +1385,17 @@ def verify_bundle(
             == "model_generated_synthetic"
         and dataset_card.get("data_boundary", {}).get("contains_real_user_data")
             is False
+        and (
+            not supports_bundle_feature(str(version), "trajectory_purpose")
+            or (
+                dataset_card.get("data_boundary", {}).get(
+                    "exported_trajectory_role"
+                ) == "certification_evidence"
+                and dataset_card.get("data_boundary", {}).get(
+                    "direct_training_status"
+                ) == "not_certified"
+            )
+        )
         and "do_not_feed_trainer_only_evidence_to_the_policy"
             in dataset_card.get("consumer_requirements", [])
     ):
@@ -1360,7 +1407,7 @@ def verify_bundle(
         failures.append("bundle_episode_counts")
     trusted_attestation = (
         manifest.get("version") in {
-            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0",
+            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0", "13.0",
             BUNDLE_VERSION,
         }
         and trusted_public_key is not None
@@ -1391,6 +1438,7 @@ def verify_bundle(
         "task_lineage_ready": task_lineage_ready,
         "production_preflight_ready": production_preflight_ready,
         "experiment_config_ready": experiment_config_ready,
+        "trajectory_purpose_ready": trajectory_purpose_ready,
         "preflight_provider_bindings": verified_preflight_provider_bindings,
         "metadata_privacy_ready": portable_metadata_privacy["safe"],
         "evaluator_independence_ready": evaluator_independence_ready,
