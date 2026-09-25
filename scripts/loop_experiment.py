@@ -26,6 +26,7 @@ from env_factory.execution_provenance import (
 )
 from env_factory.task_similarity import task_partition_isolation
 from env_factory.task_portability import valid_task_lineage
+from env_factory.material_artifacts import digest_json
 
 MODEL = "gpt-5.6-luna"
 ACTIVE_PROCESSES = set()
@@ -1111,6 +1112,8 @@ def main():
     project = args.project.resolve()
     from dotenv import load_dotenv
     load_dotenv(project / ".env")
+    from env_factory.model_roles import resolve_model_roles
+    model_roles = resolve_model_roles(os.environ)
     bundle_private_key = args.bundle_signing_private_key or (
         Path(os.environ["ENVFACTORY_BUNDLE_SIGNING_PRIVATE_KEY"])
         if os.getenv("ENVFACTORY_BUNDLE_SIGNING_PRIVATE_KEY") else None
@@ -1137,8 +1140,16 @@ def main():
             parser.error(str(exc))
         if private_identity != bundle_key_identity:
             parser.error("bundle signing private key does not match trusted public key")
-    if (args.generate_count or args.validation == "live") and not all(os.getenv(key) for key in ("LLM_MODEL", "LLM_API_KEY")):
-        parser.error("generation/live rollout requires LLM_MODEL and LLM_API_KEY")
+    if args.generate_count and not all(
+        model_roles["generation"][key] for key in ("model", "api_key")
+    ):
+        parser.error("task generation requires LLM_MODEL and LLM_API_KEY")
+    if args.validation == "live" and not all(
+        model_roles["agent"][key] for key in ("model", "api_key")
+    ):
+        parser.error(
+            "live rollout requires ROLLOUT_LLM_MODEL/API_KEY or LLM fallback"
+        )
     root = args.output if args.output.is_absolute() else project / args.output
     root = root.resolve()
     task_root = args.task_root if args.task_root.is_absolute() else project / args.task_root
@@ -1175,21 +1186,33 @@ def main():
         "bundle_signing_private_key", "bundle_trusted_public_key",
     }}
     from env_factory.data_governance import provider_identity
+    generation_provider = provider_identity(
+        model_roles["generation"]["base_url"],
+        model_roles["generation"]["model"],
+    )
+    rollout_provider = provider_identity(
+        model_roles["agent"]["base_url"],
+        model_roles["agent"]["model"],
+    )
+    runtime_provider = provider_identity(
+        model_roles["runtime"]["base_url"],
+        model_roles["runtime"]["model"],
+    )
     config.update(project=str(project), task_paths=list(map(str, paths)), model=MODEL,
                   source_digest=source_digest(project), input_digests=[input_digest(path) for path in paths],
                   execution_provenance=collect_execution_provenance(project),
                   bundle_attestation_key_identity_sha256=bundle_key_identity,
-                  generation_model=os.getenv("LLM_MODEL"), runtime_model=os.getenv("SANDBOX_LLM_MODEL") or os.getenv("LLM_MODEL"),
-                  generation_provider=provider_identity(
-                      os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
-                      os.getenv("LLM_MODEL", ""),
-                  ),
-                  runtime_provider=provider_identity(
-                      os.getenv("SANDBOX_LLM_BASE_URL")
-                      or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
-                      os.getenv("SANDBOX_LLM_MODEL") or os.getenv("LLM_MODEL", ""),
-                  ),
-                  provider_digest=hashlib.sha256(json.dumps([os.getenv("LLM_BASE_URL"), os.getenv("SANDBOX_LLM_BASE_URL")]).encode()).hexdigest())
+                  generation_model=model_roles["generation"]["model"],
+                  rollout_model=model_roles["agent"]["model"],
+                  runtime_model=model_roles["runtime"]["model"],
+                  generation_provider=generation_provider,
+                  rollout_provider=rollout_provider,
+                  runtime_provider=runtime_provider,
+                  provider_digest=digest_json({
+                      "generation": generation_provider,
+                      "agent": rollout_provider,
+                      "runtime": runtime_provider,
+                  }))
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)
     root.mkdir(parents=True, exist_ok=True)

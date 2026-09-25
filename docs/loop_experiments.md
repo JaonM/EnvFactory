@@ -78,8 +78,10 @@ Pilot 通过只表示可以进入更大规模认证，
 
 ## 模型默认值
 
-Rollout Agent 使用任务生成的 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`、`LLM_TIMEOUT`。
-User Simulator 和奖励 LLM 按字段优先使用 `SANDBOX_LLM_*`；缺失或空值回退到对应 `LLM_*`（超时回退到 `LLM_TIMEOUT`）。显式配置某字段不会覆盖其他字段。没有任何模型/密钥配置时明确报错，不静默使用 mock。
+Rollout Agent 按字段优先使用 `ROLLOUT_LLM_API_KEY`、`ROLLOUT_LLM_BASE_URL`、`ROLLOUT_LLM_MODEL`
+和 `ROLLOUT_LLM_TIMEOUT_SECONDS`；缺失或空值回退到任务生成使用的对应 `LLM_*`。User Simulator 和
+奖励 LLM 同样优先使用 `SANDBOX_LLM_*` 并逐字段回退到 `LLM_*`。显式配置某个字段不会覆盖其他字段，
+三个角色的 provider 身份分别冻结和审计；缺少实际所需角色的模型或密钥时明确报错，不静默使用 mock。
 
 CLI 从项目 `.env` 加载环境变量；独立沙箱/容器应由启动器注入这些变量，不复制 `.env` 或密钥进入沙箱文件。离线模式仍强制 mock。
 

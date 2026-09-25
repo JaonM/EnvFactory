@@ -16,6 +16,7 @@ from .material_attestation import (
 )
 from .material_consumer import BUNDLE_VERSION
 from .data_governance import provider_identity
+from .model_roles import resolve_model_roles
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -74,44 +75,52 @@ def run_production_preflight(
             docker_ready = False
     record("docker_daemon", docker_ready, docker_identity)
 
-    agent_model = env.get("LLM_MODEL", "").strip()
-    agent_key = env.get("LLM_API_KEY", "").strip()
-    runtime_model = (env.get("SANDBOX_LLM_MODEL") or agent_model).strip()
-    runtime_key = (env.get("SANDBOX_LLM_API_KEY") or agent_key).strip()
-    agent_url = (env.get("LLM_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
-    runtime_url = (env.get("SANDBOX_LLM_BASE_URL") or agent_url).rstrip("/")
-    model_configured = all((agent_model, agent_key, runtime_model, runtime_key))
-    urls_valid = _valid_url(agent_url) and _valid_url(runtime_url)
-    agent_provider = provider_identity(agent_url, agent_model)
-    runtime_provider = provider_identity(runtime_url, runtime_model)
+    roles = resolve_model_roles(env)
+    generation = roles["generation"]
+    agent = roles["agent"]
+    runtime = roles["runtime"]
+    model_configured = all(
+        role["model"] and role["api_key"]
+        for role in (generation, agent, runtime)
+    )
+    urls_valid = all(
+        _valid_url(role["base_url"])
+        for role in (generation, agent, runtime)
+    )
+    generation_provider = provider_identity(
+        generation["base_url"], generation["model"]
+    )
+    agent_provider = provider_identity(agent["base_url"], agent["model"])
+    runtime_provider = provider_identity(runtime["base_url"], runtime["model"])
     record("model_configuration", model_configured and urls_valid, {
-        "agent_model_configured": bool(agent_model),
-        "agent_key_configured": bool(agent_key),
-        "runtime_model_configured": bool(runtime_model),
-        "runtime_key_configured": bool(runtime_key),
-        "agent_host": urlparse(agent_url).hostname,
-        "runtime_host": urlparse(runtime_url).hostname,
+        "generation_model_configured": bool(generation["model"]),
+        "generation_key_configured": bool(generation["api_key"]),
+        "agent_model_configured": bool(agent["model"]),
+        "agent_key_configured": bool(agent["api_key"]),
+        "runtime_model_configured": bool(runtime["model"]),
+        "runtime_key_configured": bool(runtime["api_key"]),
+        "generation_host": urlparse(generation["base_url"]).hostname,
+        "agent_host": urlparse(agent["base_url"]).hostname,
+        "runtime_host": urlparse(runtime["base_url"]).hostname,
+        "generation_provider": generation_provider,
         "agent_provider": agent_provider,
         "runtime_provider": runtime_provider,
         "urls_valid": urls_valid,
     })
 
-    timeout_valid = retries_valid = False
-    try:
-        timeout_valid = float(
-            env.get("SANDBOX_LLM_TIMEOUT_SECONDS")
-            or env.get("LLM_TIMEOUT")
-            or "60"
-        ) > 0
-    except ValueError:
-        pass
+    timeout_checks: dict[str, bool] = {}
+    for name, role in roles.items():
+        try:
+            timeout_checks[name] = float(role["timeout_seconds"]) > 0
+        except ValueError:
+            timeout_checks[name] = False
     try:
         retries = int(env.get("SANDBOX_LLM_MAX_RETRIES") or "3")
         retries_valid = 0 <= retries <= 10
     except ValueError:
-        pass
-    record("model_runtime_limits", timeout_valid and retries_valid, {
-        "timeout_valid": timeout_valid,
+        retries_valid = False
+    record("model_runtime_limits", all(timeout_checks.values()) and retries_valid, {
+        "timeout_valid": timeout_checks,
         "retries_valid": retries_valid,
     })
 
@@ -167,6 +176,7 @@ def valid_production_preflight(
     *,
     expected_agent_provider: Mapping[str, Any] | None = None,
     expected_runtime_provider: Mapping[str, Any] | None = None,
+    expected_generation_provider: Mapping[str, Any] | None = None,
     expected_signing_key_identity: str | None = None,
 ) -> bool:
     """Validate evidence produced by a fresh, trusted preflight execution."""
@@ -214,6 +224,12 @@ def valid_production_preflight(
     if not isinstance(model_evidence, Mapping):
         return False
     if (
+        expected_generation_provider is not None
+        and model_evidence.get("generation_provider")
+            != dict(expected_generation_provider)
+    ):
+        return False
+    if (
         expected_agent_provider is not None
         and model_evidence.get("agent_provider") != dict(expected_agent_provider)
     ):
@@ -238,5 +254,7 @@ def valid_production_preflight(
 
     return all(
         valid_provider(model_evidence.get(name))
-        for name in ("agent_provider", "runtime_provider")
+        for name in (
+            "generation_provider", "agent_provider", "runtime_provider"
+        )
     )

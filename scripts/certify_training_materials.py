@@ -742,8 +742,11 @@ def certify(
         isinstance(config, Mapping)
         and config.get("certification_profile") == "production"
     )
-    expected_agent_provider = (
+    expected_generation_provider = (
         config.get("generation_provider") if isinstance(config, Mapping) else None
+    )
+    expected_agent_provider = (
+        config.get("rollout_provider") if isinstance(config, Mapping) else None
     )
     expected_runtime_provider = (
         config.get("runtime_provider") if isinstance(config, Mapping) else None
@@ -753,11 +756,13 @@ def certify(
         if isinstance(config, Mapping) else None
     )
     preflight_verified = (
-        isinstance(expected_agent_provider, Mapping)
+        isinstance(expected_generation_provider, Mapping)
+        and isinstance(expected_agent_provider, Mapping)
         and isinstance(expected_runtime_provider, Mapping)
         and isinstance(expected_signing_key_identity, str)
         and valid_production_preflight(
             production_preflight,
+            expected_generation_provider=expected_generation_provider,
             expected_agent_provider=expected_agent_provider,
             expected_runtime_provider=expected_runtime_provider,
             expected_signing_key_identity=expected_signing_key_identity,

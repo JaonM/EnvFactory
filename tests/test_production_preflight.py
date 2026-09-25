@@ -68,6 +68,9 @@ class ProductionPreflightTest(unittest.TestCase):
             self.assertEqual(model["evidence"]["agent_host"], "agent.example")
             self.assertTrue(valid_production_preflight(
                 report,
+                expected_generation_provider=model["evidence"][
+                    "generation_provider"
+                ],
                 expected_agent_provider=model["evidence"]["agent_provider"],
                 expected_runtime_provider=model["evidence"]["runtime_provider"],
                 expected_signing_key_identity="a" * 64,

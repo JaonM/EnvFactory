@@ -12,6 +12,7 @@ import sys
 import tempfile
 from env_factory.llm import LLMClient
 from env_factory.data_governance import provider_identity
+from env_factory.model_roles import resolve_model_roles
 from env_factory.material_artifacts import portable_artifact_digest
 from env_factory.runtime_llm import RuntimeLLMConfig
 from env_factory.sandbox_http import HTTPSandboxClient
@@ -248,7 +249,14 @@ def main():
         parser.error("episodes and steps must be positive")
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-    client = LLMClient.from_env("LLM", timeout=float(os.getenv("LLM_TIMEOUT", "60")))
+    roles = resolve_model_roles(os.environ)
+    agent = roles["agent"]
+    client = LLMClient(
+        api_key=agent["api_key"],
+        base_url=agent["base_url"],
+        model=agent["model"],
+        timeout=float(agent["timeout_seconds"]),
+    )
     os.environ["SANDBOX_EVALUATOR_MOCK"] = "0"
     runtime = RuntimeLLMConfig.from_env()
     os.environ["SANDBOX_MUTATION_MODE"] = "disabled"

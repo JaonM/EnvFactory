@@ -32,6 +32,10 @@ class ProductionReadinessTest(unittest.TestCase):
     @staticmethod
     def production_preflight():
         agent_provider = {
+            "host": "agent.example", "model": "policy-model",
+            "identity_sha256": "a" * 64,
+        }
+        generation_provider = {
             "host": "generator.example", "model": "generator-model",
             "identity_sha256": "c" * 64,
         }
@@ -51,6 +55,7 @@ class ProductionReadinessTest(unittest.TestCase):
                     "passed": True,
                     "evidence": (
                         {
+                            "generation_provider": generation_provider,
                             "agent_provider": agent_provider,
                             "runtime_provider": runtime_provider,
                         }
@@ -607,6 +612,11 @@ class ProductionReadinessTest(unittest.TestCase):
                     "model": "simulator-model",
                     "identity_sha256": "b" * 64,
                 },
+                "rollout_provider": {
+                    "host": "agent.example",
+                    "model": "policy-model",
+                    "identity_sha256": "a" * 64,
+                },
                 "bundle_attestation_key_identity_sha256": "e" * 64,
             },
             "holdout": holdouts[0], "holdouts": holdouts,
@@ -679,6 +689,17 @@ class ProductionReadinessTest(unittest.TestCase):
             history = self.make_history(Path(directory))
             history["config"]["runtime_provider"] = {
                 "host": "other.example", "model": "simulator-model",
+                "identity_sha256": "d" * 64,
+            }
+            report = self.certify(history)
+            self.assertFalse(report["certified"])
+            self.assertIn("production_preflight", report["failed_gates"])
+
+    def test_rollout_agent_provider_drift_cannot_certify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            history["config"]["rollout_provider"] = {
+                "host": "other.example", "model": "policy-model",
                 "identity_sha256": "d" * 64,
             }
             report = self.certify(history)

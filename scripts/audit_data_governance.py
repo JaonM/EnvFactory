@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from env_factory.data_governance import audit
+from env_factory.model_roles import resolve_model_roles
 
 
 def main() -> int:
@@ -20,17 +21,13 @@ def main() -> int:
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     load_dotenv(project / ".env")
-    agent_model = os.getenv("LLM_MODEL", "")
-    runtime_model = os.getenv("SANDBOX_LLM_MODEL") or agent_model
+    roles = resolve_model_roles(os.environ)
     report = audit(
         args.root.resolve(),
-        agent_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
-        agent_model=agent_model,
-        runtime_base_url=(
-            os.getenv("SANDBOX_LLM_BASE_URL")
-            or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-        ),
-        runtime_model=runtime_model,
+        agent_base_url=roles["agent"]["base_url"],
+        agent_model=roles["agent"]["model"],
+        runtime_base_url=roles["runtime"]["base_url"],
+        runtime_model=roles["runtime"]["model"],
     )
     output = args.output or args.root / "data_governance.json"
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

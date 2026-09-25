@@ -25,6 +25,9 @@ NEO4J_PASSWORD=your-password
 LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=your-model
+# 可选：不设置时逐字段回退到 LLM_*
+ROLLOUT_LLM_MODEL=your-policy-model
+SANDBOX_LLM_MODEL=your-user-and-judge-model
 LLM_TIMEOUT=60
 WIKIPEDIA_API_URL=https://zh.wikipedia.org/w/api.php
 WIKIPEDIA_TIMEOUT=10

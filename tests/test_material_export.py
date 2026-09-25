@@ -262,10 +262,15 @@ class MaterialExportTest(unittest.TestCase):
                             "passed": True,
                             "evidence": (
                                 {
-                                    "agent_provider": {
+                                    "generation_provider": {
                                         "host": "generator.example",
                                         "model": "generator-model",
                                         "identity_sha256": "c" * 64,
+                                    },
+                                    "agent_provider": {
+                                        "host": "agent.example",
+                                        "model": "policy",
+                                        "identity_sha256": "a" * 64,
                                     },
                                     "runtime_provider": {
                                         "host": "runtime.example",
