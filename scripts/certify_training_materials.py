@@ -585,6 +585,7 @@ def valid_provider_binding(item: Mapping[str, Any]) -> bool:
     """Bind rollout model identities to the provider governance authorization."""
     live = item.get("live_rollout")
     governance = _artifact(item, "data_governance.json")
+    calibration = _artifact(item, "agentic_training_value_live.json")
     providers = governance.get("providers")
     if not isinstance(live, Mapping) or not isinstance(providers, Mapping):
         return False
@@ -598,6 +599,7 @@ def valid_provider_binding(item: Mapping[str, Any]) -> bool:
         and live.get("runtime_model") == runtime.get("model")
         and live.get("runtime_provider_sha256")
             == runtime.get("identity_sha256")
+        and calibration.get("evaluator_provider") == runtime
     )
 
 

@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from env_factory.sandbox_http import HTTPSandboxClient
+from env_factory.data_governance import provider_identity
+from env_factory.runtime_llm import RuntimeLLMConfig
 
 
 PLACEHOLDERS = {"fixture-value", "example", "placeholder", "todo", "unknown", "test"}
@@ -128,6 +130,10 @@ def validate(
 ) -> dict[str, Any]:
     if evaluator_mode not in {"mock", "live"}:
         raise ValueError("evaluator_mode must be mock or live")
+    evaluator_provider = None
+    if evaluator_mode == "live":
+        runtime = RuntimeLLMConfig.from_env()
+        evaluator_provider = provider_identity(runtime.base_url, runtime.model)
     task = load(root / "task.json")
     contract = task.get("training_contract") if isinstance(task.get("training_contract"), Mapping) else {}
     category = contract.get("category", task.get("training_category", "multi_step_agentic"))
@@ -153,6 +159,7 @@ def validate(
             "validation_mode": (
                 "offline_mock" if evaluator_mode == "mock" else "live_evaluator"
             ),
+            "evaluator_provider": evaluator_provider,
             "failed_gates": ["scenario_coverage"],
             "evidence": evidence,
             "failures": failures,
@@ -356,6 +363,7 @@ def validate(
         "sandbox_profile": contract.get("sandbox_profile", category),
         "agentic_eligible": tool_required,
         "validation_mode": "offline_mock" if evaluator_mode == "mock" else "live_evaluator",
+        "evaluator_provider": evaluator_provider,
         "runtime_execution": runtime_execution,
         "hard_gates_passed": not failures,
         "failed_gates": failed_gates,

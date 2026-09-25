@@ -25,6 +25,7 @@ def load_script(name="certify_training_materials"):
 
 certifier = load_script()
 verifier = load_script("verify_training_materials")
+rollout_runner = load_script("run_live_rollout")
 
 
 class ProductionReadinessTest(unittest.TestCase):
@@ -297,6 +298,10 @@ class ProductionReadinessTest(unittest.TestCase):
             "agentic_training_ready": True,
             "hard_gates_passed": True,
             "validation_mode": "live_evaluator",
+            "evaluator_provider": {
+                "host": "runtime.example", "model": "simulator-model",
+                "identity_sha256": "b" * 64,
+            },
             "failed_gates": [],
             "failures": [],
             "runtime_execution": {
@@ -777,6 +782,39 @@ class ProductionReadinessTest(unittest.TestCase):
                 report["measurements"]["provider_identity_consistency"],
                 {"verified": 899, "expected": 900, "all_verified": False},
             )
+
+    def test_reward_evaluator_identity_must_match_data_governance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory), count=1, batches=1)
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            self.assertTrue(certifier.valid_provider_binding(result))
+            calibration_path = (
+                Path(result["output"]) / "agentic_training_value_live.json"
+            )
+            calibration = json.loads(calibration_path.read_text())
+            calibration["evaluator_provider"]["identity_sha256"] = "f" * 64
+            calibration_path.write_text(json.dumps(calibration))
+            self.assertFalse(certifier.valid_provider_binding(result))
+
+    def test_rollout_uses_governance_provider_identity_algorithm(self):
+        class Provider:
+            def __init__(self, base_url, model):
+                self.base_url = base_url
+                self.model = model
+
+        agent = Provider("https://agent.example/v1/", "policy-model")
+        runtime = Provider("https://runtime.example/v1", "simulator-model")
+        attestation = rollout_runner.rollout_provider_attestation(agent, runtime)
+        from env_factory.data_governance import provider_identity
+
+        self.assertEqual(
+            attestation["agent_provider_sha256"],
+            provider_identity(agent.base_url, agent.model)["identity_sha256"],
+        )
+        self.assertEqual(
+            attestation["runtime_provider_sha256"],
+            provider_identity(runtime.base_url, runtime.model)["identity_sha256"],
+        )
 
     def test_rollout_provider_digest_must_be_canonical_hex(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -11,7 +11,8 @@ from pathlib import Path
 import sys
 import tempfile
 from env_factory.llm import LLMClient
-from env_factory.material_artifacts import digest_json, portable_artifact_digest
+from env_factory.data_governance import provider_identity
+from env_factory.material_artifacts import portable_artifact_digest
 from env_factory.runtime_llm import RuntimeLLMConfig
 from env_factory.sandbox_http import HTTPSandboxClient
 from env_factory.sandbox_runtime import BusinessGoalEvaluator
@@ -218,6 +219,18 @@ def summarize_episodes(episodes, minimum_success_rate):
     }
 
 
+def rollout_provider_attestation(client, runtime):
+    """Use the governance identity algorithm for every rollout provider."""
+    return {
+        "agent_provider_sha256": provider_identity(
+            client.base_url, client.model
+        )["identity_sha256"],
+        "runtime_provider_sha256": provider_identity(
+            runtime.base_url, runtime.model
+        )["identity_sha256"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
@@ -271,13 +284,13 @@ def main():
             "mode": "in_process",
             "container_image_id": None,
         }
+    provider_attestation = rollout_provider_attestation(client, runtime)
     report = {"schema_version": "2.0", "material_visibility_version": "1.0",
               "mode": "live_rollout", "agent_model": client.model,
               "runtime_model": runtime.model, "episodes": [],
               "task_sha256": hashlib.sha256((root / "task.json").read_bytes()).hexdigest(),
               "sandbox_artifacts_digest": portable_artifact_digest(root),
-              "agent_provider_sha256": digest_json({"base_url": client.base_url, "model": client.model}),
-              "runtime_provider_sha256": digest_json({"base_url": runtime.base_url, "model": runtime.model}),
+              **provider_attestation,
               "runtime_execution": runtime_execution,
               "same_model_bias_possible": client.model == runtime.model,
               "live_rollout_verified": False, "passed": False}
