@@ -28,8 +28,8 @@ def run_production_preflight(
     project: Path,
     output_parent: Path,
     *,
-    signing_private_key: Path,
-    trusted_public_key: Path,
+    signing_private_key: Path | None,
+    trusted_public_key: Path | None,
     environment: Mapping[str, str] | None = None,
     runner: Runner = subprocess.run,
     which: Callable[[str], str | None] = shutil.which,
@@ -117,7 +117,7 @@ def run_production_preflight(
             public_identity = public_key_identity(trusted_public_key)
             signing_ready = private_identity == public_identity
             key_identity = public_identity if signing_ready else None
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError, TypeError):
             signing_ready = False
     record("bundle_signing_identity", signing_ready, {
         "key_identity_sha256": key_identity,
@@ -144,3 +144,40 @@ def run_production_preflight(
         "checks": checks,
     }
 
+
+REQUIRED_CHECKS = {
+    "project_contract",
+    "required_executables",
+    "docker_daemon",
+    "model_configuration",
+    "model_runtime_limits",
+    "bundle_signing_identity",
+    "workspace_capacity",
+}
+
+
+def valid_production_preflight(value: Mapping[str, Any] | Any) -> bool:
+    """Validate evidence produced by a fresh, trusted preflight execution."""
+    if not isinstance(value, Mapping) or value.get("version") != "1.0":
+        return False
+    if (
+        value.get("scope") != "production_pre_training_material_experiment"
+        or value.get("network_probe_performed") is not False
+        or value.get("ready") is not True
+        or value.get("failed_checks") != []
+    ):
+        return False
+    checks = value.get("checks")
+    if not isinstance(checks, list):
+        return False
+    by_name: dict[str, Mapping[str, Any]] = {}
+    for check in checks:
+        if not isinstance(check, Mapping) or not isinstance(check.get("name"), str):
+            return False
+        name = check["name"]
+        if name in by_name:
+            return False
+        by_name[name] = check
+    return set(by_name) == REQUIRED_CHECKS and all(
+        check.get("passed") is True for check in by_name.values()
+    )

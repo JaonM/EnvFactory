@@ -46,6 +46,11 @@ from env_factory.runtime_provenance import valid_container_rollout_execution
 from env_factory.sandbox_scoring import valid_score_report
 from env_factory.task_quality import score_file
 from env_factory.material_consumer import BUNDLE_VERSION
+from env_factory.production_preflight import (
+    REQUIRED_CHECKS,
+    run_production_preflight,
+    valid_production_preflight,
+)
 
 
 Z_95 = 1.959963984540054
@@ -729,9 +734,16 @@ def certify(
     *,
     project: Path | None = None,
     sandbox_revalidation: Mapping[str, Mapping[str, Any]] | None = None,
+    production_preflight: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     project = project or Path(__file__).resolve().parents[1]
-    recorded_execution = history.get("config", {}).get("execution_provenance")
+    config = history.get("config", {})
+    production_experiment = (
+        isinstance(config, Mapping)
+        and config.get("certification_profile") == "production"
+    )
+    preflight_verified = valid_production_preflight(production_preflight)
+    recorded_execution = config.get("execution_provenance") if isinstance(config, Mapping) else None
     execution_verification = verify_execution_provenance(project, recorded_execution)
     raw_holdouts = history.get("holdouts")
     if isinstance(raw_holdouts, list) and raw_holdouts:
@@ -1388,9 +1400,13 @@ def certify(
             "failures": generation_failures,
         },
         "execution_environment": execution_verification,
+        "production_experiment_profile": production_experiment,
+        "production_preflight": dict(production_preflight or {}),
     }
 
     gates = {
+        "production_experiment_profile": production_experiment,
+        "production_preflight": preflight_verified,
         "materialized_sample_size": (
             len(task_documents) >= policy["min_tasks"] * policy["min_holdout_batches"]
             and len(task_documents) == len(generated)
@@ -1577,16 +1593,26 @@ def main() -> int:
     history = load(args.history.resolve())
     policy = default_policy()
     project = args.project.resolve()
+    production_preflight = run_production_preflight(
+        project,
+        args.history.resolve().parent,
+        signing_private_key=args.bundle_signing_private_key,
+        trusted_public_key=args.bundle_trusted_public_key,
+        environment=os.environ,
+    )
     print(
         "production certification: re-executing sandbox evidence",
         file=sys.stderr,
     )
-    sandbox_revalidation = run_sandbox_revalidation(
-        history,
-        project=project,
-        policy=policy,
-        max_workers=args.revalidation_workers,
-        timeout=args.revalidation_timeout,
+    sandbox_revalidation = (
+        run_sandbox_revalidation(
+            history,
+            project=project,
+            policy=policy,
+            max_workers=args.revalidation_workers,
+            timeout=args.revalidation_timeout,
+        )
+        if production_preflight["ready"] else {}
     )
     print(
         "production certification: sandbox evidence revalidation complete "
@@ -1599,6 +1625,7 @@ def main() -> int:
         policy,
         project=project,
         sandbox_revalidation=sandbox_revalidation,
+        production_preflight=production_preflight,
     )
     from verify_training_materials import verify
     report = attach_artifact_verification(

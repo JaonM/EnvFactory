@@ -1307,12 +1307,44 @@ def main():
                     "rounds": reports, "holdout": holdouts[0], "holdouts": holdouts,
                 }
                 if args.certification_profile == "production":
+                    from env_factory.production_preflight import (
+                        run_production_preflight,
+                    )
                     from certify_training_materials import (
                         attach_artifact_verification, certify, default_policy,
+                        run_sandbox_revalidation,
                     )
                     policy = default_policy()
                     policy["score_threshold"] = args.threshold
-                    certification = certify(history, policy, project=project)
+                    certification_preflight = run_production_preflight(
+                        project,
+                        root.parent,
+                        signing_private_key=bundle_private_key,
+                        trusted_public_key=bundle_public_key,
+                        environment=os.environ,
+                        minimum_free_bytes=int(minimum_free_gib * 1024**3),
+                    )
+                    write_json(
+                        root / "production_certification_preflight.json",
+                        certification_preflight,
+                    )
+                    sandbox_revalidation = (
+                        run_sandbox_revalidation(
+                            history,
+                            project=project,
+                            policy=policy,
+                            max_workers=args.max_concurrency,
+                            timeout=args.score_timeout,
+                        )
+                        if certification_preflight["ready"] else {}
+                    )
+                    certification = certify(
+                        history,
+                        policy,
+                        project=project,
+                        sandbox_revalidation=sandbox_revalidation,
+                        production_preflight=certification_preflight,
+                    )
                     from verify_training_materials import verify
                     certification = attach_artifact_verification(
                         certification,

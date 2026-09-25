@@ -30,6 +30,20 @@ rollout_runner = load_script("run_live_rollout")
 
 class ProductionReadinessTest(unittest.TestCase):
     @staticmethod
+    def production_preflight():
+        return {
+            "version": "1.0",
+            "scope": "production_pre_training_material_experiment",
+            "network_probe_performed": False,
+            "ready": True,
+            "failed_checks": [],
+            "checks": [
+                {"name": name, "passed": True, "evidence": {}}
+                for name in sorted(certifier.REQUIRED_CHECKS)
+            ],
+        }
+
+    @staticmethod
     def sandbox_revalidation(history):
         revalidation = {}
         for holdout in history.get("holdouts", []):
@@ -55,6 +69,7 @@ class ProductionReadinessTest(unittest.TestCase):
             history,
             certifier.default_policy(),
             sandbox_revalidation=self.sandbox_revalidation(history),
+            production_preflight=self.production_preflight(),
         )
 
     @staticmethod
@@ -555,6 +570,7 @@ class ProductionReadinessTest(unittest.TestCase):
         ))
         return {
             "config": {
+                "certification_profile": "production",
                 "source_digest": "evaluator-source-v1",
                 "execution_provenance": certifier.verify_execution_provenance(
                     ROOT, {}
@@ -596,6 +612,8 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertTrue(report["gates"]["container_reproducibility"])
             self.assertTrue(report["gates"]["trajectory_privacy"])
             self.assertTrue(report["gates"]["execution_environment"])
+            self.assertTrue(report["gates"]["production_experiment_profile"])
+            self.assertTrue(report["gates"]["production_preflight"])
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
             self.assertEqual(report["materials_manifest"]["version"], "4.0")
             self.assertRegex(
@@ -608,6 +626,25 @@ class ProductionReadinessTest(unittest.TestCase):
                 "evaluator-source-v1",
             )
             self.assertEqual(len(report["materials_manifest"]["dataset_sha256"]), 64)
+
+    def test_pilot_profile_cannot_claim_production_certification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            history["config"]["certification_profile"] = "pilot"
+            report = self.certify(history)
+            self.assertFalse(report["certified"])
+            self.assertIn("production_experiment_profile", report["failed_gates"])
+
+    def test_missing_production_preflight_cannot_certify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            report = certifier.certify(
+                history,
+                certifier.default_policy(),
+                sandbox_revalidation=self.sandbox_revalidation(history),
+            )
+            self.assertFalse(report["certified"])
+            self.assertIn("production_preflight", report["failed_gates"])
 
     def test_execution_environment_drift_breaks_certification(self):
         with tempfile.TemporaryDirectory() as directory:

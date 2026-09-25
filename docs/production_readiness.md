@@ -14,6 +14,11 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 
 `scripts/certify_training_materials.py` 读取冻结实验的 `history.json`，使用以下默认策略：
 
+- 只接受由 `certification_profile=production` 启动的实验；pilot 历史即使人工补齐数量也不能升级为生产认证。
+- 认证时重新执行 production preflight，复核 Docker daemon、模型/runtime 配置、签名密钥配对、运行参数与
+  工作区容量，并由循环写入 `production_certification_preflight.json`。实验启动时的
+  `production_preflight.json` 仅用于诊断，不能替代认证阶段的新鲜检查。
+
 - 连续 3 个独立留出批次，每批至少 300 个实际生成的新任务；开发阶段和各留出批次之间的 seed、
   任务内容均不重叠。
 - 任务良品率不低于 90%，Wilson 95% 置信区间下界不低于 85%。

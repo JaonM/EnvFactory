@@ -4,7 +4,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from env_factory.production_preflight import run_production_preflight
+from env_factory.production_preflight import (
+    run_production_preflight,
+    valid_production_preflight,
+)
 
 
 class Usage:
@@ -56,6 +59,7 @@ class ProductionPreflightTest(unittest.TestCase):
                     disk_usage=lambda path: Usage(),
                 )
             self.assertTrue(report["ready"])
+            self.assertTrue(valid_production_preflight(report))
             self.assertNotIn("secret-value", str(report))
             model = next(
                 item for item in report["checks"]
@@ -79,6 +83,7 @@ class ProductionPreflightTest(unittest.TestCase):
                 disk_usage=lambda path: type("Low", (), {"free": 1})(),
             )
             self.assertFalse(report["ready"])
+            self.assertFalse(valid_production_preflight(report))
             self.assertEqual(
                 set(report["failed_checks"]),
                 {
@@ -87,6 +92,18 @@ class ProductionPreflightTest(unittest.TestCase):
                     "workspace_capacity",
                 },
             )
+
+    def test_preflight_validator_rejects_forged_or_incomplete_evidence(self):
+        self.assertFalse(valid_production_preflight({"ready": True}))
+        report = {
+            "version": "1.0",
+            "scope": "production_pre_training_material_experiment",
+            "network_probe_performed": False,
+            "ready": True,
+            "failed_checks": [],
+            "checks": [],
+        }
+        self.assertFalse(valid_production_preflight(report))
 
 
 if __name__ == "__main__":
