@@ -261,6 +261,54 @@ def valid_reward_calibration(
     )
 
 
+def valid_training_readiness(report: Mapping[str, Any]) -> bool:
+    """Validate the complete deterministic runtime evidence envelope."""
+    evidence = report.get("evidence")
+    if not isinstance(evidence, Mapping):
+        return False
+    state_causality = evidence.get("state_causality")
+    rewards = evidence.get("rewards")
+    observation = evidence.get("observation_scan")
+    runtime = evidence.get("runtime_state")
+    if not all(isinstance(value, Mapping) for value in (
+        state_causality, rewards, observation, runtime,
+    )):
+        return False
+    success = rewards.get("success")
+    failure = rewards.get("failure")
+    reward_separated = (
+        isinstance(success, (int, float))
+        and not isinstance(success, bool)
+        and isinstance(failure, (int, float))
+        and not isinstance(failure, bool)
+        and success > failure
+        and success - failure >= 0.1
+    )
+    return (
+        report.get("training_ready") is True
+        and report.get("validation_mode") == "offline_mock"
+        and report.get("live_rollout_verified") is False
+        and report.get("hard_gates_passed") is True
+        and report.get("failed_gates") == []
+        and report.get("failures") == []
+        and evidence.get("determinism") is True
+        and isinstance(state_causality.get("archetype"), str)
+        and bool(state_causality["archetype"])
+        and isinstance(state_causality.get("expected_delta"), list)
+        and state_causality.get("invalid") == []
+        and reward_separated
+        and observation.get("status") == 200
+        and observation.get("forbidden_paths") == []
+        and runtime.get("reset_reproducible") is True
+        and runtime.get("episode_isolation") is True
+        and runtime.get("replay_consistent") is True
+        and isinstance(runtime.get("episode_a_event_count"), int)
+        and not isinstance(runtime.get("episode_a_event_count"), bool)
+        and runtime["episode_a_event_count"] >= 1
+        and runtime.get("episode_b_event_count") == 0
+    )
+
+
 def valid_user_turn(step: Mapping[str, Any]) -> bool:
     result = step.get("result")
     return (
@@ -772,15 +820,13 @@ def certify(
         and report.get("eligible_for_policy_training_export") is True
         for item, report in zip(qualified, privacy_reports)
     )
-    runtime_integrity = bool(readiness_reports) and all(
-        report.get("training_ready") is True
-        and report.get("evidence", {}).get("determinism") is True
-        and report.get("evidence", {}).get("observation_scan", {}).get("forbidden_paths") == []
-        and all(
-            report.get("evidence", {}).get("runtime_state", {}).get(key) is True
-            for key in ("reset_reproducible", "episode_isolation", "replay_consistent")
-        )
-        for report in readiness_reports
+    verified_readiness_reports = sum(
+        valid_training_readiness(report) for report in readiness_reports
+    )
+    runtime_integrity = (
+        bool(qualified)
+        and len(readiness_reports) == len(qualified)
+        and verified_readiness_reports == len(qualified)
     )
     qualified_tasks = []
     for item in qualified:
@@ -981,6 +1027,10 @@ def certify(
         ),
         "user_simulator_outcomes": dict(user_outcomes),
         "runtime_integrity": runtime_integrity,
+        "runtime_readiness_coverage": {
+            "verified": verified_readiness_reports,
+            "expected": len(qualified),
+        },
         "tool_and_reward_integrity": tool_and_reward_integrity,
         "reward_calibration_coverage": {
             "verified": verified_reward_calibrations,

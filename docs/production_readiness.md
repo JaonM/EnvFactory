@@ -46,6 +46,8 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 真实 User Simulator 轨迹至少覆盖 3 类结果，同时包含成功/接受类结果和需要继续交互或恢复的结果，
   防止只验证“用户永远接受”的退化模拟器。
 - 每个合格沙箱的固定 seed reset、episode 隔离、replay 稳定性、隐藏字段扫描和确定性验证全部通过。
+  认证器还会核对 readiness 报告的 hard-gate/failure 集合、成功与失败奖励间隔、observation HTTP 状态、
+  两个隔离 episode 的事件计数和完整证据结构；只有若干顶层 `true` 的手写报告不合格。
 - 每个合格沙箱必须实际完成 Docker 构建，并在禁网、只读根文件系统、非 root、丢弃全部 capabilities、
   `no-new-privileges` 和资源上限下通过容器内 pytest smoke test。基础镜像必须解析并固化为
   `sha256` 内容地址，测试依赖必须精确锁版本；镜像 ID、平台、Dockerfile 和依赖摘要由认证器独立复核。

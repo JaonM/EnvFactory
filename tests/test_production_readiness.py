@@ -178,13 +178,24 @@ class ProductionReadinessTest(unittest.TestCase):
         }))
         (evidence / "training_readiness.json").write_text(json.dumps({
             "training_ready": True,
+            "validation_mode": "offline_mock",
+            "live_rollout_verified": False,
+            "hard_gates_passed": True,
+            "failed_gates": [],
+            "failures": [],
             "evidence": {
                 "determinism": True,
-                "observation_scan": {"forbidden_paths": []},
+                "state_causality": {
+                    "archetype": "fixture", "expected_delta": [], "invalid": [],
+                },
+                "rewards": {"success": 1.0, "failure": 0.0},
+                "observation_scan": {"status": 200, "forbidden_paths": []},
                 "runtime_state": {
                     "reset_reproducible": True,
                     "episode_isolation": True,
                     "replay_consistent": True,
+                    "episode_a_event_count": 1,
+                    "episode_b_event_count": 0,
                 },
             },
         }))
@@ -770,6 +781,34 @@ class ProductionReadinessTest(unittest.TestCase):
         self.assertTrue(certifier.valid_reward_calibration(report, task))
         del report["evidence"]["counterfactuals"]["skipped_tool_2"]
         self.assertFalse(certifier.valid_reward_calibration(report, task))
+
+    def test_runtime_readiness_requires_complete_executable_evidence(self):
+        report = {
+            "training_ready": True,
+            "validation_mode": "offline_mock",
+            "live_rollout_verified": False,
+            "hard_gates_passed": True,
+            "failed_gates": [],
+            "failures": [],
+            "evidence": {
+                "determinism": True,
+                "state_causality": {
+                    "archetype": "single_read", "expected_delta": [], "invalid": [],
+                },
+                "rewards": {"success": 1.0, "failure": 0.0},
+                "observation_scan": {"status": 200, "forbidden_paths": []},
+                "runtime_state": {
+                    "reset_reproducible": True,
+                    "episode_isolation": True,
+                    "replay_consistent": True,
+                    "episode_a_event_count": 2,
+                    "episode_b_event_count": 0,
+                },
+            },
+        }
+        self.assertTrue(certifier.valid_training_readiness(report))
+        del report["evidence"]["runtime_state"]["episode_b_event_count"]
+        self.assertFalse(certifier.valid_training_readiness(report))
 
     def test_credential_finding_breaks_data_governance_gate(self):
         with tempfile.TemporaryDirectory() as directory:
