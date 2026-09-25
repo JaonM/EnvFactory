@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from score_sandbox import Check, contract_check, evaluate, score_checks
+from score_sandbox import Check, evaluate, rubric_check, score_checks
 
 
 def load(path: Path) -> Any:
@@ -92,7 +92,9 @@ def evaluate_offline(root: Path, *, project: Path, threshold: float) -> dict[str
     checks = []
     for item in result["checks"]:
         if item["name"] == "semantic_business_fidelity":
-            checks.append(Check(item["name"], item["weight"], semantic_ok, semantic_evidence, True))
+            checks.append(rubric_check(
+                item["name"], semantic_ok, semantic_evidence,
+            ))
         else:
             checks.append(Check(**item))
     scored = score_checks(checks, threshold=threshold)

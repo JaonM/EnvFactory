@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from env_factory.sandbox_scoring import evidence_fingerprint
+from env_factory.sandbox_scoring import RUBRIC_BY_NAME, evidence_fingerprint
 
 
 REQUIRED_FILES = (
@@ -28,6 +28,11 @@ class Check(NamedTuple):
     passed: bool
     evidence: str
     critical: bool = False
+
+
+def rubric_check(name: str, passed: bool, evidence: str) -> Check:
+    spec = RUBRIC_BY_NAME[name]
+    return Check(name, spec["weight"], passed, evidence, spec["critical"])
 
 
 def score_checks(checks: list[Check], *, threshold: float = 8.0) -> dict[str, Any]:
@@ -97,13 +102,20 @@ def evaluate(root: Path, *, project: Path, execute: bool, threshold: float, offl
     except (OSError, json.JSONDecodeError):
         status = {}
     delivery_ok = not missing and status.get("success") is True
-    checks = [Check("delivery_integrity", 1.0, delivery_ok, f"missing={missing}; status={status.get('status')}", True)]
+    checks = [rubric_check(
+        "delivery_integrity", delivery_ok,
+        f"missing={missing}; status={status.get('status')}",
+    )]
 
     contract_ok, contract_evidence = contract_check(root)
-    checks.append(Check("contract_and_tool_identity", 1.0, contract_ok, contract_evidence, True))
+    checks.append(rubric_check(
+        "contract_and_tool_identity", contract_ok, contract_evidence,
+    ))
 
     review_ok, review_evidence, review_score = review_check(root)
-    checks.append(Check("semantic_business_fidelity", 0.5, review_ok, review_evidence, True))
+    checks.append(rubric_check(
+        "semantic_business_fidelity", review_ok, review_evidence,
+    ))
 
     if execute:
         env = os.environ.copy()
@@ -165,13 +177,13 @@ def evaluate(root: Path, *, project: Path, execute: bool, threshold: float, offl
         }, ensure_ascii=False)
 
     checks.extend([
-        Check("business_acceptance", 1.0, acceptance_ok, acceptance_out, True),
-        Check("sandbox_pytest", 1.0, pytest_ok, pytest_out, True),
-        Check("runtime_genericity", 0.5, runtime_ok, runtime_out, True),
-        Check("outer_conformance", 1.0, outer_ok, outer_out, True),
-        Check("mutation_resistance", 1.0, mutation_ok, mutation_out, True),
-        Check("training_readiness", 1.0, readiness_ok, readiness_out, True),
-        Check("declared_training_policy", 2.0, agentic_ok, agentic_out, True),
+        rubric_check("business_acceptance", acceptance_ok, acceptance_out),
+        rubric_check("sandbox_pytest", pytest_ok, pytest_out),
+        rubric_check("runtime_genericity", runtime_ok, runtime_out),
+        rubric_check("outer_conformance", outer_ok, outer_out),
+        rubric_check("mutation_resistance", mutation_ok, mutation_out),
+        rubric_check("training_readiness", readiness_ok, readiness_out),
+        rubric_check("declared_training_policy", agentic_ok, agentic_out),
     ])
     result = score_checks(checks, threshold=threshold)
     result.update({

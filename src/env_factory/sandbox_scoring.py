@@ -8,17 +8,22 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-REQUIRED_CHECKS = {
-    "delivery_integrity",
-    "contract_and_tool_identity",
-    "semantic_business_fidelity",
-    "business_acceptance",
-    "sandbox_pytest",
-    "runtime_genericity",
-    "outer_conformance",
-    "mutation_resistance",
-    "training_readiness",
-    "declared_training_policy",
+SCORE_RUBRIC = (
+    ("delivery_integrity", 1.0, True),
+    ("contract_and_tool_identity", 1.0, True),
+    ("semantic_business_fidelity", 0.5, True),
+    ("business_acceptance", 1.0, True),
+    ("sandbox_pytest", 1.0, True),
+    ("runtime_genericity", 0.5, True),
+    ("outer_conformance", 1.0, True),
+    ("mutation_resistance", 1.0, True),
+    ("training_readiness", 1.0, True),
+    ("declared_training_policy", 2.0, True),
+)
+REQUIRED_CHECKS = frozenset(name for name, _, _ in SCORE_RUBRIC)
+RUBRIC_BY_NAME = {
+    name: {"weight": weight, "critical": critical}
+    for name, weight, critical in SCORE_RUBRIC
 }
 
 
@@ -98,7 +103,13 @@ def valid_score_report(
             raw += float(weight)
         elif check["critical"]:
             failed_critical.append(name)
-    if len(names) != len(set(names)) or set(names) != REQUIRED_CHECKS:
+    if names != [name for name, _, _ in SCORE_RUBRIC]:
+        return False
+    if any(
+        check["weight"] != RUBRIC_BY_NAME[check["name"]]["weight"]
+        or check["critical"] is not RUBRIC_BY_NAME[check["name"]]["critical"]
+        for check in checks
+    ):
         return False
     score = round(raw, 2)
     eligible = not failed_critical

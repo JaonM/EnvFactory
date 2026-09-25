@@ -4,7 +4,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from env_factory.sandbox_scoring import evidence_fingerprint
+from env_factory.sandbox_scoring import (
+    SCORE_RUBRIC,
+    evidence_fingerprint,
+    valid_score_report,
+)
 from env_factory.task_quality import score_file
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -664,6 +668,39 @@ class ProductionReadinessTest(unittest.TestCase):
                 report["measurements"]["sandbox_score_provenance"],
                 {"verified": 899, "failures": 1},
             )
+
+    def test_sandbox_score_rubric_weights_and_critical_flags_are_immutable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = {
+                "score": 10.0, "eligible": True, "passed": True,
+                "threshold": 8.0, "failed_critical_gates": [],
+                "checks": [
+                    {
+                        "name": name, "weight": weight, "passed": True,
+                        "evidence": "verified", "critical": critical,
+                    }
+                    for name, weight, critical in SCORE_RUBRIC
+                ],
+                "mode": "offline_executable", "network_used": False,
+                "model_used": False, "live_rollout_verified": False,
+                "model": "gpt-5.6-luna", "review_model": "gpt-5.6-luna",
+                "evidence_fingerprint": evidence_fingerprint(root, ROOT),
+            }
+            self.assertTrue(valid_score_report(
+                report, root=root, project=ROOT, threshold=8.0,
+            ))
+            report["checks"][0]["weight"] = 2.0
+            report["score"] = 11.0
+            self.assertFalse(valid_score_report(
+                report, root=root, project=ROOT, threshold=8.0,
+            ))
+            report["checks"][0]["weight"] = 1.0
+            report["score"] = 10.0
+            report["checks"][0]["critical"] = False
+            self.assertFalse(valid_score_report(
+                report, root=root, project=ROOT, threshold=8.0,
+            ))
 
     def test_task_score_and_category_are_recomputed_from_frozen_task(self):
         with tempfile.TemporaryDirectory() as directory:
