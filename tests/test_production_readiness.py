@@ -174,6 +174,7 @@ class ProductionReadinessTest(unittest.TestCase):
                 ]
                 result = {
                     "task_path": str(task), "output": str(evidence),
+                    "container_image_tag": "fixture",
                     "sample_seed": global_index + 1000,
                     "category": (
                         "direct_response" if index % 10 < 2

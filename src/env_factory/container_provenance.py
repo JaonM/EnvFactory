@@ -29,7 +29,9 @@ def exact_requirements(path: Path) -> bool:
     return bool(values) and all(EXACT_REQUIREMENT.fullmatch(line) for line in values)
 
 
-def verify_container_provenance(root: Path) -> dict[str, Any]:
+def verify_container_provenance(
+    root: Path, *, expected_tag: str | None = None
+) -> dict[str, Any]:
     failures = []
     metadata_path = root / "docker_image_metadata.json"
     dockerfile = root / "Dockerfile"
@@ -44,6 +46,8 @@ def verify_container_provenance(root: Path) -> dict[str, Any]:
         metadata = {}
     if PINNED_IMAGE.fullmatch(str(metadata.get("base_image", ""))) is None:
         failures.append("base_image_digest")
+    if expected_tag is not None and metadata.get("tag") != expected_tag:
+        failures.append("image_tag")
     if CONTENT_DIGEST.fullmatch(str(metadata.get("image_id", ""))) is None:
         failures.append("image_id")
     try:
@@ -56,6 +60,8 @@ def verify_container_provenance(root: Path) -> dict[str, Any]:
     from_images = re.findall(r"(?im)^\s*FROM\s+([^\s]+)", dockerfile_text)
     if not from_images or any(PINNED_IMAGE.fullmatch(image) is None for image in from_images):
         failures.append("dockerfile_base_image")
+    elif any(image != metadata.get("base_image") for image in from_images):
+        failures.append("base_image_mismatch")
     users = re.findall(r"(?im)^\s*USER\s+([^\s]+)", dockerfile_text)
     runtime_user = str(metadata.get("runtime_user", ""))
     if (
@@ -97,6 +103,7 @@ def verify_container_provenance(root: Path) -> dict[str, Any]:
         "verified": not failures,
         "failed_gates": sorted(set(failures)),
         "base_image": metadata.get("base_image"),
+        "tag": metadata.get("tag"),
         "image_id": metadata.get("image_id"),
         "platform": metadata.get("platform"),
     }

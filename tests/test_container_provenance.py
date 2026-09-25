@@ -49,6 +49,7 @@ class ContainerProvenanceTest(unittest.TestCase):
         requirements.write_text("pluggy==1.6.0\npytest==9.1.1\n")
         metadata = {
             "version": "2.0",
+            "tag": "fixture",
             "base_image": image,
             "image_id": "sha256:" + "b" * 64,
             "runtime_user": "sandbox",
@@ -71,7 +72,9 @@ class ContainerProvenanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.fixture(root)
-            self.assertTrue(verify_container_provenance(root)["verified"])
+            self.assertTrue(verify_container_provenance(
+                root, expected_tag="fixture"
+            )["verified"])
 
     def test_floating_base_image_and_dependency_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -101,6 +104,17 @@ class ContainerProvenanceTest(unittest.TestCase):
             report = verify_container_provenance(root)
             self.assertIn("requirements_digest", report["failed_gates"])
             self.assertIn("non_root_user", report["failed_gates"])
+
+    def test_expected_attempt_tag_and_base_image_are_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = self.fixture(root)
+            metadata["tag"] = "other-attempt"
+            metadata["base_image"] = "registry.example/other@sha256:" + "c" * 64
+            (root / "docker_image_metadata.json").write_text(json.dumps(metadata))
+            report = verify_container_provenance(root, expected_tag="fixture")
+            self.assertIn("image_tag", report["failed_gates"])
+            self.assertIn("base_image_mismatch", report["failed_gates"])
 
 
 if __name__ == "__main__":

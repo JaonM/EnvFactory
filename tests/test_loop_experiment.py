@@ -25,6 +25,15 @@ rollout = load("run_live_rollout")
 
 
 class ExperimentTest(unittest.TestCase):
+    def test_concurrent_attempts_receive_distinct_stable_container_tags(self):
+        first = loop.sandbox_image_tag(Path("/tmp/experiment/sample-1/attempt-1"))
+        second = loop.sandbox_image_tag(Path("/tmp/experiment/sample-2/attempt-1"))
+        self.assertEqual(first, loop.sandbox_image_tag(
+            Path("/tmp/experiment/sample-1/attempt-1")
+        ))
+        self.assertNotEqual(first, second)
+        self.assertRegex(first, r"^envfactory-sandbox-[0-9a-f]{20}$")
+
     def test_zero_round_limit_is_unbounded(self):
         self.assertEqual(list(itertools.islice(loop.round_numbers(0), 25))[-1], 25)
         self.assertEqual(list(loop.round_numbers(3)), [1, 2, 3])
@@ -285,6 +294,12 @@ class ExperimentTest(unittest.TestCase):
             self.assertEqual(
                 build_command[build_command.index("--runtime") + 1], "docker"
             )
+            image_tag = build_command[build_command.index("--tag") + 1]
+            cleanup_command = next(
+                command for command in commands
+                if command[:3] == ["docker", "image", "rm"]
+            )
+            self.assertEqual(cleanup_command[-1], image_tag)
             governance_index = next(
                 index for index, command in enumerate(commands)
                 if "audit_data_governance.py" in " ".join(command)

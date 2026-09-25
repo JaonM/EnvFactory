@@ -149,7 +149,10 @@ awk -v image="$selected" '
   { print }
 ' "$dockerfile" > "$resolved_dockerfile"
 
-docker build --pull --file "$resolved_dockerfile" --tag "$tag" "$context"
+# Make the portable source identical to the context whose image is measured.
+# In particular, COPY . . must not embed the earlier floating-tag Dockerfile.
+cp "$resolved_dockerfile" "$dockerfile"
+docker build --pull --file "$dockerfile" --tag "$tag" "$context"
 # Keep a machine-readable image provenance record beside the sandbox.
 image_id="$(docker image inspect --format '{{.Id}}' "$tag")"
 image_user="$(docker image inspect --format '{{.Config.User}}' "$tag")"
@@ -175,8 +178,6 @@ docker run --rm --network none --read-only \
   -e SANDBOX_EVALUATOR_MOCK=1 \
   -e PYTHONDONTWRITEBYTECODE=1 \
   "$tag" python3 -m pytest -q -p no:cacheprovider
-# Publish the exact image identity used by this build into the portable source.
-cp "$resolved_dockerfile" "$dockerfile"
 python3 - "$context/docker_image_metadata.json" "$tag" "$selected" "$image_id" \
   "$image_os" "$image_arch" "$image_user" "$dockerfile" "$context/requirements-dev.txt" <<'PY'
 import hashlib

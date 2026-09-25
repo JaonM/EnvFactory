@@ -65,7 +65,9 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 
 `build_docker_sandbox_image.sh` 将可达镜像标签解析为当前 Docker 平台的 manifest digest，以该内容地址
 构建并回写最终 Dockerfile；随后在生产安全参数下执行镜像内测试，成功后才写
-`docker_image_metadata.json`。没有这份可复核证据的沙箱不能通过生产准备认证。
+`docker_image_metadata.json`。每个并发 attempt 使用由其输出路径派生的唯一镜像 tag，认证时要求 tag、
+Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时镜像，只把内容身份和可重建源码纳入
+训练素材。没有这份可复核证据的沙箱不能通过生产准备认证。
 
 ## 结果解释
 

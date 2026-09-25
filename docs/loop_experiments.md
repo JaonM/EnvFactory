@@ -42,7 +42,8 @@ Pilot 通过只表示可以进入更大规模认证，
 - `--validation offline` 只执行离线门禁，不能证明真实训练质量；默认 `live` 会追加真实模型 rollout。
 - `--certification-profile production` 强制 `--sandbox-runtime docker`，每个候选环境必须实际构建内容寻址
   镜像并通过安全容器 smoke test；不能用 `none` 生成生产认证。pilot 可显式设置
-  `--sandbox-runtime none`，但其结果仍只表示候选流程验证。
+  `--sandbox-runtime none`，但其结果仍只表示候选流程验证。并发 worker 使用互不相同的本地镜像 tag；
+  smoke evidence 写入后立即移除临时镜像，避免大规模留出集发生 tag 串样或耗尽 Docker 存储。
 - `--rollout-episodes 3 --rollout-steps 20` 控制开发阶段每个沙箱的轨迹次数和步数。开发阶段默认只要求至少
   一条成功证据；`--rollout-min-success-rate` 可提高该门槛。生产留出集默认使用 10 次 episode 和
   `--holdout-rollout-success-rate 0.6666666666666666`。

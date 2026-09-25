@@ -408,7 +408,10 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         for item, report in zip(qualified, governance_reports)
     )
     container_reports = [
-        verify_container_provenance(Path(str(item.get("output", ""))))
+        verify_container_provenance(
+            Path(str(item.get("output", ""))),
+            expected_tag=str(item.get("container_image_tag", "")),
+        )
         for item in qualified
     ]
     reproducible_containers = sum(

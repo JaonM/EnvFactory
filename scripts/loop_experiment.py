@@ -122,6 +122,12 @@ def input_digest(path):
     return digest.hexdigest()
 
 
+def sandbox_image_tag(output: Path) -> str:
+    """Give every concurrent attempt a collision-resistant local image tag."""
+    identity = hashlib.sha256(str(output.resolve()).encode("utf-8")).hexdigest()[:20]
+    return f"envfactory-sandbox-{identity}"
+
+
 def failure(stage, detail, **extra):
     targets = {"generation": "task_pipeline", "task_quality": "task_contract",
                "build": "sandbox_builder", "offline_validation": "runtime_or_contract",
@@ -350,10 +356,13 @@ def build_one(project, task_path, output, config, seed=None):
                 shutil.copytree(source, output / name)
             elif source.is_file():
                 shutil.copy2(source, output / name)
+    image_tag = sandbox_image_tag(output)
+    common["container_image_tag"] = image_tag
     command = ["bash", str(project / "scripts/develop_sandbox_with_agent.sh"),
                "--input", str(task_path), "--output", str(output), "--agent", "codex",
                "--review-agent", "codex", "--model", MODEL, "--review-model", MODEL,
                "--runtime", config.get("sandbox_runtime", "none"),
+               "--tag", image_tag,
                "--max-attempts", str(config["max_attempts"]),
                "--foreground", "--skip-auto-score"]
     if seed:
@@ -374,6 +383,18 @@ def build_one(project, task_path, output, config, seed=None):
     assert built is not None
     common["build"] = built
     common["build_attempts"] = build_attempts
+    if config.get("sandbox_runtime", "none") == "docker":
+        cleanup = run_process(
+            ["docker", "image", "rm", image_tag],
+            project,
+            output / "container_cleanup.log",
+            min(config.get("score_timeout", 1800), 120),
+        )
+        common["container_cleanup"] = cleanup
+        if built["exit_code"] == 0 and cleanup["exit_code"] != 0:
+            return failure(
+                "infrastructure", "validated container image cleanup failed", **common
+            )
     if built["exit_code"] != 0:
         buildability_path = output / "buildability.json"
         if buildability_path.is_file():
