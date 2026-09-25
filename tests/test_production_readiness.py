@@ -24,6 +24,7 @@ class ProductionReadinessTest(unittest.TestCase):
     def make_history(self, root: Path, *, count: int = 300, batches: int = 3):
         evidence = root / "evidence"
         evidence.mkdir()
+        (evidence / "app.py").write_text("# immutable sandbox\n")
         (evidence / "training_readiness.json").write_text(json.dumps({
             "training_ready": True,
             "evidence": {
@@ -58,11 +59,23 @@ class ProductionReadinessTest(unittest.TestCase):
                 task.write_text(json.dumps({"task": description}))
                 episodes = [
                 {
-                    "seed": episode, "agent_success": episode < 8,
+                    "schema_version": "2.0", "seed": episode, "agent_success": episode < 8,
                     "termination": "completed" if episode < 8 else "step_budget",
                     "initial_reward": 0.0, "final_reward": 1.0 if episode < 8 else 0.0,
                     "issues": [], "usage": [], "initial_state": {}, "final_state": {},
                     "replay": {"events": []},
+                    "transitions": [{
+                        "step": 0,
+                        "agent_input": [{"role": "user", "content": "do it"}],
+                        "assistant_output": '{"kind":"respond","content":"done"}',
+                        "observation": {},
+                        "action": {"kind": "respond", "content": "done"},
+                        "result": {"status": 200},
+                        "next_observation": {},
+                        "reward": 1.0 if episode < 8 else 0.0,
+                        "terminated": episode < 8,
+                        "truncated": episode >= 8,
+                    }],
                     "trajectory": [
                         {
                             "method": "GET", "path": "/v1/reward", "status": 200,
@@ -96,7 +109,10 @@ class ProductionReadinessTest(unittest.TestCase):
                 "jobs": jobs,
                 "summary": {"fresh_tasks_verified": True},
             })
-        return {"holdout": holdouts[0], "holdouts": holdouts}
+        return {
+            "config": {"source_digest": "evaluator-source-v1"},
+            "holdout": holdouts[0], "holdouts": holdouts,
+        }
 
     def test_wilson_bound_accounts_for_sample_size(self):
         self.assertLess(certifier.wilson_lower(9, 10), .9)
@@ -111,6 +127,11 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertIn("rl_training_convergence", report["does_not_certify"])
             self.assertEqual(report["measurements"]["episodes"], 9000)
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
+            self.assertEqual(report["materials_manifest"]["version"], "2.0")
+            self.assertEqual(
+                report["materials_manifest"]["evaluator_source_digest"],
+                "evaluator-source-v1",
+            )
             self.assertEqual(len(report["materials_manifest"]["dataset_sha256"]), 64)
 
     def test_pilot_sized_holdout_cannot_claim_production_certification(self):
@@ -174,6 +195,62 @@ class ProductionReadinessTest(unittest.TestCase):
         })
         self.assertFalse(report["certified"])
         self.assertIn("material_artifacts_immutable", report["failed_gates"])
+
+    def test_v2_manifest_tracks_sandbox_files_independently_of_evaluator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = root / "task.json"
+            app = root / "app.py"
+            rollout = {"episodes": []}
+            task.write_text('{"task":"immutable"}')
+            app.write_text("# v1\n")
+            (root / "live_rollout.json").write_text(json.dumps(rollout))
+            item = {
+                "task_path": str(task),
+                "task_sha256": __import__("hashlib").sha256(task.read_bytes()).hexdigest(),
+                "sandbox_root": str(root),
+                "sandbox_evidence_fingerprint": "historical-evaluator-proof",
+                "sandbox_artifacts_sha256": verifier.portable_artifact_digests(root),
+                "rollout_sha256": verifier.digest_json(rollout),
+                "episode_count": 0,
+            }
+            manifest = {
+                "version": "2.0", "kind": "agentic_rl_pretraining_materials",
+                "evaluator_source_digest": "old-evaluator", "items": [item],
+            }
+            manifest["dataset_sha256"] = verifier.digest_json(manifest)
+            self.assertTrue(verifier.verify(manifest, ROOT)["verified"])
+            app.write_text("# changed\n")
+            report = verifier.verify(manifest, ROOT)
+            self.assertFalse(report["verified"])
+            self.assertIn("sandbox_digest", report["failed_gates"])
+
+    def test_v2_manifest_detects_added_executable_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = root / "task.json"
+            rollout = {"episodes": []}
+            task.write_text('{"task":"immutable"}')
+            (root / "app.py").write_text("# app\n")
+            (root / "live_rollout.json").write_text(json.dumps(rollout))
+            item = {
+                "task_path": str(task),
+                "task_sha256": __import__("hashlib").sha256(task.read_bytes()).hexdigest(),
+                "sandbox_root": str(root),
+                "sandbox_evidence_fingerprint": "sandbox-proof",
+                "sandbox_artifacts_sha256": verifier.portable_artifact_digests(root),
+                "rollout_sha256": verifier.digest_json(rollout),
+                "episode_count": 0,
+            }
+            manifest = {
+                "version": "2.0", "kind": "agentic_rl_pretraining_materials",
+                "evaluator_source_digest": "evaluator", "items": [item],
+            }
+            manifest["dataset_sha256"] = verifier.digest_json(manifest)
+            (root / "helper.py").write_text("# injected\n")
+            report = verifier.verify(manifest, ROOT)
+            self.assertFalse(report["verified"])
+            self.assertIn("sandbox_digest", report["failed_gates"])
 
 
 if __name__ == "__main__":

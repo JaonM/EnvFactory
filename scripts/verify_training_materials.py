@@ -10,19 +10,63 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
+PORTABLE_ROOT_SUFFIXES = {".py", ".sh", ".json", ".md", ".txt"}
+PORTABLE_DIRECTORIES = ("tests", "data", ".outer_conformance")
+
+
 def digest_json(value: Any) -> str:
     return hashlib.sha256(json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")).hexdigest()
 
 
+def portable_artifact_digests(root: Path) -> dict[str, str]:
+    paths = [
+        path for path in root.iterdir()
+        if path.is_file()
+        and path.name != "live_rollout.json"
+        and (path.name == "Dockerfile" or path.suffix in PORTABLE_ROOT_SUFFIXES)
+    ]
+    for directory in PORTABLE_DIRECTORIES:
+        paths.extend(
+            path for path in (root / directory).rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+            and path.suffix not in {".pyc", ".sqlite", ".sqlite3", ".db", ".log"}
+        )
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(set(paths))
+    }
+
+
+def verify_artifact_digests(root: Path, expected: Mapping[str, Any]) -> list[str]:
+    failures = []
+    normalized = {}
+    for relative, wanted in expected.items():
+        relative_path = Path(relative) if isinstance(relative, str) else None
+        if (
+            relative_path is None or relative_path.is_absolute()
+            or ".." in relative_path.parts or not isinstance(wanted, str)
+        ):
+            failures.append(str(relative))
+            continue
+        normalized[relative] = wanted
+    try:
+        actual = portable_artifact_digests(root)
+    except OSError as exc:
+        return [f"artifact inventory unavailable: {exc}"]
+    failures.extend(sorted(set(normalized) ^ set(actual)))
+    failures.extend(
+        relative for relative in sorted(set(normalized) & set(actual))
+        if normalized[relative] != actual[relative]
+    )
+    return sorted(set(failures))
+
+
 def verify(
     manifest: Mapping[str, Any], project: Path,
     *, fingerprint: Callable[[Path, Path], str] | None = None,
 ) -> dict[str, Any]:
-    if fingerprint is None:
-        from score_sandbox import evidence_fingerprint
-        fingerprint = evidence_fingerprint
     failures = []
     base = {key: value for key, value in manifest.items() if key != "dataset_sha256"}
     if manifest.get("dataset_sha256") != digest_json(base):
@@ -45,17 +89,38 @@ def verify(
             continue
         if task_digest != item.get("task_sha256"):
             failures.append({"gate": "task_digest", "item": index})
-        try:
-            actual_fingerprint = fingerprint(root, project)
-        except Exception as exc:  # evidence verifier must report, not abort the batch
-            failures.append({
-                "gate": "sandbox_artifact", "item": index,
-                "message": f"{type(exc).__name__}: {exc}",
-            })
-            continue
         expected_fingerprint = item.get("sandbox_evidence_fingerprint")
-        if actual_fingerprint != expected_fingerprint:
-            failures.append({"gate": "sandbox_digest", "item": index})
+        artifact_hashes = item.get("sandbox_artifacts_sha256")
+        if manifest.get("version") == "2.0" and not (
+            isinstance(artifact_hashes, Mapping) and artifact_hashes
+        ):
+            failures.append({"gate": "manifest_schema", "item": index,
+                             "message": "v2 item needs sandbox_artifacts_sha256"})
+            continue
+        if isinstance(artifact_hashes, Mapping) and artifact_hashes:
+            changed = verify_artifact_digests(root, artifact_hashes)
+            if changed:
+                failures.append({
+                    "gate": "sandbox_digest", "item": index,
+                    "message": f"changed or missing artifacts: {changed}",
+                })
+        else:
+            # Backward compatibility for v1 manifests. V2 deliberately avoids
+            # recomputing a fingerprint that also depends on the current
+            # evaluator source tree.
+            try:
+                if fingerprint is None:
+                    from score_sandbox import evidence_fingerprint
+                    fingerprint = evidence_fingerprint
+                actual_fingerprint = fingerprint(root, project)
+            except Exception as exc:  # verifier must report, not abort the batch
+                failures.append({
+                    "gate": "sandbox_artifact", "item": index,
+                    "message": f"{type(exc).__name__}: {exc}",
+                })
+                continue
+            if actual_fingerprint != expected_fingerprint:
+                failures.append({"gate": "sandbox_digest", "item": index})
         if expected_fingerprint in seen:
             failures.append({"gate": "duplicate_sandbox_identity", "item": index})
         seen.add(expected_fingerprint)

@@ -16,6 +16,8 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 每个出现的训练类别端到端合格率不低于 75%。
 - 精确重复率为 0，近似重复率不高于 5%。
 - 每个合格沙箱至少 10 个真实 rollout，三个批次累计至少 7500 个 episode；轨迹池同时包含成功和失败。
+- 每个 episode 必须使用 transition schema v2，逐步保存模型输入、原始输出、解析动作、公开观察、
+  工具或 User Simulator 结果、下一观察、奖励以及 terminated/truncated 标记；仅有 HTTP trace 不合格。
 - episode 环境错误率不高于 0.1%，LLM fallback 为 0。
 - User Simulator 调用协议有效率不低于 99.5%，并且至少产生一条真实用户响应证据。
 - 每个合格沙箱的固定 seed reset、episode 隔离、replay 稳定性、隐藏字段扫描和确定性验证全部通过。
@@ -50,7 +52,8 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 认证报告会显式保存 `does_not_certify`，防止将训练前环境质量误表述为训练效果。
 
 通过或失败时都会生成 `training_materials_manifest.json`，列出当前合格候选的任务 SHA-256、沙箱
-证据指纹、rollout 摘要哈希、类别、分数和 episode 数量，并为整批清单生成 `dataset_sha256`。
+可移植文件树 SHA-256、原始证据指纹、rollout 摘要哈希、类别、分数和 episode 数量，并记录认证时的
+评估器源码摘要，再为整批清单生成 `dataset_sha256`。
 认证要求每个合格样本都有唯一证据指纹；后续导入训练系统时应重新计算这些摘要，拒绝认证后被修改、
 替换或额外混入的任务、沙箱和轨迹。只有认证报告 `certified=true` 时，这份清单才能作为正式输入。
 
@@ -61,5 +64,6 @@ uv run python scripts/verify_training_materials.py \
   output/loop_experiment_v1/training_materials_manifest.json
 ```
 
-验证器会重新计算任务文件、沙箱实现与评测代码联合指纹、rollout JSON 和整批清单摘要；任何文件变化、
-轨迹数量变化或重复沙箱身份都会返回非零退出码。
+验证器会分别重新计算任务文件、沙箱可移植文件树、rollout JSON 和整批清单摘要；任何文件变化、
+轨迹数量变化或重复沙箱身份都会返回非零退出码。评估器版本作为 provenance 固化，但后续评估器升级
+不会被误判成已认证沙箱遭到篡改。v1 清单仍可验证，但应重新认证并升级为 v2 后再导入训练系统。

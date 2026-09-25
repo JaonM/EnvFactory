@@ -26,6 +26,8 @@ USER_OUTCOMES = {
 NEGATIVE_COUNTERFACTUALS = (
     "goal_failure", "no_tools", "noise_selection", "reordered_tools",
 )
+PORTABLE_ROOT_SUFFIXES = {".py", ".sh", ".json", ".md", ".txt"}
+PORTABLE_DIRECTORIES = ("tests", "data", ".outer_conformance")
 
 
 def load(path: Path) -> Any:
@@ -37,6 +39,26 @@ def digest_json(value: Any) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(rendered).hexdigest()
+
+
+def artifact_digests(root: Path) -> dict[str, str]:
+    """Hash only portable training-environment inputs, never logs or runtime DBs."""
+    paths = [
+        path for path in root.iterdir()
+        if path.is_file()
+        and path.name != "live_rollout.json"
+        and (path.name == "Dockerfile" or path.suffix in PORTABLE_ROOT_SUFFIXES)
+    ]
+    for directory in PORTABLE_DIRECTORIES:
+        paths.extend(
+            path for path in (root / directory).rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+            and path.suffix not in {".pyc", ".sqlite", ".sqlite3", ".db", ".log"}
+        )
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(set(paths))
+    }
 
 
 def wilson_lower(successes: int, total: int, *, z: float = Z_95) -> float:
@@ -124,8 +146,35 @@ def _counterfactual_counts(reports: Iterable[Mapping[str, Any]]) -> dict[str, in
 
 def complete_episode(episode: Mapping[str, Any]) -> bool:
     """Require the fields needed to reconstruct a future RL transition stream."""
+    transitions = episode.get("transitions")
+    transition_schema_complete = (
+        episode.get("schema_version") == "2.0"
+        and isinstance(transitions, list)
+        and bool(transitions)
+        and all(
+            isinstance(item, Mapping)
+            and isinstance(item.get("step"), int)
+            and isinstance(item.get("agent_input"), list)
+            and bool(item["agent_input"])
+            and all(
+                isinstance(message, Mapping)
+                and message.get("role") in {"system", "user", "assistant"}
+                and isinstance(message.get("content"), str)
+                for message in item["agent_input"]
+            )
+            and isinstance(item.get("assistant_output"), str)
+            and isinstance(item.get("observation"), Mapping)
+            and isinstance(item.get("result"), Mapping)
+            and isinstance(item.get("next_observation"), Mapping)
+            and isinstance(item.get("reward"), (int, float))
+            and isinstance(item.get("terminated"), bool)
+            and isinstance(item.get("truncated"), bool)
+            for item in transitions
+        )
+    )
     return (
-        isinstance(episode.get("seed"), int)
+        transition_schema_complete
+        and isinstance(episode.get("seed"), int)
         and isinstance(episode.get("agent_success"), bool)
         and isinstance(episode.get("termination"), str)
         and isinstance(episode.get("initial_reward"), (int, float))
@@ -351,6 +400,9 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
             "task_sha256": hashlib.sha256(task_path.read_bytes()).hexdigest(),
             "sandbox_root": str(Path(str(item.get("output", ""))).resolve()),
             "sandbox_evidence_fingerprint": fingerprint,
+            "sandbox_artifacts_sha256": artifact_digests(
+                Path(str(item.get("output", "")))
+            ),
             "category": str(item.get("category", "unknown")),
             "score": item.get("score"),
             "rollout_sha256": digest_json(live),
@@ -364,8 +416,9 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         item["sandbox_evidence_fingerprint"] for item in material_items
     ]
     material_manifest = {
-        "version": "1.0",
+        "version": "2.0",
         "kind": "agentic_rl_pretraining_materials",
+        "evaluator_source_digest": history.get("config", {}).get("source_digest"),
         "items": material_items,
     }
     material_manifest["dataset_sha256"] = digest_json(material_manifest)
@@ -454,6 +507,9 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "material_identity": (
             len(material_items) == len(qualified)
             and len(material_fingerprints) == len(set(material_fingerprints))
+            and isinstance(material_manifest.get("evaluator_source_digest"), str)
+            and bool(material_manifest["evaluator_source_digest"])
+            and all(item.get("sandbox_artifacts_sha256") for item in material_items)
         ),
         "reward_false_positive_rate": false_positive_rate <= policy["max_reward_false_positive_rate"],
         "reward_false_negative_rate": false_negative_rate <= policy["max_reward_false_negative_rate"],
