@@ -773,6 +773,7 @@ def attach_bundle_verification(
     report["gates"]["portable_materials_bundle"] = (
         verification.get("verified") is True
         and verification.get("production_contract_ready") is True
+        and verification.get("trusted_attestation") is True
         and verification.get("source_dataset_sha256")
         == report.get("materials_manifest", {}).get("dataset_sha256")
     )
@@ -789,6 +790,8 @@ def main() -> int:
     parser.add_argument("--project", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output", type=Path)
     parser.add_argument("--bundle-output", type=Path)
+    parser.add_argument("--bundle-signing-private-key", type=Path)
+    parser.add_argument("--bundle-trusted-public-key", type=Path)
     args = parser.parse_args()
     report = certify(
         load(args.history.resolve()), default_policy(), project=args.project.resolve()
@@ -805,10 +808,14 @@ def main() -> int:
         )
         try:
             if bundle_root.is_dir() and any(bundle_root.iterdir()):
-                bundle_verification = verify_bundle(bundle_root)
+                bundle_verification = verify_bundle(
+                    bundle_root, trusted_public_key=args.bundle_trusted_public_key
+                )
             else:
                 bundle_verification = export_bundle(
-                    report, bundle_root, args.project.resolve()
+                    report, bundle_root, args.project.resolve(),
+                    signing_private_key=args.bundle_signing_private_key,
+                    trusted_public_key=args.bundle_trusted_public_key,
                 )
         except Exception as exc:
             bundle_verification = {

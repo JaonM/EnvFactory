@@ -99,21 +99,26 @@ Dockerfile 基础镜像和 provenance 三者一致；验证后删除本地临时
 
 生产认证还会原子生成 `training_materials_bundle/`。该目录不保留本机绝对路径，按内容身份保存每个
 环境的任务、运行时代码、业务数据、验收证据和 `live_rollout.json`，并生成 `transitions.jsonl` 与
-`bundle_manifest.json`。Bundle v4 同时包含去除本机路径的 `certification.json`、机器可读
+`bundle_manifest.json`。Bundle v5 同时包含去除本机路径的 `certification.json`、机器可读
 `dataset_card.json`。JSONL 每行是一条可重建的 schema v2 transition，并携带任务、类别、episode、
 Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bundle_sha256` 再次校验；导出失败或包校验
 失败时，即使此前统计门禁通过，也不会产生 `production_prepared_for_agentic_rl`。
 
-便携包 v2 还会从每个环境内的原始 `live_rollout.json` 重新生成预期 transition 流，并与
+便携包验证器还会从每个环境内的原始 `live_rollout.json` 重新生成预期 transition 流，并与
 `transitions.jsonl` 逐条精确比较。校验范围包含 item/episode/step 引用、模型身份、parsed action 与原始
 输出的一致性、observation 链、reward、usage 以及 terminated/truncated 终止语义，防止只重算文件哈希
 就让语义损坏的轨迹通过。JSONL 由固定字段白名单投影产生；完整 trainer-only 证据仍保存在对应环境目录，
 并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。
 
-Bundle v4 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
+Bundle v5 还包含 `consumer_contract.json`：以 JSON Schema 固定 transition 记录字段，以机器可读形式声明
 记录身份与排序、环境目录和 Docker 重建入口、运行接口来源，以及 policy input/output、环境反馈和
 trainer-only 证据边界。验证器使用内置规范与文件逐项比较；即使同时修改契约并重算所有外层哈希，也不能
-把 trainer-only 字段伪装成策略输入。历史 v3 包仍可验证完整性，但不能满足当前生产认证的消费契约门禁。
+把 trainer-only 字段伪装成策略输入。历史 v3/v4 包仍可验证完整性，但不能满足当前生产认证的受信发布门禁。
+
+生产发布还要求使用组织持有的 Ed25519 私钥对最终 `bundle_manifest.json` 生成 detached signature，并由
+显式指定的受信任公钥复验。报告和包中只保存公钥 SHA-256 身份，不保存私钥、私钥路径或公钥内容。
+因此重写整个包并重算所有普通哈希仍不能伪造认证来源。开发检查可以导出未签名包，但
+`trusted_attestation=false`，不能触发 `production_prepared_for_agentic_rl`。
 
 数据集卡记录任务类别、模型组合、同模型评估数量、episode 成败和 transition 数量，并明确只适合重建
 沙箱、验证数据适配器、收集新鲜 on-policy rollout 和准备 policy-visible 输入。它显式禁止把本认证解释为

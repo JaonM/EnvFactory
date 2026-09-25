@@ -389,6 +389,23 @@ class ExperimentTest(unittest.TestCase):
             completed.stderr,
         )
 
+    def test_production_profile_requires_trusted_bundle_signing_keys(self):
+        completed = __import__("subprocess").run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/loop_experiment.py"),
+                "--certification-profile", "production",
+                "--sandbox-runtime", "docker",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            "production certification requires bundle signing private and trusted public keys",
+            completed.stderr,
+        )
+
     def test_holdout_requires_fresh_tasks_and_two_of_three_successes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

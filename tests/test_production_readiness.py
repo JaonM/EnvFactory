@@ -442,12 +442,14 @@ class ProductionReadinessTest(unittest.TestCase):
         }
         certifier.attach_bundle_verification(report, {
             "verified": True, "production_contract_ready": True,
+            "trusted_attestation": True,
             "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
         self.assertIn("portable_materials_bundle", report["failed_gates"])
         certifier.attach_bundle_verification(report, {
             "verified": True, "production_contract_ready": True,
+            "trusted_attestation": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])
@@ -462,6 +464,7 @@ class ProductionReadinessTest(unittest.TestCase):
         certifier.attach_bundle_verification(report, {
             "verified": True,
             "production_contract_ready": False,
+            "trusted_attestation": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertFalse(report["certified"])

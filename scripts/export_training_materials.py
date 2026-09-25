@@ -17,12 +17,18 @@ from typing import Any, Mapping
 from env_factory.material_artifacts import digest_json
 from env_factory.material_consumer import (
     BUNDLE_MANIFEST,
+    BUNDLE_SIGNATURE_FILE,
     BUNDLE_VERSION,
     CERTIFICATION_FILE,
     CONSUMER_CONTRACT_FILE,
     DATASET_CARD_FILE,
     TRANSITIONS_FILE,
     consumer_contract,
+)
+from env_factory.material_attestation import (
+    sign_file,
+    signed_metadata,
+    verify_file,
 )
 from env_factory.material_privacy import audit_rollout_privacy
 from env_factory.trajectory_schema import episode_errors, policy_transition
@@ -183,8 +189,11 @@ def _transition_records(
 
 
 def _export_bundle_uncommitted(
-    certification: Mapping[str, Any], output: Path, project: Path
+    certification: Mapping[str, Any], output: Path, project: Path,
+    *, signing_private_key: Path | None = None, trusted_public_key: Path | None = None,
 ) -> dict[str, Any]:
+    if (signing_private_key is None) != (trusted_public_key is None):
+        raise ValueError("signing private key and trusted public key are both required")
     if certification.get("certified") is not True:
         raise ValueError("only a certified production report can be exported")
     if certification.get("material_verification", {}).get("verified") is not True:
@@ -328,6 +337,13 @@ def _export_bundle_uncommitted(
         "certification_file": CERTIFICATION_FILE,
         "dataset_card_file": DATASET_CARD_FILE,
         "consumer_contract_file": CONSUMER_CONTRACT_FILE,
+        "attestation": (
+            signed_metadata(
+                signing_private_key, trusted_public_key, BUNDLE_SIGNATURE_FILE
+            )
+            if signing_private_key is not None and trusted_public_key is not None
+            else {"version": "1.0", "status": "unsigned"}
+        ),
         "transition_visibility": {
             "version": "1.0",
             "policy_projection": "env_factory.trajectory_schema.policy_transition",
@@ -340,10 +356,18 @@ def _export_bundle_uncommitted(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8", newline="\n",
     )
-    return verify_bundle(output)
+    if signing_private_key is not None and trusted_public_key is not None:
+        sign_file(
+            output / BUNDLE_MANIFEST,
+            output / BUNDLE_SIGNATURE_FILE,
+            signing_private_key,
+        )
+    return verify_bundle(output, trusted_public_key=trusted_public_key)
 
 
-def verify_bundle(root: Path) -> dict[str, Any]:
+def verify_bundle(
+    root: Path, *, trusted_public_key: Path | None = None
+) -> dict[str, Any]:
     failures = []
     try:
         manifest = json.loads((root / BUNDLE_MANIFEST).read_text(encoding="utf-8"))
@@ -353,13 +377,13 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     if manifest.get("bundle_sha256") != digest_json(unsigned):
         failures.append("bundle_digest")
     if (
-        manifest.get("version") not in {"3.0", BUNDLE_VERSION}
+        manifest.get("version") not in {"3.0", "4.0", BUNDLE_VERSION}
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
         or not isinstance(manifest.get("source_dataset_sha256"), str)
         or len(manifest["source_dataset_sha256"]) != 64
     ):
         failures.append("bundle_schema")
-    production_contract_ready = manifest.get("version") == BUNDLE_VERSION
+    production_contract_ready = manifest.get("version") in {"4.0", BUNDLE_VERSION}
     if production_contract_ready:
         try:
             contract_relative = _safe_relative(
@@ -372,7 +396,7 @@ def verify_bundle(root: Path) -> dict[str, Any]:
             )
         except (OSError, json.JSONDecodeError, ValueError):
             consumer_contract_document = {}
-        if consumer_contract_document != consumer_contract():
+        if consumer_contract_document != consumer_contract(manifest["version"]):
             failures.append("consumer_contract")
             production_contract_ready = False
     visibility = manifest.get("transition_visibility", {})
@@ -388,7 +412,7 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     actual = {
         str(path.relative_to(root)): file_sha256(path)
         for path in sorted(root.rglob("*"))
-        if path.is_file() and path.name != BUNDLE_MANIFEST
+        if path.is_file() and path.name not in {BUNDLE_MANIFEST, BUNDLE_SIGNATURE_FILE}
     }
     if not isinstance(expected, Mapping) or expected_files != actual:
         failures.append("bundle_files")
@@ -567,7 +591,7 @@ def verify_bundle(root: Path) -> dict[str, Any]:
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version")
-            == ("1.1" if manifest.get("version") == BUNDLE_VERSION else "1.0")
+            == ("1.1" if manifest.get("version") in {"4.0", BUNDLE_VERSION} else "1.0")
         and dataset_card.get("kind") == "agentic_rl_pretraining_material_dataset_card"
         and dataset_card.get("source_dataset_sha256")
             == manifest.get("source_dataset_sha256")
@@ -580,7 +604,7 @@ def verify_bundle(root: Path) -> dict[str, Any]:
             == "internal_only_until_legal_and_security_review"
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
-            manifest.get("version") != BUNDLE_VERSION
+            manifest.get("version") not in {"4.0", BUNDLE_VERSION}
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
         )
         and card_composition.get("items") == len(items)
@@ -611,6 +635,19 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         or manifest.get("successful_episodes") != verified_successes
     ):
         failures.append("bundle_episode_counts")
+    attestation = manifest.get("attestation")
+    trusted_attestation = (
+        manifest.get("version") == BUNDLE_VERSION
+        and trusted_public_key is not None
+        and verify_file(
+            root / BUNDLE_MANIFEST,
+            root / BUNDLE_SIGNATURE_FILE,
+            trusted_public_key,
+            attestation,
+        )
+    )
+    if trusted_public_key is not None and not trusted_attestation:
+        failures.append("trusted_attestation")
     return {
         "verified": not failures,
         "bundle_sha256": manifest.get("bundle_sha256"),
@@ -618,14 +655,22 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         "items": manifest.get("item_count", 0),
         "transitions": len(records),
         "production_contract_ready": production_contract_ready,
+        "trusted_attestation": trusted_attestation,
+        "attestation_key_identity_sha256": (
+            attestation.get("key_identity_sha256")
+            if isinstance(attestation, Mapping) else None
+        ),
         "failed_gates": sorted(set(failures)),
     }
 
 
 def export_bundle(
-    certification: Mapping[str, Any], output: Path, project: Path
+    certification: Mapping[str, Any], output: Path, project: Path,
+    *, signing_private_key: Path | None = None, trusted_public_key: Path | None = None,
 ) -> dict[str, Any]:
     """Stage the complete bundle and publish it with one directory rename."""
+    if (signing_private_key is None) != (trusted_public_key is None):
+        raise ValueError("signing private key and trusted public key are both required")
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         if any(output.iterdir()):
@@ -635,11 +680,15 @@ def export_bundle(
         prefix=f".{output.name}.", dir=output.parent
     ) as temporary:
         staged = Path(temporary) / "bundle"
-        report = _export_bundle_uncommitted(certification, staged, project)
+        report = _export_bundle_uncommitted(
+            certification, staged, project,
+            signing_private_key=signing_private_key,
+            trusted_public_key=trusted_public_key,
+        )
         if report.get("verified") is not True:
             raise ValueError(f"staged bundle verification failed: {report['failed_gates']}")
         staged.replace(output)
-    return verify_bundle(output)
+    return verify_bundle(output, trusted_public_key=trusted_public_key)
 
 
 def main() -> int:
@@ -648,12 +697,20 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--project", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--signing-private-key", type=Path)
+    parser.add_argument("--trusted-public-key", type=Path)
     args = parser.parse_args()
     if args.verify_only:
-        report = verify_bundle(args.output.resolve())
+        report = verify_bundle(
+            args.output.resolve(), trusted_public_key=args.trusted_public_key
+        )
     else:
         certification = json.loads(args.certification.read_text(encoding="utf-8"))
-        report = export_bundle(certification, args.output.resolve(), args.project.resolve())
+        report = export_bundle(
+            certification, args.output.resolve(), args.project.resolve(),
+            signing_private_key=args.signing_private_key,
+            trusted_public_key=args.trusted_public_key,
+        )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["verified"] else 1
 

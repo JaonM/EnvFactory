@@ -12,10 +12,11 @@ TRANSITIONS_FILE = "transitions.jsonl"
 CERTIFICATION_FILE = "certification.json"
 DATASET_CARD_FILE = "dataset_card.json"
 CONSUMER_CONTRACT_FILE = "consumer_contract.json"
-BUNDLE_VERSION = "4.0"
+BUNDLE_SIGNATURE_FILE = "bundle_manifest.sig"
+BUNDLE_VERSION = "5.0"
 
 
-def consumer_contract() -> dict[str, Any]:
+def consumer_contract(bundle_version: str = BUNDLE_VERSION) -> dict[str, Any]:
     """Return the exact portable handoff; consumers need no prompt conventions."""
     record_fields = [
         "schema_version", "item_id", "task_sha256", "category",
@@ -26,7 +27,7 @@ def consumer_contract() -> dict[str, Any]:
     return {
         "version": "1.0",
         "kind": "agentic_rl_training_material_consumer_contract",
-        "bundle_version": BUNDLE_VERSION,
+        "bundle_version": bundle_version,
         "records": {
             "path": TRANSITIONS_FILE,
             "media_type": "application/x-ndjson",

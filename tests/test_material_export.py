@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import subprocess
 
 from env_factory.material_artifacts import (
     digest_json,
@@ -29,6 +30,19 @@ exporter = load_exporter()
 
 
 class MaterialExportTest(unittest.TestCase):
+    def signing_keys(self, root: Path) -> tuple[Path, Path]:
+        private = root / "private.pem"
+        public = root / "public.pem"
+        subprocess.run(
+            ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["openssl", "pkey", "-in", str(private), "-pubout", "-out", str(public)],
+            check=True, capture_output=True,
+        )
+        return private, public
+
     def source(self, root: Path):
         sandbox = root / "sandbox"
         sandbox.mkdir()
@@ -154,7 +168,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "4.0")
+            self.assertEqual(contract["bundle_version"], "5.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -289,6 +303,34 @@ class MaterialExportTest(unittest.TestCase):
             self.assertTrue(report["verified"], report)
             self.assertFalse(report["production_contract_ready"])
 
+    def test_legacy_v4_bundle_keeps_contract_but_has_no_trusted_attestation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            contract_path = bundle / "consumer_contract.json"
+            contract = json.loads(contract_path.read_text())
+            contract["bundle_version"] = "4.0"
+            contract_path.write_text(json.dumps(contract))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["version"] = "4.0"
+            manifest.pop("attestation")
+            manifest["files_sha256"]["consumer_contract.json"] = exporter.file_sha256(
+                contract_path
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertTrue(report["verified"], report)
+            self.assertTrue(report["production_contract_ready"])
+            self.assertFalse(report["trusted_attestation"])
+
     def test_rehashed_bundle_cannot_remove_environment_rebuild_entrypoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -313,6 +355,30 @@ class MaterialExportTest(unittest.TestCase):
             self.assertIn(
                 "environment_reconstruction_contract", report["failed_gates"]
             )
+
+    def test_signed_bundle_requires_the_trusted_key_and_detects_reserialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private, public = self.signing_keys(root)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            report = exporter.export_bundle(
+                certification, bundle, ROOT,
+                signing_private_key=private, trusted_public_key=public,
+            )
+            self.assertTrue(report["verified"], report)
+            self.assertTrue(report["trusted_attestation"])
+            without_trust = exporter.verify_bundle(bundle)
+            self.assertTrue(without_trust["verified"])
+            self.assertFalse(without_trust["trusted_attestation"])
+
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest_path.write_text(json.dumps(manifest, separators=(",", ":")))
+            changed = exporter.verify_bundle(bundle, trusted_public_key=public)
+            self.assertFalse(changed["verified"])
+            self.assertFalse(changed["trusted_attestation"])
+            self.assertIn("trusted_attestation", changed["failed_gates"])
 
     def test_uncertified_report_cannot_be_exported(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -750,6 +750,8 @@ def main():
         "--certification-profile", choices=("pilot", "production"), default="production",
         help="pilot 仅执行候选门禁；production 追加生产级训练素材准备认证",
     )
+    parser.add_argument("--bundle-signing-private-key", type=Path)
+    parser.add_argument("--bundle-trusted-public-key", type=Path)
     parser.add_argument("--holdout-count", type=int, default=400)
     parser.add_argument("--holdout-batches", type=int, default=3)
     parser.add_argument("--holdout-end-to-end-rate", type=float, default=0.85)
@@ -792,6 +794,32 @@ def main():
     project = args.project.resolve()
     from dotenv import load_dotenv
     load_dotenv(project / ".env")
+    bundle_private_key = args.bundle_signing_private_key or (
+        Path(os.environ["ENVFACTORY_BUNDLE_SIGNING_PRIVATE_KEY"])
+        if os.getenv("ENVFACTORY_BUNDLE_SIGNING_PRIVATE_KEY") else None
+    )
+    bundle_public_key = args.bundle_trusted_public_key or (
+        Path(os.environ["ENVFACTORY_BUNDLE_TRUSTED_PUBLIC_KEY"])
+        if os.getenv("ENVFACTORY_BUNDLE_TRUSTED_PUBLIC_KEY") else None
+    )
+    bundle_key_identity = None
+    if args.certification_profile == "production":
+        if bundle_private_key is None or bundle_public_key is None:
+            parser.error(
+                "production certification requires bundle signing private and "
+                "trusted public keys"
+            )
+        try:
+            from env_factory.material_attestation import (
+                private_key_public_identity,
+                public_key_identity,
+            )
+            private_identity = private_key_public_identity(bundle_private_key)
+            bundle_key_identity = public_key_identity(bundle_public_key)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        if private_identity != bundle_key_identity:
+            parser.error("bundle signing private key does not match trusted public key")
     if (args.generate_count or args.validation == "live") and not all(os.getenv(key) for key in ("LLM_MODEL", "LLM_API_KEY")):
         parser.error("generation/live rollout requires LLM_MODEL and LLM_API_KEY")
     root = args.output if args.output.is_absolute() else project / args.output
@@ -806,10 +834,14 @@ def main():
     paths = [] if args.generate_count else [(task_root / f"task-{value}/task.json").resolve() for value in ids]
     if any(not path.is_file() for path in paths):
         parser.error("task input is missing")
-    config = {key: value for key, value in vars(args).items() if key not in {"project", "output", "task_root", "task_ids"}}
+    config = {key: value for key, value in vars(args).items() if key not in {
+        "project", "output", "task_root", "task_ids",
+        "bundle_signing_private_key", "bundle_trusted_public_key",
+    }}
     config.update(project=str(project), task_paths=list(map(str, paths)), model=MODEL,
                   source_digest=source_digest(project), input_digests=[input_digest(path) for path in paths],
                   execution_provenance=collect_execution_provenance(project),
+                  bundle_attestation_key_identity_sha256=bundle_key_identity,
                   generation_model=os.getenv("LLM_MODEL"), runtime_model=os.getenv("SANDBOX_LLM_MODEL") or os.getenv("LLM_MODEL"),
                   provider_digest=hashlib.sha256(json.dumps([os.getenv("LLM_BASE_URL"), os.getenv("SANDBOX_LLM_BASE_URL")]).encode()).hexdigest())
     signal.signal(signal.SIGINT, interrupt)
@@ -943,10 +975,15 @@ def main():
                         bundle_root = root / "training_materials_bundle"
                         try:
                             if bundle_root.is_dir() and any(bundle_root.iterdir()):
-                                bundle_verification = verify_bundle(bundle_root)
+                                bundle_verification = verify_bundle(
+                                    bundle_root,
+                                    trusted_public_key=bundle_public_key,
+                                )
                             else:
                                 bundle_verification = export_bundle(
-                                    certification, bundle_root, project
+                                    certification, bundle_root, project,
+                                    signing_private_key=bundle_private_key,
+                                    trusted_public_key=bundle_public_key,
                                 )
                         except Exception as exc:
                             bundle_verification = {
