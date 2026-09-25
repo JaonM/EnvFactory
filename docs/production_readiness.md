@@ -74,6 +74,9 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
   证据独立交叉验证。
 - 每份 rollout 保存任务 SHA-256、沙箱可执行输入摘要、Agent/User/Judge 模型及 provider 摘要；认证时重新
   计算并拒绝把其他任务或沙箱的轨迹挂接到当前样本。
+- Rollout 中的 Agent 与 User Simulator/Reward Judge 模型名称、provider 身份 SHA-256 必须逐项匹配该
+  沙箱的数据治理授权报告；摘要必须是规范的 64 位小写十六进制。两个报告分别格式合法但身份不一致时，
+  不能把轨迹视为已获授权的生产素材。
 - 生产留出集的 live rollout 必须通过随机 loopback 端口调用刚刚构建并验证的 Docker 镜像；宿主进程
   直接导入 `app.py` 只允许用于开发检查，不能作为生产证据。轨迹保存实际 Docker image ID、HTTP 传输
   模式和只读根文件系统、非 root、capability drop、no-new-privileges 状态，并与

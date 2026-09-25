@@ -710,6 +710,27 @@ class ProductionReadinessTest(unittest.TestCase):
                 {"verified": 899, "expected": 900, "all_verified": False},
             )
 
+    def test_rollout_provider_identity_must_match_data_governance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            result["live_rollout"]["agent_provider_sha256"] = "f" * 64
+            report = self.certify(history)
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["provider_identity_consistency"])
+            self.assertEqual(
+                report["measurements"]["provider_identity_consistency"],
+                {"verified": 899, "expected": 900, "all_verified": False},
+            )
+
+    def test_rollout_provider_digest_must_be_canonical_hex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            result["live_rollout"]["agent_provider_sha256"] = "z" * 64
+            report = self.certify(history)
+            self.assertFalse(report["gates"]["rollout_provenance"])
+
     def test_sandbox_score_must_match_frozen_structural_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             history = self.make_history(Path(directory))

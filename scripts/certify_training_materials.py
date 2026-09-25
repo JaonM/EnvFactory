@@ -506,10 +506,31 @@ def valid_rollout_provenance(item: Mapping[str, Any]) -> bool:
         and isinstance(live.get("agent_model"), str) and bool(live["agent_model"])
         and isinstance(live.get("runtime_model"), str) and bool(live["runtime_model"])
         and all(
-            isinstance(live.get(name), str) and len(live[name]) == 64
+            isinstance(live.get(name), str)
+            and re.fullmatch(r"[0-9a-f]{64}", live[name]) is not None
             for name in ("agent_provider_sha256", "runtime_provider_sha256")
         )
         and valid_container_rollout_execution(live, root)
+    )
+
+
+def valid_provider_binding(item: Mapping[str, Any]) -> bool:
+    """Bind rollout model identities to the provider governance authorization."""
+    live = item.get("live_rollout")
+    governance = _artifact(item, "data_governance.json")
+    providers = governance.get("providers")
+    if not isinstance(live, Mapping) or not isinstance(providers, Mapping):
+        return False
+    agent = providers.get("agent")
+    runtime = providers.get("user_simulator_and_reward")
+    return (
+        isinstance(agent, Mapping)
+        and isinstance(runtime, Mapping)
+        and live.get("agent_model") == agent.get("model")
+        and live.get("agent_provider_sha256") == agent.get("identity_sha256")
+        and live.get("runtime_model") == runtime.get("model")
+        and live.get("runtime_provider_sha256")
+            == runtime.get("identity_sha256")
     )
 
 
@@ -966,6 +987,12 @@ def certify(
     rollout_provenance = bool(qualified) and all(
         valid_rollout_provenance(item) for item in qualified
     )
+    provider_bindings_verified = sum(
+        valid_provider_binding(item) for item in qualified
+    )
+    provider_identity_consistency = (
+        bool(qualified) and provider_bindings_verified == len(qualified)
+    )
     container_rollout_execution = bool(qualified) and all(
         valid_container_rollout_execution(
             item.get("live_rollout"), Path(str(item.get("output", "")))
@@ -1214,6 +1241,11 @@ def certify(
             "all_verified": rollout_outcome_integrity,
         },
         "rollout_provenance": rollout_provenance,
+        "provider_identity_consistency": {
+            "verified": provider_bindings_verified,
+            "expected": len(qualified),
+            "all_verified": provider_identity_consistency,
+        },
         "container_rollout_execution": container_rollout_execution,
         "trajectory_schema_complete": (
             bool(audited_episodes)
@@ -1321,6 +1353,7 @@ def certify(
         "rollout_coverage": rollout_coverage and len(episodes) >= policy["min_total_episodes"],
         "rollout_outcome_integrity": rollout_outcome_integrity,
         "rollout_provenance": rollout_provenance,
+        "provider_identity_consistency": provider_identity_consistency,
         "container_rollout_execution": container_rollout_execution,
         "trajectory_schema": measurements["trajectory_schema_complete"],
         "user_simulator_protocol": (
