@@ -1244,7 +1244,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "materials_manifest": {"dataset_sha256": "dataset"},
         }
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "11.0",
+            "verified": True, "bundle_version": "12.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1254,12 +1254,13 @@ class ProductionReadinessTest(unittest.TestCase):
             "container_reward_calibration_ready": True,
             "provider_identity_ready": True,
             "task_lineage_ready": True,
+            "production_preflight_ready": True,
             "source_dataset_sha256": "different",
         })
         self.assertFalse(report["certified"])
         self.assertIn("portable_materials_bundle", report["failed_gates"])
         certifier.attach_bundle_verification(report, {
-            "verified": True, "bundle_version": "11.0",
+            "verified": True, "bundle_version": "12.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1269,11 +1270,12 @@ class ProductionReadinessTest(unittest.TestCase):
             "container_reward_calibration_ready": True,
             "provider_identity_ready": True,
             "task_lineage_ready": True,
+            "production_preflight_ready": True,
             "source_dataset_sha256": "dataset",
         })
         self.assertTrue(report["certified"])
 
-    def test_verified_v10_bundle_cannot_satisfy_current_release_gate(self):
+    def test_verified_v11_bundle_cannot_satisfy_current_release_gate(self):
         report = {
             "certified": True,
             "gates": {"base": True},
@@ -1282,7 +1284,7 @@ class ProductionReadinessTest(unittest.TestCase):
         }
         certifier.attach_bundle_verification(report, {
             "verified": True,
-            "bundle_version": "10.0",
+            "bundle_version": "11.0",
             "production_contract_ready": True,
             "trusted_attestation": True,
             "dataset_split_ready": True,
@@ -1290,8 +1292,9 @@ class ProductionReadinessTest(unittest.TestCase):
             "generation_provenance_ready": True,
             "container_rollout_ready": True,
             "container_reward_calibration_ready": True,
-            "provider_identity_ready": False,
-            "task_lineage_ready": False,
+            "provider_identity_ready": True,
+            "task_lineage_ready": True,
+            "production_preflight_ready": False,
             "source_dataset_sha256": "dataset",
         })
         self.assertFalse(report["certified"])

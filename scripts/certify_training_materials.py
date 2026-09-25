@@ -1585,6 +1585,7 @@ def attach_bundle_verification(
         and verification.get("container_reward_calibration_ready") is True
         and verification.get("provider_identity_ready") is True
         and verification.get("task_lineage_ready") is True
+        and verification.get("production_preflight_ready") is True
         and verification.get("source_dataset_sha256")
         == report.get("materials_manifest", {}).get("dataset_sha256")
     )

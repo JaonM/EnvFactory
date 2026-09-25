@@ -41,6 +41,10 @@ from env_factory.generation_provenance import valid_generation_provenance
 from env_factory.runtime_provenance import valid_container_rollout_execution
 from env_factory.data_governance import valid_provider_binding
 from env_factory.task_portability import valid_task_lineage
+from env_factory.production_preflight import (
+    REQUIRED_CHECKS,
+    valid_production_preflight,
+)
 
 
 def file_sha256(path: Path) -> str:
@@ -146,7 +150,7 @@ def _dataset_card(
         "absence_of_same_model_evaluation_bias",
     ])
     return {
-        "version": "1.7",
+        "version": "1.8",
         "kind": "agentic_rl_pretraining_material_dataset_card",
         "source_dataset_sha256": source_dataset_sha256,
         "certification": {
@@ -561,7 +565,7 @@ def verify_bundle(
         failures.append("bundle_digest")
     if (
         manifest.get("version") not in {
-            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0",
+            "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",
             BUNDLE_VERSION,
         }
         or manifest.get("kind") != "portable_agentic_rl_training_materials"
@@ -570,7 +574,7 @@ def verify_bundle(
     ):
         failures.append("bundle_schema")
     production_contract_ready = manifest.get("version") in {
-        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0",
+        "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",
         BUNDLE_VERSION,
     }
     if production_contract_ready:
@@ -659,6 +663,25 @@ def verify_bundle(
             )
             or "provider_identity_consistency"
                 in portable_certification["gates"]
+        )
+        and (
+            not supports_bundle_feature(
+                str(manifest.get("version")), "production_preflight"
+            )
+            or (
+                {
+                    "production_experiment_profile",
+                    "production_preflight",
+                } <= set(portable_certification["gates"])
+                and portable_certification.get("measurements", {}).get(
+                    "production_experiment_profile"
+                ) is True
+                and valid_production_preflight(
+                    portable_certification.get("measurements", {}).get(
+                        "production_preflight"
+                    )
+                )
+            )
         )
     ):
         failures.append("portable_certification")
@@ -980,6 +1003,26 @@ def verify_bundle(
         and bool(items)
         and verified_task_lineages == len(items)
     )
+    production_preflight_ready = (
+        supports_bundle_feature(
+            str(manifest.get("version")), "production_preflight"
+        )
+        and isinstance(portable_certification, Mapping)
+        and portable_certification.get("gates", {}).get(
+            "production_experiment_profile"
+        ) is True
+        and portable_certification.get("gates", {}).get(
+            "production_preflight"
+        ) is True
+        and portable_certification.get("measurements", {}).get(
+            "production_experiment_profile"
+        ) is True
+        and valid_production_preflight(
+            portable_certification.get("measurements", {}).get(
+                "production_preflight"
+            )
+        )
+    )
     if (
         len(records) != manifest.get("transition_count")
         or len(items) != manifest.get("item_count")
@@ -1110,7 +1153,8 @@ def verify_bundle(
     if not (
         isinstance(dataset_card, Mapping)
         and dataset_card.get("version") == (
-            "1.7" if manifest.get("version") == BUNDLE_VERSION
+            "1.8" if manifest.get("version") == BUNDLE_VERSION
+            else "1.7" if manifest.get("version") == "11.0"
             else "1.6" if manifest.get("version") == "10.0"
             else "1.5" if manifest.get("version") == "9.0"
             else "1.4" if manifest.get("version") == "8.0"
@@ -1132,7 +1176,7 @@ def verify_bundle(
         and dataset_card.get("license_status") == "not_asserted_by_envfactory"
         and (
             manifest.get("version") not in {
-                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0",
+                "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",
                 BUNDLE_VERSION,
             }
             or dataset_card.get("consumer_contract") == CONSUMER_CONTRACT_FILE
@@ -1169,7 +1213,8 @@ def verify_bundle(
     attestation = manifest.get("attestation")
     trusted_attestation = (
         manifest.get("version") in {
-            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", BUNDLE_VERSION,
+            "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",
+            BUNDLE_VERSION,
         }
         and trusted_public_key is not None
         and verify_file(
@@ -1197,6 +1242,7 @@ def verify_bundle(
         "container_reward_calibration_ready": container_reward_calibration_ready,
         "provider_identity_ready": provider_identity_ready,
         "task_lineage_ready": task_lineage_ready,
+        "production_preflight_ready": production_preflight_ready,
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any, Callable, Mapping
@@ -206,7 +207,20 @@ def valid_production_preflight(
         and model_evidence.get("runtime_provider") != dict(expected_runtime_provider)
     ):
         return False
+
+    def valid_provider(provider: Any) -> bool:
+        return (
+            isinstance(provider, Mapping)
+            and isinstance(provider.get("host"), str)
+            and bool(provider["host"].strip())
+            and isinstance(provider.get("model"), str)
+            and bool(provider["model"].strip())
+            and isinstance(provider.get("identity_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", provider["identity_sha256"])
+            is not None
+        )
+
     return all(
-        isinstance(model_evidence.get(name), Mapping)
+        valid_provider(model_evidence.get(name))
         for name in ("agent_provider", "runtime_provider")
     )

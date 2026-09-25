@@ -246,12 +246,46 @@ class MaterialExportTest(unittest.TestCase):
                 "cross_model_generalization",
             ],
             "policy": {"score_threshold": 8.0},
-            "measurements": {"training_ready": 1},
+            "measurements": {
+                "training_ready": 1,
+                "production_experiment_profile": True,
+                "production_preflight": {
+                    "version": "1.0",
+                    "scope": "production_pre_training_material_experiment",
+                    "network_probe_performed": False,
+                    "ready": True,
+                    "failed_checks": [],
+                    "checks": [
+                        {
+                            "name": name,
+                            "passed": True,
+                            "evidence": (
+                                {
+                                    "agent_provider": {
+                                        "host": "generator.example",
+                                        "model": "generator-model",
+                                        "identity_sha256": "c" * 64,
+                                    },
+                                    "runtime_provider": {
+                                        "host": "runtime.example",
+                                        "model": "simulator",
+                                        "identity_sha256": "b" * 64,
+                                    },
+                                }
+                                if name == "model_configuration" else {}
+                            ),
+                        }
+                        for name in sorted(exporter.REQUIRED_CHECKS)
+                    ],
+                },
+            },
             "gates": {
                 "fixture": True,
                 "container_rollout_execution": True,
                 "container_reward_calibration": True,
                 "provider_identity_consistency": True,
+                "production_experiment_profile": True,
+                "production_preflight": True,
             },
             "failed_gates": [],
             "material_verification": {"verified": True},
@@ -324,7 +358,7 @@ class MaterialExportTest(unittest.TestCase):
                 digest_json(card["build_environment"]),
             )
             contract = json.loads((bundle / "consumer_contract.json").read_text())
-            self.assertEqual(contract["bundle_version"], "11.0")
+            self.assertEqual(contract["bundle_version"], "12.0")
             self.assertEqual(
                 contract["records"]["policy_transition_fields"],
                 exporter.consumer_contract()["records"]["policy_transition_fields"],
@@ -345,6 +379,33 @@ class MaterialExportTest(unittest.TestCase):
             rollout["episodes"][0]["transitions"][0]["terminated"] = False
             with self.assertRaisesRegex(ValueError, "user_simulator_terminal"):
                 exporter._transition_records("fixture", item, rollout)
+
+    def test_v12_verifier_rejects_rehashed_missing_preflight_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            certification_path = bundle / "certification.json"
+            portable = json.loads(certification_path.read_text())
+            portable["gates"].pop("production_preflight")
+            portable["measurements"].pop("production_preflight")
+            certification_path.write_text(json.dumps(portable))
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files_sha256"]["certification.json"] = (
+                exporter.file_sha256(certification_path)
+            )
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["production_preflight_ready"])
+            self.assertIn("portable_certification", report["failed_gates"])
 
     def test_bundle_verifier_rejects_semantically_rewritten_transition_jsonl(self):
         with tempfile.TemporaryDirectory() as directory:
