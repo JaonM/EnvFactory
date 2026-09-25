@@ -48,9 +48,13 @@ class MaterialExportTest(unittest.TestCase):
             "reward": 1.0,
             "terminated": True,
             "truncated": False,
+            "trainer_metadata": {
+                "user_simulator": {"outcome_category": "user_acceptance"},
+            },
         }
         rollout = {
             "schema_version": "2.0",
+            "material_visibility_version": "1.0",
             "agent_model": "policy",
             "runtime_model": "simulator",
             "episodes": [{
@@ -107,6 +111,7 @@ class MaterialExportTest(unittest.TestCase):
             self.assertEqual(record["transition"]["reward"], 1.0)
             self.assertEqual(record["episode_final_reward"], 1.0)
             self.assertEqual(record["agent_usage"], {})
+            self.assertNotIn("trainer_metadata", record["transition"])
             copied_app = next((bundle / "environments").glob("*/app.py"))
             copied_app.write_text("# tampered\n")
             changed = exporter.verify_bundle(bundle)

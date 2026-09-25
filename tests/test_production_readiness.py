@@ -189,6 +189,7 @@ class ProductionReadinessTest(unittest.TestCase):
                     "score": 9, "passed": True,
                     "live_rollout": {
                         "schema_version": "2.0",
+                        "material_visibility_version": "1.0",
                         "task_sha256": __import__("hashlib").sha256(task.read_bytes()).hexdigest(),
                         "sandbox_artifacts_digest": certifier.portable_artifact_digest(evidence),
                         "agent_model": "policy-model",
@@ -204,6 +205,10 @@ class ProductionReadinessTest(unittest.TestCase):
                 "jobs": jobs,
                 "summary": {"fresh_tasks_verified": True},
             })
+        representative = holdouts[0]["jobs"][0]["result"]["live_rollout"]
+        (evidence / "trajectory_privacy.json").write_text(json.dumps(
+            certifier.audit_rollout_privacy(representative)
+        ))
         return {
             "config": {"source_digest": "evaluator-source-v1"},
             "holdout": holdouts[0], "holdouts": holdouts,
@@ -226,6 +231,7 @@ class ProductionReadinessTest(unittest.TestCase):
             self.assertTrue(report["gates"]["user_simulator_outcome_coverage"])
             self.assertTrue(report["gates"]["data_governance"])
             self.assertTrue(report["gates"]["container_reproducibility"])
+            self.assertTrue(report["gates"]["trajectory_privacy"])
             self.assertEqual(len(report["materials_manifest"]["items"]), 900)
             self.assertEqual(report["materials_manifest"]["version"], "2.0")
             self.assertEqual(
@@ -322,6 +328,19 @@ class ProductionReadinessTest(unittest.TestCase):
             report = certifier.certify(history, certifier.default_policy())
             self.assertFalse(report["gates"]["container_reproducibility"])
             self.assertIn("container_reproducibility", report["failed_gates"])
+
+    def test_privacy_report_cannot_hide_policy_visible_credential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = self.make_history(root)
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            result["live_rollout"]["episodes"][0]["transitions"][0]["result"] = {
+                "status": 200,
+                "token": "sk-abcdefghijklmnopqrstuvwxyz123456",
+            }
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["gates"]["trajectory_privacy"])
+            self.assertIn("trajectory_privacy", report["failed_gates"])
 
     def test_category_mix_prevents_single_route_dataset(self):
         with tempfile.TemporaryDirectory() as directory:

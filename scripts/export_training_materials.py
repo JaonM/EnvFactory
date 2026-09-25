@@ -14,7 +14,8 @@ import tempfile
 from typing import Any, Mapping
 
 from env_factory.material_artifacts import digest_json
-from env_factory.trajectory_schema import episode_errors
+from env_factory.material_privacy import audit_rollout_privacy
+from env_factory.trajectory_schema import episode_errors, policy_transition
 
 
 BUNDLE_MANIFEST = "bundle_manifest.json"
@@ -51,6 +52,9 @@ def _transition_records(
         for name in ("agent_model", "runtime_model")
     ):
         raise ValueError("rollout model provenance is incomplete")
+    privacy = audit_rollout_privacy(rollout)
+    if privacy.get("eligible_for_policy_training_export") is not True:
+        raise ValueError(f"rollout policy-visible payload is unsafe: {privacy}")
     episodes = rollout.get("episodes")
     if not isinstance(episodes, list) or not episodes:
         raise ValueError("rollout episodes must be non-empty")
@@ -76,7 +80,7 @@ def _transition_records(
                 "agent_model": rollout.get("agent_model"),
                 "runtime_model": rollout.get("runtime_model"),
                 "agent_usage": episode["usage"][transition_index],
-                "transition": dict(transition),
+                "transition": policy_transition(transition),
             })
     return records
 
@@ -174,6 +178,11 @@ def _export_bundle_uncommitted(
         "items": exported_items,
         "item_count": len(exported_items),
         "transition_count": transition_count,
+        "transition_visibility": {
+            "version": "1.0",
+            "policy_projection": "env_factory.trajectory_schema.policy_transition",
+            "trainer_only_evidence": "environments/*/live_rollout.json",
+        },
         "files_sha256": files,
     }
     manifest["bundle_sha256"] = digest_json(manifest)
@@ -200,6 +209,14 @@ def verify_bundle(root: Path) -> dict[str, Any]:
         or len(manifest["source_dataset_sha256"]) != 64
     ):
         failures.append("bundle_schema")
+    visibility = manifest.get("transition_visibility", {})
+    if not (
+        isinstance(visibility, Mapping)
+        and visibility.get("version") == "1.0"
+        and visibility.get("policy_projection")
+            == "env_factory.trajectory_schema.policy_transition"
+    ):
+        failures.append("transition_visibility")
     expected = manifest.get("files_sha256")
     expected_files = dict(expected) if isinstance(expected, Mapping) else {}
     actual = {

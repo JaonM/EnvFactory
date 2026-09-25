@@ -88,7 +88,15 @@ def episode(app, task, client, seed, max_steps):
                 user = request("POST", "/v1/user_simulator", {"messages": conversation})[1]
                 conversation.append({"role": "user", "content": user["user_query"]})
                 messages.append({"role": "user", "content": user["user_query"]})
-                transition["result"] = {"status": 200, "user_simulator": copy.deepcopy(user)}
+                # Store exactly what becomes visible to the policy.  Outcome
+                # labels and FSM decisions remain trainer-only evidence.
+                transition["result"] = {
+                    "status": 200,
+                    "user_query": user["user_query"],
+                }
+                transition["trainer_metadata"] = {
+                    "user_simulator": copy.deepcopy(user),
+                }
                 if user.get("should_end"):
                     termination = user.get("termination_reason", "user_ended")
             else:
@@ -230,7 +238,8 @@ def main():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     task = json.loads((root / "task.json").read_text())
-    report = {"schema_version": "2.0", "mode": "live_rollout", "agent_model": client.model,
+    report = {"schema_version": "2.0", "material_visibility_version": "1.0",
+              "mode": "live_rollout", "agent_model": client.model,
               "runtime_model": runtime.model, "episodes": [],
               "task_sha256": hashlib.sha256((root / "task.json").read_bytes()).hexdigest(),
               "sandbox_artifacts_digest": portable_artifact_digest(root),

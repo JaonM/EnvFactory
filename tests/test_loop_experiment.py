@@ -267,6 +267,10 @@ class ExperimentTest(unittest.TestCase):
                         "passed": True, "live_rollout_verified": True,
                         "quality_score": 1.0, "episodes": [],
                     }))
+                elif "audit_trajectory_privacy.py" in " ".join(command):
+                    (output / "trajectory_privacy.json").write_text(json.dumps({
+                        "eligible_for_policy_training_export": True,
+                    }))
                 elif "validate_agentic_training_value.py" in " ".join(command):
                     (output / "agentic_training_value_live.json").write_text(json.dumps({
                         "curriculum_training_ready": True,
@@ -289,6 +293,7 @@ class ExperimentTest(unittest.TestCase):
                 result = loop.build_one(ROOT, task_path, output, config)
             self.assertTrue(result["passed"])
             self.assertTrue(result["data_governance_verified"])
+            self.assertTrue(result["trajectory_privacy_verified"])
             self.assertTrue(result["live_reward_calibration_verified"])
             build_command = commands[0]
             self.assertEqual(
@@ -496,6 +501,15 @@ class RolloutTest(unittest.TestCase):
         self.assertEqual(result["transitions"][0]["action"]["kind"], "tool")
         self.assertIsInstance(result["transitions"][0]["next_observation"], dict)
         self.assertTrue(result["transitions"][-1]["terminated"])
+        self.assertEqual(
+            result["transitions"][-1]["result"],
+            {"status": 200, "user_query": "accepted"},
+        )
+        self.assertTrue(
+            result["transitions"][-1]["trainer_metadata"]["user_simulator"][
+                "should_end"
+            ]
+        )
 
     def test_high_reward_with_wrong_state_is_rejected(self):
         result = self.run_episode(FakeApp(correct=False))

@@ -20,6 +20,9 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 每个合格沙箱至少 10 个真实 rollout，三个批次累计至少 7500 个 episode；轨迹池同时包含成功和失败。
 - 每个 episode 必须使用 transition schema v2，逐步保存模型输入、原始输出、解析动作、公开观察、
   工具或 User Simulator 结果、下一观察、奖励以及 terminated/truncated 标记；仅有 HTTP trace 不合格。
+- policy-visible transition 只能包含 Agent 实际收到的输入、公开观察和公开结果。User Simulator 的
+  outcome、FSM transition、match status，以及 replay、初末业务状态等保留为 trainer-only evidence；
+  不得混入供策略摄取的 `transitions.jsonl`。
 - episode 环境错误率不高于 0.1%，LLM fallback 为 0。
 - User Simulator 调用协议有效率不低于 99.5%，并且至少产生一条真实用户响应证据。
 - 真实 User Simulator 轨迹至少覆盖 3 类结果，同时包含成功/接受类结果和需要继续交互或恢复的结果，
@@ -63,6 +66,11 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 业务 fixture 的凭证与疑似 PII，并将目标 provider、允许的出站面和禁止出站字段写入
 `data_governance.json`。报告只保存命中类型与 JSON 路径，不回写疑似敏感值。
 
+`audit_trajectory_privacy.py` 在 live rollout 后扫描 Agent 实际可见的 messages、observation、action、
+tool/User 公开结果和 next observation。凭证或 acceptance contract、ground truth、future user turns 等
+内部控制字段一旦进入可见轨迹，该样本立即失去导出资格。生产认证器和便携包导出器都会针对原始 rollout
+独立重算，不能用人工修改的干净报告绕过。
+
 `build_docker_sandbox_image.sh` 将可达镜像标签解析为当前 Docker 平台的 manifest digest，以该内容地址
 构建并回写最终 Dockerfile；随后在生产安全参数下执行镜像内测试，成功后才写
 `docker_image_metadata.json`。每个并发 attempt 使用由其输出路径派生的唯一镜像 tag，认证时要求 tag、
@@ -94,7 +102,8 @@ Agent 模型和 User/Judge 模型身份。整个目录通过文件清册与 `bun
 便携包 v2 还会从每个环境内的原始 `live_rollout.json` 重新生成预期 transition 流，并与
 `transitions.jsonl` 逐条精确比较。校验范围包含 item/episode/step 引用、模型身份、parsed action 与原始
 输出的一致性、observation 链、reward、usage 以及 terminated/truncated 终止语义，防止只重算文件哈希
-就让语义损坏的轨迹通过。
+就让语义损坏的轨迹通过。JSONL 由固定字段白名单投影产生；完整 trainer-only 证据仍保存在对应环境目录，
+并由 manifest 的 `transition_visibility` 显式区分，避免下游把评估标签作为策略观测。
 
 导入前执行：
 

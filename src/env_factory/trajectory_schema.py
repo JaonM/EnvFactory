@@ -7,6 +7,25 @@ import math
 from typing import Any, Mapping
 
 
+POLICY_TRANSITION_FIELDS = (
+    "step",
+    "agent_input",
+    "assistant_output",
+    "observation",
+    "action",
+    "result",
+    "next_observation",
+    "reward",
+    "terminated",
+    "truncated",
+)
+
+
+def policy_transition(transition: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one step onto the stable trainer/policy interchange contract."""
+    return {name: transition.get(name) for name in POLICY_TRANSITION_FIELDS}
+
+
 def _number(value: Any) -> bool:
     return (
         isinstance(value, (int, float))
@@ -61,6 +80,9 @@ def transition_errors(transition: Any, *, expected_step: int) -> list[str]:
         errors.append(f"{prefix}:truncated")
     if transition.get("terminated") is True and transition.get("truncated") is True:
         errors.append(f"{prefix}:dual_terminal")
+    trainer_metadata = transition.get("trainer_metadata")
+    if trainer_metadata is not None and not isinstance(trainer_metadata, Mapping):
+        errors.append(f"{prefix}:trainer_metadata")
     return errors
 
 

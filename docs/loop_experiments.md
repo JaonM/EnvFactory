@@ -54,6 +54,9 @@ Pilot 通过只表示可以进入更大规模认证，
 - live rollout 通过后会以 `SANDBOX_EVALUATOR_MOCK=0` 执行奖励反事实校准，写入
   `agentic_training_value_live.json`。真实 evaluator 的成功轨迹、失败轨迹、无工具、错参数、跳步、乱序和
   噪声轨迹不满足奖励分离时，样本仍不合格；离线 mock 报告不能替代该证据。
+- live rollout 与奖励校准之间执行 policy-visible 隐私审计，写入 `trajectory_privacy.json`。User
+  Simulator 内部 outcome/FSM 标签只进入 trainer-only evidence，Agent 可见 `result` 只保留实际传给
+  Agent 的 `user_query`；发现凭证或隐藏控制字段时停止样本，不能进入便携训练素材包。
 - `--build-timeout`、`--generation-timeout`、`--score-timeout`、`--rollout-timeout` 分阶段限时，超时清理进程组。
 - `--max-total-seconds` 默认 259200，只累计实验进程的活跃执行时间；正常暂停不消耗预算。`runtime_state.json` 保存累计活跃时间和运行状态。质量循环不再因“停滞”或固定 20 轮提前结束；显式设置正数 `--max-rounds` 才启用轮数预算。基础设施超时属于异常中止而非质量收敛。
 - 同一个实验目录只允许一个运行进程；每个任务完成即原子保存。相同命令重启可恢复，不重复执行已经完成的任务；未完成构建使用新的 attempt 目录。中断的生成不会自动重新抽样，缺失任务计为失败。
@@ -80,6 +83,10 @@ Agent 只获得题面、公开工具及观测，使用 JSON 动作协议自主�
 前后观察、奖励、terminated/truncated 和调用用量；同时保留 HTTP trace 与 replay。轨迹绑定任务哈希、
 沙箱可执行输入摘要、模型及 provider 摘要。检查无操作高奖励、重复奖励不稳定，以及 stateful 目标不满足
 却得到高奖励。模型没有完成任务记录为缺少成功证据，不直接断言环境有错。
+
+这里的“User Simulator 结果”对策略侧仅指公开 `user_query`；outcome category、transition ID、match
+status 和 termination reasoning 属于 trainer-only metadata。便携 JSONL 采用字段白名单重新投影，不会
+因为未来在内部 rollout 结构中增加调试字段而自动把它们泄漏给训练策略。
 
 开发阶段的默认 live 门要求至少一条成功轨迹、全部轨迹无已检测环境问题且无 LLM fallback；
 发布留出集将成功率门提高到至少 2/3，并要求轨迹池同时包含成功和失败样本。

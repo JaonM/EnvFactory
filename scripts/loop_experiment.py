@@ -132,11 +132,13 @@ def failure(stage, detail, **extra):
     targets = {"generation": "task_pipeline", "task_quality": "task_contract",
                "build": "sandbox_builder", "offline_validation": "runtime_or_contract",
                "data_governance": "inspect_outbound_payload",
+               "trajectory_privacy": "inspect_policy_visible_trajectory",
                "infrastructure": "runner_or_provider", "live_rollout": "inspect_live_trajectory",
                "live_reward_calibration": "inspect_reward_evaluator"}
     codes = {"generation": "GEN_SEMANTIC", "task_quality": "TASK_BUILDABILITY",
              "build": "BUILD_BUSINESS", "offline_validation": "REWARD_OR_RUNTIME",
              "data_governance": "DATA_GOVERNANCE",
+             "trajectory_privacy": "TRAJECTORY_PRIVACY",
              "infrastructure": "INFRA", "live_rollout": "ROLLOUT_ENVIRONMENT",
              "live_reward_calibration": "LIVE_REWARD_CALIBRATION"}
     return {"passed": False, "failure_class": stage, "repair_target": targets.get(stage, "inspect"),
@@ -489,6 +491,42 @@ def build_one(project, task_path, output, config, seed=None):
                 detail=live.get("conclusion", "rollout failed"),
             )
         else:
+            privacy_path = output / "trajectory_privacy.json"
+            privacy_run = run_process([
+                sys.executable,
+                str(project / "scripts/audit_trajectory_privacy.py"),
+                "--rollout", str(live_path),
+                "--output", str(privacy_path),
+            ], project, output / "trajectory_privacy.log", config["score_timeout"])
+            try:
+                privacy = json.loads(privacy_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                privacy = {}
+            privacy_passed = (
+                privacy_run["exit_code"] == 0
+                and privacy.get("eligible_for_policy_training_export") is True
+            )
+            result.update(
+                trajectory_privacy=privacy,
+                trajectory_privacy_process=privacy_run,
+                trajectory_privacy_verified=privacy_passed,
+            )
+            if not privacy_passed:
+                result.update(
+                    passed=False,
+                    live_rollout_verified=False,
+                    failure_class=(
+                        "infrastructure" if privacy_run["timed_out"]
+                        else "trajectory_privacy"
+                    ),
+                    failure_code=(
+                        "INFRA" if privacy_run["timed_out"]
+                        else "TRAJECTORY_PRIVACY"
+                    ),
+                    repair_target="inspect_policy_visible_trajectory",
+                    detail=privacy or "trajectory privacy report unavailable",
+                )
+        if result["passed"]:
             calibration_path = output / "agentic_training_value_live.json"
             calibration_run = run_process([
                 sys.executable,

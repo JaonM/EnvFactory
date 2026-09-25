@@ -23,6 +23,7 @@ from env_factory.material_artifacts import (
     portable_artifact_digest,
     portable_artifact_digests,
 )
+from env_factory.material_privacy import audit_rollout_privacy
 from env_factory.trajectory_schema import complete_episode
 from env_factory.data_governance import (
     FORBIDDEN_OUTBOUND,
@@ -417,6 +418,12 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
     reproducible_containers = sum(
         report.get("verified") is True for report in container_reports
     )
+    privacy_reports = [_artifact(item, "trajectory_privacy.json") for item in qualified]
+    privacy_verified = sum(
+        report == audit_rollout_privacy(item.get("live_rollout", {}))
+        and report.get("eligible_for_policy_training_export") is True
+        for item, report in zip(qualified, privacy_reports)
+    )
     runtime_integrity = bool(readiness_reports) and all(
         report.get("training_ready") is True
         and report.get("evidence", {}).get("determinism") is True
@@ -605,6 +612,15 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
                 for gate in report.get("failed_gates", [])
             )),
         },
+        "trajectory_privacy": {
+            "reports": len(privacy_reports),
+            "verified": privacy_verified,
+            "all_verified": (
+                bool(qualified)
+                and len(privacy_reports) == len(qualified)
+                and privacy_verified == len(qualified)
+            ),
+        },
         "reward_counterfactuals": counterfactuals,
         "reward_false_positive_rate": false_positive_rate,
         "reward_false_negative_rate": false_negative_rate,
@@ -666,6 +682,7 @@ def certify(history: Mapping[str, Any], policy: Mapping[str, Any]) -> dict[str, 
         "container_reproducibility": measurements["container_reproducibility"][
             "all_verified"
         ],
+        "trajectory_privacy": measurements["trajectory_privacy"]["all_verified"],
         "material_identity": (
             len(material_items) == len(qualified)
             and len(material_fingerprints) == len(set(material_fingerprints))

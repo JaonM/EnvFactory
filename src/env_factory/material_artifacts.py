@@ -20,7 +20,7 @@ EVIDENCE_NAMES = {
     "agentic_training_value_live.json", "buildability.json",
     "data_governance.json",
     "offline_sandbox_score.json", "review_report.json", "score_summary.json",
-    "training_readiness.json",
+    "training_readiness.json", "trajectory_privacy.json",
 }
 SKIPPED_SUFFIXES = {".pyc", ".sqlite", ".sqlite3", ".db", ".log"}
 
