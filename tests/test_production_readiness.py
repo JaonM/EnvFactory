@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from env_factory.sandbox_scoring import (
     SCORE_RUBRIC,
@@ -27,6 +28,34 @@ verifier = load_script("verify_training_materials")
 
 
 class ProductionReadinessTest(unittest.TestCase):
+    @staticmethod
+    def sandbox_revalidation(history):
+        revalidation = {}
+        for holdout in history.get("holdouts", []):
+            for job in holdout.get("jobs", []):
+                result = job.get("result", {})
+                report = result.get("sandbox_score")
+                if not isinstance(report, dict):
+                    continue
+                root = Path(str(result.get("output", "")))
+                task_path = Path(str(result.get("task_path", "")))
+                revalidation[certifier.sandbox_revalidation_key(
+                    root, task_path
+                )] = {
+                    "verified": True,
+                    "exit_code": 0,
+                    "report": report,
+                    "error": None,
+                }
+        return revalidation
+
+    def certify(self, history):
+        return certifier.certify(
+            history,
+            certifier.default_policy(),
+            sandbox_revalidation=self.sandbox_revalidation(history),
+        )
+
     @staticmethod
     def fixture_task(category: str, description: str) -> dict:
         task = {
@@ -492,7 +521,7 @@ class ProductionReadinessTest(unittest.TestCase):
             # Exercise the authoritative on-disk representation: tuples in a
             # freshly computed score report become lists after JSON storage.
             history = json.loads(json.dumps(self.make_history(Path(directory))))
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertTrue(report["certified"], report["failed_gates"])
             self.assertEqual(report["scope"], "pre_training_material_readiness")
             self.assertIn("rl_training_execution", report["does_not_certify"])
@@ -523,7 +552,7 @@ class ProductionReadinessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             history = self.make_history(Path(directory))
             history["config"]["execution_provenance"]["python"]["version"] = "0.0"
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["execution_environment"])
             self.assertIn("execution_environment", report["failed_gates"])
@@ -536,7 +565,7 @@ class ProductionReadinessTest(unittest.TestCase):
             value = json.loads(sample_manifest.read_text())
             value["generator_provider"]["identity_sha256"] = "f" * 64
             sample_manifest.write_text(json.dumps(value))
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["generation_provenance"])
             self.assertIn("generation_provenance", report["failed_gates"])
@@ -544,7 +573,7 @@ class ProductionReadinessTest(unittest.TestCase):
     def test_pilot_sized_holdout_cannot_claim_production_certification(self):
         with tempfile.TemporaryDirectory() as directory:
             history = self.make_history(Path(directory), count=30)
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertIn("materialized_sample_size", report["failed_gates"])
             self.assertIn("rollout_coverage", report["failed_gates"])
@@ -567,7 +596,7 @@ class ProductionReadinessTest(unittest.TestCase):
             sample = json.loads(sample_path.read_text())
             sample["task_sha256"] = changed_digest
             sample_path.write_text(json.dumps(sample))
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["holdout_partition_isolation"])
             self.assertEqual(
@@ -582,7 +611,7 @@ class ProductionReadinessTest(unittest.TestCase):
             history["holdout"]["jobs"][0]["result"]["live_rollout"]["episodes"][0][
                 "issues"
             ] = ["runtime_llm_fallback"]
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["environment_integrity"])
             self.assertEqual(report["measurements"]["llm_fallbacks"], 1)
 
@@ -593,7 +622,7 @@ class ProductionReadinessTest(unittest.TestCase):
             for job in jobs[:46]:
                 turns = job["result"]["live_rollout"]["episodes"][0]["trajectory"]
                 turns[1]["result"].pop("outcome_category")
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["user_simulator_protocol"])
 
     def test_rollout_must_be_bound_to_the_exact_task_and_sandbox(self):
@@ -601,7 +630,7 @@ class ProductionReadinessTest(unittest.TestCase):
             history = self.make_history(Path(directory))
             result = history["holdouts"][0]["jobs"][0]["result"]
             result["live_rollout"]["task_sha256"] = "0" * 64
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["rollout_provenance"])
 
     def test_in_process_rollout_cannot_certify_container_execution(self):
@@ -611,7 +640,7 @@ class ProductionReadinessTest(unittest.TestCase):
             rollout["runtime_execution"] = {
                 "version": "1.0", "mode": "in_process", "container_image_id": None,
             }
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["rollout_provenance"])
             self.assertFalse(report["gates"]["container_rollout_execution"])
@@ -624,7 +653,7 @@ class ProductionReadinessTest(unittest.TestCase):
             value = json.loads(live_report.read_text())
             value["validation_mode"] = "offline_mock"
             live_report.write_text(json.dumps(value))
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["tool_and_reward_integrity"])
 
     def test_in_process_reward_calibration_cannot_certify_production(self):
@@ -639,7 +668,7 @@ class ProductionReadinessTest(unittest.TestCase):
                 "container_image_id": None,
             }
             live_report.write_text(json.dumps(value))
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["container_reward_calibration"])
 
@@ -650,7 +679,7 @@ class ProductionReadinessTest(unittest.TestCase):
             result["task_score"]["eligible"] = False
             # A stale or tampered outer result still claims final success.
             self.assertTrue(result["passed"])
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["qualification_lineage"])
             self.assertEqual(
@@ -668,7 +697,7 @@ class ProductionReadinessTest(unittest.TestCase):
             ]
             rollout["passed"] = False
             rollout["agent_success_rate"] = 1.0
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["rollout_outcome_integrity"])
             self.assertEqual(
@@ -682,13 +711,81 @@ class ProductionReadinessTest(unittest.TestCase):
             result = history["holdouts"][0]["jobs"][0]["result"]
             result["sandbox_score"] = dict(result["sandbox_score"])
             result["sandbox_score"]["score"] = 9.5
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["sandbox_score_provenance"])
             self.assertEqual(
                 report["measurements"]["sandbox_score_provenance"],
                 {"verified": 899, "failures": 1},
             )
+
+    def test_production_certification_requires_executable_sandbox_revalidation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            report = certifier.certify(history, certifier.default_policy())
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["sandbox_executable_revalidation"])
+            self.assertEqual(
+                report["measurements"]["sandbox_executable_revalidation"],
+                {"verified": 0, "expected": 900, "failures": 900},
+            )
+
+    def test_revalidated_score_must_match_the_frozen_score_envelope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            revalidation = self.sandbox_revalidation(history)
+            result = history["holdouts"][0]["jobs"][0]["result"]
+            key = certifier.sandbox_revalidation_key(
+                Path(result["output"]), Path(result["task_path"])
+            )
+            rerun = dict(revalidation[key]["report"])
+            rerun["score"] = 9.5
+            revalidation[key] = {**revalidation[key], "report": rerun}
+            report = certifier.certify(
+                history,
+                certifier.default_policy(),
+                sandbox_revalidation=revalidation,
+            )
+            self.assertFalse(report["certified"])
+            self.assertFalse(report["gates"]["sandbox_executable_revalidation"])
+            self.assertEqual(
+                report["measurements"]["sandbox_executable_revalidation"],
+                {"verified": 899, "expected": 900, "failures": 1},
+            )
+
+    def test_sandbox_revalidation_invokes_offline_executable_scorer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sandbox"
+            root.mkdir()
+            task = root / "task.json"
+            task.write_text("{}")
+            claimed = {"passed": True, "score": 8.0}
+            history = {"holdouts": [{"jobs": [{"result": {
+                "output": str(root),
+                "task_path": str(task),
+                "sandbox_score": claimed,
+            }}]}]}
+
+            def fake_run(command, **kwargs):
+                self.assertIn("score_sandbox_offline.py", command[1])
+                self.assertIn("--no-individual", command)
+                self.assertEqual(kwargs["env"]["SANDBOX_EVALUATOR_MOCK"], "1")
+                self.assertNotIn("SANDBOX_LLM_API_KEY", kwargs["env"])
+                output = Path(command[command.index("--output") + 1])
+                output.write_text(json.dumps({"sandboxes": [claimed]}))
+                return certifier.subprocess.CompletedProcess(command, 0)
+
+            with patch.object(certifier.subprocess, "run", side_effect=fake_run):
+                result = certifier.run_sandbox_revalidation(
+                    history,
+                    project=ROOT,
+                    policy=certifier.default_policy(),
+                    max_workers=1,
+                    timeout=10,
+                )
+            key = certifier.sandbox_revalidation_key(root, task)
+            self.assertEqual(result[key]["report"], claimed)
+            self.assertTrue(result[key]["verified"])
 
     def test_sandbox_score_rubric_weights_and_critical_flags_are_immutable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -730,7 +827,7 @@ class ProductionReadinessTest(unittest.TestCase):
             result["task_score"] = dict(result["task_score"])
             result["task_score"]["score"] = 9.5
             result["category"] = "multi_step_agentic"
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["task_score_provenance"])
             self.assertEqual(
@@ -743,7 +840,7 @@ class ProductionReadinessTest(unittest.TestCase):
             history = self.make_history(Path(directory))
             result = history["holdouts"][0]["jobs"][0]["result"]
             result["score"] = 9.5
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["certified"])
             self.assertFalse(report["gates"]["final_result_provenance"])
             self.assertEqual(
@@ -820,7 +917,7 @@ class ProductionReadinessTest(unittest.TestCase):
                 "kind": "assigned_secret", "path": "$.data/config.txt",
             }]
             path.write_text(json.dumps(value))
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["data_governance"])
             self.assertIn("data_governance", report["failed_gates"])
 
@@ -839,7 +936,7 @@ class ProductionReadinessTest(unittest.TestCase):
             result["live_rollout"]["task_sha256"] = __import__("hashlib").sha256(
                 task_path.read_bytes()
             ).hexdigest()
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["data_governance"])
             self.assertFalse(report["measurements"]["data_governance"]["all_verified"])
 
@@ -848,7 +945,7 @@ class ProductionReadinessTest(unittest.TestCase):
             root = Path(directory)
             history = self.make_history(root)
             (root / "evidence/requirements-dev.txt").write_text("pytest>=8,<10\n")
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["container_reproducibility"])
             self.assertIn("container_reproducibility", report["failed_gates"])
 
@@ -861,7 +958,7 @@ class ProductionReadinessTest(unittest.TestCase):
                 "status": 200,
                 "token": "sk-abcdefghijklmnopqrstuvwxyz123456",
             }
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["trajectory_privacy"])
             self.assertIn("trajectory_privacy", report["failed_gates"])
 
@@ -871,7 +968,7 @@ class ProductionReadinessTest(unittest.TestCase):
             for batch in history["holdouts"]:
                 for job in batch["jobs"]:
                     job["result"]["category"] = "multi_step_agentic"
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["category_mix"])
             self.assertFalse(report["gates"]["independent_holdout_batches"])
 
@@ -887,7 +984,7 @@ class ProductionReadinessTest(unittest.TestCase):
                             outcome_category="user_acceptance",
                             reason_code="accepted",
                         )
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["user_simulator_outcome_coverage"])
 
     def test_holdout_summary_cannot_hide_reused_seed(self):
@@ -896,7 +993,7 @@ class ProductionReadinessTest(unittest.TestCase):
             first = history["holdouts"][0]["jobs"][0]["result"]
             second = history["holdouts"][1]["jobs"][0]["result"]
             second["sample_seed"] = first["sample_seed"]
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["fresh_holdout"])
             self.assertFalse(report["measurements"]["fresh_holdout_evidence"]["verified"])
 
@@ -905,7 +1002,7 @@ class ProductionReadinessTest(unittest.TestCase):
             history = self.make_history(Path(directory))
             episode = history["holdouts"][0]["jobs"][0]["result"]["live_rollout"]["episodes"][0]
             episode["transitions"][-1]["terminated"] = False
-            report = certifier.certify(history, certifier.default_policy())
+            report = self.certify(history)
             self.assertFalse(report["gates"]["trajectory_schema"])
 
     def test_material_manifest_detects_post_certification_changes(self):

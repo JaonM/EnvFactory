@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import subprocess
+import sys
+import tempfile
 from typing import Any, Iterable, Mapping
 
 from env_factory.material_artifacts import (
@@ -57,6 +62,144 @@ REQUIRED_OUTBOUND_SURFACES = {
 
 def load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def sandbox_revalidation_key(root: Path, task_path: Path) -> str:
+    try:
+        task_sha256 = hashlib.sha256(task_path.read_bytes()).hexdigest()
+    except OSError:
+        task_sha256 = "missing"
+    return digest_json({
+        "sandbox_root": str(root.resolve()),
+        "task_sha256": task_sha256,
+    })
+
+
+def score_envelope(report: Mapping[str, Any] | Any) -> dict[str, Any] | None:
+    """Return deterministic score semantics; diagnostic text may vary."""
+    if not isinstance(report, Mapping):
+        return None
+    checks = report.get("checks")
+    if not isinstance(checks, list):
+        return None
+    return {
+        "score": report.get("score"),
+        "eligible": report.get("eligible"),
+        "passed": report.get("passed"),
+        "threshold": report.get("threshold"),
+        "failed_critical_gates": report.get("failed_critical_gates"),
+        "checks": [
+            {
+                key: check.get(key)
+                for key in ("name", "weight", "passed", "critical")
+            }
+            if isinstance(check, Mapping) else None
+            for check in checks
+        ],
+        "mode": report.get("mode"),
+        "network_used": report.get("network_used"),
+        "model_used": report.get("model_used"),
+        "model": report.get("model"),
+        "review_model": report.get("review_model"),
+        "evidence_fingerprint": report.get("evidence_fingerprint"),
+    }
+
+
+def run_sandbox_revalidation(
+    history: Mapping[str, Any],
+    *,
+    project: Path,
+    policy: Mapping[str, Any],
+    max_workers: int = 4,
+    timeout: int = 1800,
+) -> dict[str, dict[str, Any]]:
+    """Re-execute every claimed passing sandbox with offline hard gates."""
+    raw_holdouts = history.get("holdouts")
+    holdouts = (
+        [item for item in raw_holdouts if isinstance(item, Mapping)]
+        if isinstance(raw_holdouts, list) and raw_holdouts
+        else [history.get("holdout")]
+    )
+    targets: dict[str, tuple[Path, Path]] = {}
+    for holdout in holdouts:
+        if not isinstance(holdout, Mapping):
+            continue
+        for job in holdout.get("jobs", []):
+            result = job.get("result") if isinstance(job, Mapping) else None
+            if not isinstance(result, Mapping):
+                continue
+            score = result.get("sandbox_score")
+            if not (
+                isinstance(score, Mapping)
+                and score.get("passed") is True
+                and score.get("score", 0) >= policy["score_threshold"]
+            ):
+                continue
+            root = Path(str(result.get("output", "")))
+            task_path = Path(str(result.get("task_path", "")))
+            targets[sandbox_revalidation_key(root, task_path)] = (root, task_path)
+
+    def execute(key: str, root: Path, task_path: Path) -> tuple[str, dict[str, Any]]:
+        if not root.is_dir() or not task_path.is_file():
+            return key, {"verified": False, "error": "missing_artifact"}
+        environment = os.environ.copy()
+        environment["SANDBOX_EVALUATOR_MOCK"] = "1"
+        for name in (
+            "SANDBOX_LLM_API_KEY", "SANDBOX_LLM_BASE_URL",
+            "SANDBOX_EXTERNAL_CAPABILITY_URL", "LLM_API_KEY", "LLM_BASE_URL",
+        ):
+            environment.pop(name, None)
+        with tempfile.TemporaryDirectory(prefix="envfactory-certify-") as directory:
+            output = Path(directory) / "score_summary.json"
+            command = [
+                sys.executable,
+                str(project / "scripts/score_sandbox_offline.py"),
+                str(root),
+                "--project", str(project),
+                "--threshold", str(policy["score_threshold"]),
+                "--output", str(output),
+                "--no-individual",
+            ]
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=project,
+                    env=environment,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout,
+                )
+                summary = load(output)
+                reports = summary.get("sandboxes")
+                report = (
+                    reports[0]
+                    if isinstance(reports, list) and len(reports) == 1
+                    else None
+                )
+                return key, {
+                    "verified": completed.returncode == 0,
+                    "exit_code": completed.returncode,
+                    "report": report,
+                    "error": (
+                        None if completed.returncode == 0 else "scorer_failed"
+                    ),
+                }
+            except subprocess.TimeoutExpired:
+                return key, {"verified": False, "error": "timeout"}
+            except (OSError, TypeError, json.JSONDecodeError):
+                return key, {"verified": False, "error": "invalid_output"}
+
+    results: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+        futures = {
+            executor.submit(execute, key, root, task_path): key
+            for key, (root, task_path) in targets.items()
+        }
+        for future in as_completed(futures):
+            key, result = future.result()
+            results[key] = result
+    return results
 
 
 def artifact_digests(root: Path) -> dict[str, str]:
@@ -502,7 +645,11 @@ def partition_isolation_evidence(
 
 
 def certify(
-    history: Mapping[str, Any], policy: Mapping[str, Any], *, project: Path | None = None
+    history: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    *,
+    project: Path | None = None,
+    sandbox_revalidation: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     project = project or Path(__file__).resolve().parents[1]
     recorded_execution = history.get("config", {}).get("execution_provenance")
@@ -554,8 +701,12 @@ def certify(
             and claimed.get("score", 0) >= policy["score_threshold"]
         ):
             task_score_failures.append(str(task_path))
+    structurally_verified_sandbox_scores: set[int] = set()
     verified_sandbox_scores: set[int] = set()
+    executable_revalidated_scores: set[int] = set()
     sandbox_score_failures = []
+    executable_revalidation_failures = []
+    sandbox_revalidation = sandbox_revalidation or {}
     for item in results:
         claimed = item.get("sandbox_score")
         if not isinstance(claimed, Mapping):
@@ -573,22 +724,50 @@ def certify(
             ) if isinstance(reports, list) else None
         except (OSError, json.JSONDecodeError, TypeError, IndexError):
             stored = None
-        if (
+        task_path = Path(str(item.get("task_path", "")))
+        revalidation = sandbox_revalidation.get(
+            sandbox_revalidation_key(root, task_path), {}
+        )
+        rerun = (
+            revalidation.get("report")
+            if isinstance(revalidation, Mapping) else None
+        )
+        executable_verified = (
+            isinstance(revalidation, Mapping)
+            and revalidation.get("verified") is True
+            and score_envelope(rerun) == score_envelope(claimed)
+            and valid_score_report(
+                rerun,
+                root=root,
+                project=project,
+                threshold=float(policy["score_threshold"]),
+                task_path=task_path,
+            )
+        )
+        if executable_verified:
+            executable_revalidated_scores.add(id(item))
+        structurally_verified = (
             stored == claimed
             and valid_score_report(
                 stored,
                 root=root,
                 project=project,
                 threshold=float(policy["score_threshold"]),
-                task_path=Path(str(item.get("task_path", ""))),
+                task_path=task_path,
             )
-        ):
+        )
+        if structurally_verified:
+            structurally_verified_sandbox_scores.add(id(item))
+        if structurally_verified and executable_verified:
             verified_sandbox_scores.add(id(item))
         elif (
             claimed.get("passed") is True
             and claimed.get("score", 0) >= policy["score_threshold"]
         ):
-            sandbox_score_failures.append(str(item.get("task_path", "")))
+            if not structurally_verified:
+                sandbox_score_failures.append(str(item.get("task_path", "")))
+            if not executable_verified:
+                executable_revalidation_failures.append(str(task_path))
     def task_passes(item: Mapping[str, Any]) -> bool:
         return (
             id(item) in verified_task_scores
@@ -663,6 +842,10 @@ def certify(
     qualification_lineage = lineage_violations == 0
     task_score_provenance = not task_score_failures
     sandbox_score_provenance = not sandbox_score_failures
+    sandbox_executable_revalidation = (
+        bool(executable_revalidated_scores)
+        and not executable_revalidation_failures
+    )
     final_result_provenance = not final_result_failures
     rates = {
         "generation_completion": len(generated) / total if total else 0.0,
@@ -983,8 +1166,16 @@ def certify(
             "violations": lineage_violations,
         },
         "sandbox_score_provenance": {
-            "verified": len(verified_sandbox_scores),
+            "verified": len(structurally_verified_sandbox_scores),
             "failures": len(sandbox_score_failures),
+        },
+        "sandbox_executable_revalidation": {
+            "verified": len(executable_revalidated_scores),
+            "expected": (
+                len(executable_revalidated_scores)
+                + len(executable_revalidation_failures)
+            ),
+            "failures": len(executable_revalidation_failures),
         },
         "final_result_provenance": {
             "verified": len(verified_final_results),
@@ -1099,6 +1290,7 @@ def certify(
         "task_score_provenance": task_score_provenance,
         "qualification_lineage": qualification_lineage,
         "sandbox_score_provenance": sandbox_score_provenance,
+        "sandbox_executable_revalidation": sandbox_executable_revalidation,
         "final_result_provenance": final_result_provenance,
         "task_good_yield": (
             rates["task_good_yield"] >= policy["min_task_yield"]
@@ -1260,13 +1452,38 @@ def main() -> int:
     parser.add_argument("--bundle-output", type=Path)
     parser.add_argument("--bundle-signing-private-key", type=Path)
     parser.add_argument("--bundle-trusted-public-key", type=Path)
+    parser.add_argument("--revalidation-workers", type=int, default=4)
+    parser.add_argument("--revalidation-timeout", type=int, default=1800)
     args = parser.parse_args()
+    history = load(args.history.resolve())
+    policy = default_policy()
+    project = args.project.resolve()
+    print(
+        "production certification: re-executing sandbox evidence",
+        file=sys.stderr,
+    )
+    sandbox_revalidation = run_sandbox_revalidation(
+        history,
+        project=project,
+        policy=policy,
+        max_workers=args.revalidation_workers,
+        timeout=args.revalidation_timeout,
+    )
+    print(
+        "production certification: sandbox evidence revalidation complete "
+        f"({sum(item.get('verified') is True for item in sandbox_revalidation.values())}"
+        f"/{len(sandbox_revalidation)})",
+        file=sys.stderr,
+    )
     report = certify(
-        load(args.history.resolve()), default_policy(), project=args.project.resolve()
+        history,
+        policy,
+        project=project,
+        sandbox_revalidation=sandbox_revalidation,
     )
     from verify_training_materials import verify
     report = attach_artifact_verification(
-        report, verify(report["materials_manifest"], args.project.resolve())
+        report, verify(report["materials_manifest"], project)
     )
     if report["certified"]:
         from export_training_materials import export_bundle, verify_bundle
@@ -1281,7 +1498,7 @@ def main() -> int:
                 )
             else:
                 bundle_verification = export_bundle(
-                    report, bundle_root, args.project.resolve(),
+                    report, bundle_root, project,
                     signing_private_key=args.bundle_signing_private_key,
                     trusted_public_key=args.bundle_trusted_public_key,
                 )

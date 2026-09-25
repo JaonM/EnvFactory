@@ -23,6 +23,10 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
 - 沙箱离线分数必须与冻结的 `score_summary.json` 完全一致。认证器重新计算实现与评分器源码指纹、检查
   标准 10 项评分集合，并从各项权重和 critical 状态重建总分、资格及失败门禁；裸 `score=10`、陈旧报告
   或手工修改的汇总不能进入构建良品率分子。
+- 生产认证不会只读取上述评分报告。认证 CLI 会在禁用网络和外部模型配置的环境中重新执行每个声称通过
+  的沙箱验收、pytest、外层 conformance、mutation、readiness 和 agentic-value 检查，并要求重跑得到的
+  检查状态、总分、模型身份和证据指纹与冻结报告一致。缺少重跑结果、超时或重跑漂移均不能获得认证；
+  `--revalidation-workers` 和 `--revalidation-timeout` 只控制并发与单沙箱时间预算，不能跳过该门禁。
 - 最终样本分数也不是可信输入。认证器先从原始 episode 重建 rollout 结论，再按照
   `min(10, 0.9 × 离线沙箱分 + rollout质量分)` 重算最终分；只有声明的 `passed` 和分数均与重算结果一致
   时，样本才能进入训练素材清单。
