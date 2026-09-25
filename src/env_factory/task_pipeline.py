@@ -6706,6 +6706,11 @@ class TaskGenerationPipeline(UserSimulationContractMixin):
         return {
             "version": "1.0",
             "environment_mode": environment_mode,
+            "data_governance": {
+                "origin": "model_generated_synthetic",
+                "contains_real_user_data": False,
+                "intended_use": "agentic_rl_training_material",
+            },
             "root": str(artifact_dir),
             "document_file": str(document_path.relative_to(artifact_dir)),
             "tables": manifest_tables,

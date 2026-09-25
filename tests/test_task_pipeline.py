@@ -140,6 +140,11 @@ class BusinessDataArtifactsTest(unittest.TestCase):
             )
             self.assertEqual(manifest["environment_mode"], "stateless")
             self.assertEqual(manifest["tables"], [])
+            self.assertEqual(manifest["data_governance"], {
+                "origin": "model_generated_synthetic",
+                "contains_real_user_data": False,
+                "intended_use": "agentic_rl_training_material",
+            })
 
     def test_materialize_business_data_writes_schema_rows_and_document(self):
         tables = [{

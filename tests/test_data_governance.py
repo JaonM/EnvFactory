@@ -1,0 +1,116 @@
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+from env_factory.data_governance import audit, provider_identity
+
+
+class DataGovernanceTest(unittest.TestCase):
+    def make_root(self, root: Path, *, governance=None, material=None) -> None:
+        (root / "data").mkdir()
+        (root / "task.json").write_text(json.dumps({
+            "public_input": {"request": "process the synthetic fixture"},
+            "tools": [],
+            "artifacts": {"data_manifest": governance or {
+                "origin": "invalid",
+            }},
+        }))
+        if material is not None:
+            (root / "data/material.txt").write_text(material)
+
+    @staticmethod
+    def synthetic_manifest():
+        return {"data_governance": {
+            "origin": "model_generated_synthetic",
+            "contains_real_user_data": False,
+            "intended_use": "agentic_rl_training_material",
+        }}
+
+    def run_audit(self, root: Path):
+        return audit(
+            root,
+            agent_base_url="https://agent.example/v1",
+            agent_model="policy-model",
+            runtime_base_url="https://runtime.example/v1",
+            runtime_model="simulator-model",
+        )
+
+    def test_declared_synthetic_payload_is_eligible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_root(root, governance=self.synthetic_manifest(), material="fixture row")
+            report = self.run_audit(root)
+            self.assertTrue(report["eligible_for_external_model_processing"])
+            self.assertEqual(report["credential_findings"], [])
+            self.assertEqual(report["providers"]["agent"]["host"], "agent.example")
+
+    def test_credential_is_reported_by_location_without_leaking_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+            self.make_root(
+                root, governance=self.synthetic_manifest(), material=f"api_key={secret}"
+            )
+            report = self.run_audit(root)
+            self.assertFalse(report["eligible_for_external_model_processing"])
+            self.assertTrue(report["credential_findings"])
+            self.assertNotIn(secret, json.dumps(report))
+
+    def test_synthetic_pii_fixture_is_reported_but_not_mislabeled_as_real(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_root(
+                root,
+                governance=self.synthetic_manifest(),
+                material="fictional contact: fixture@example.test",
+            )
+            report = self.run_audit(root)
+            self.assertTrue(report["eligible_for_external_model_processing"])
+            self.assertEqual(report["pii_findings"][0]["kind"], "email")
+
+    def test_missing_synthetic_declaration_is_ineligible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_root(root, material="fixture@example.test")
+            report = self.run_audit(root)
+            self.assertFalse(report["eligible_for_external_model_processing"])
+
+    def test_reward_rubric_is_inside_the_scanned_outbound_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_root(root, governance=self.synthetic_manifest())
+            task = json.loads((root / "task.json").read_text())
+            task["metrics"] = [{
+                "rubric": "Use Bearer abcdefghijklmnopqrstuvwxyz123456",
+                "criteria": ["correct"],
+                "evaluation_inputs": ["final_agent_response"],
+            }]
+            (root / "task.json").write_text(json.dumps(task))
+            report = self.run_audit(root)
+            self.assertFalse(report["eligible_for_external_model_processing"])
+            self.assertIn("reward_contract", report["credential_findings"][0]["path"])
+
+    def test_provider_models_are_required_before_external_processing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_root(root, governance=self.synthetic_manifest())
+            report = audit(
+                root,
+                agent_base_url="https://agent.example/v1",
+                agent_model="",
+                runtime_base_url="https://runtime.example/v1",
+                runtime_model="simulator-model",
+            )
+            self.assertFalse(report["eligible_for_external_model_processing"])
+
+    def test_provider_identity_is_stable_and_does_not_contain_base_url(self):
+        first = provider_identity("https://provider.example/v1/", "model-a")
+        second = provider_identity("https://provider.example/v1", "model-a")
+        self.assertEqual(first, second)
+        self.assertEqual(len(first["identity_sha256"]), 64)
+        self.assertNotIn("base_url", first)
+
+
+if __name__ == "__main__":
+    unittest.main()
