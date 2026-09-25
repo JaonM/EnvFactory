@@ -130,13 +130,23 @@ def run_production_preflight(
         "urls_valid": urls_valid,
         },
     )
-    evaluator_separated = (
-        agent_provider["identity_sha256"]
-        != runtime_provider["identity_sha256"]
+    provider_hosts_distinct = agent_provider["host"] != runtime_provider["host"]
+    evaluator_models_distinct = agent_provider["model"] != runtime_provider["model"]
+    evaluator_separated = provider_hosts_distinct and evaluator_models_distinct
+    record(
+        "evaluator_role_separation",
+        evaluator_separated,
+        {
+            "agent_and_evaluator_distinct": evaluator_separated,
+            **(
+                {
+                    "provider_hosts_distinct": provider_hosts_distinct,
+                    "models_distinct": evaluator_models_distinct,
+                }
+                if experiment_config is not None else {}
+            ),
+        },
     )
-    record("evaluator_role_separation", evaluator_separated, {
-        "agent_and_evaluator_distinct": evaluator_separated,
-    })
 
     timeout_checks: dict[str, bool] = {}
     for name, role in roles.items():
@@ -181,7 +191,7 @@ def run_production_preflight(
 
     failed = [item["name"] for item in checks if not item["passed"]]
     return {
-        "version": "1.2" if experiment_config is not None else "1.0",
+        "version": "1.3" if experiment_config is not None else "1.0",
         "scope": "production_pre_training_material_experiment",
         **(
             {"experiment_config_sha256": digest_json(experiment_config)}
@@ -221,17 +231,17 @@ def valid_production_preflight(
 ) -> bool:
     """Validate evidence produced by a fresh, trusted preflight execution."""
     if not isinstance(value, Mapping) or value.get("version") not in {
-        "1.0", "1.1", "1.2",
+        "1.0", "1.1", "1.2", "1.3",
     }:
         return False
     config_digest = value.get("experiment_config_sha256")
-    if value.get("version") in {"1.1", "1.2"} and not (
+    if value.get("version") in {"1.1", "1.2", "1.3"} and not (
         isinstance(config_digest, str)
         and re.fullmatch(r"[0-9a-f]{64}", config_digest) is not None
     ):
         return False
     if expected_experiment_config_sha256 is not None and not (
-        value.get("version") in {"1.1", "1.2"}
+        value.get("version") in {"1.1", "1.2", "1.3"}
         and config_digest == expected_experiment_config_sha256
     ):
         return False
@@ -258,9 +268,23 @@ def valid_production_preflight(
         and all(check.get("passed") is True for check in by_name.values())
     ):
         return False
-    if by_name["evaluator_role_separation"].get("evidence") != {
-        "agent_and_evaluator_distinct": True,
-    }:
+    separation_evidence = by_name["evaluator_role_separation"].get("evidence")
+    expected_separation = (
+        {
+            "agent_and_evaluator_distinct": True,
+            "provider_hosts_distinct": True,
+            "models_distinct": True,
+        }
+        if value.get("version") == "1.3"
+        else {"agent_and_evaluator_distinct": True}
+    )
+    if separation_evidence != expected_separation:
+        return False
+    if (
+        expected_bundle_version == BUNDLE_VERSION
+        and expected_experiment_config_sha256 is not None
+        and value.get("version") != "1.3"
+    ):
         return False
     signing_evidence = by_name["bundle_signing_identity"].get("evidence")
     if not (
@@ -285,7 +309,7 @@ def valid_production_preflight(
         "agent": model_evidence.get("agent_allowed_response_models"),
         "runtime": model_evidence.get("runtime_allowed_response_models"),
     }
-    require_allowlists = value.get("version") == "1.2" or any(
+    require_allowlists = value.get("version") in {"1.2", "1.3"} or any(
         expected is not None for expected in (
             expected_generation_response_models,
             expected_agent_response_models,
@@ -293,7 +317,7 @@ def valid_production_preflight(
         )
     )
     if require_allowlists and not (
-        value.get("version") == "1.2"
+        value.get("version") in {"1.2", "1.3"}
         and model_evidence.get("response_allowlists_valid") is True
         and all(
             isinstance(values, list) and bool(values)
@@ -347,6 +371,8 @@ def valid_production_preflight(
     )
     return (
         providers_valid
-        and model_evidence["agent_provider"]["identity_sha256"]
-            != model_evidence["runtime_provider"]["identity_sha256"]
+        and model_evidence["agent_provider"]["host"]
+            != model_evidence["runtime_provider"]["host"]
+        and model_evidence["agent_provider"]["model"]
+            != model_evidence["runtime_provider"]["model"]
     )

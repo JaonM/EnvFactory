@@ -1290,6 +1290,10 @@ def verify_bundle(
                 if (
                     rollout.get("agent_provider_sha256")
                     == rollout.get("runtime_provider_sha256")
+                    or providers.get("agent", {}).get("host")
+                        == providers.get("user_simulator_and_reward", {}).get(
+                            "host"
+                        )
                 ):
                     verified_same_provider_evaluator_items += 1
         if item.get("episode_count") != len(rollout.get("episodes", [])):

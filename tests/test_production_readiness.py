@@ -49,7 +49,7 @@ class ProductionReadinessTest(unittest.TestCase):
             "identity_sha256": "b" * 64,
         }
         return {
-            "version": "1.2",
+            "version": "1.3",
             "experiment_config_sha256": certifier.digest_json(config),
             "scope": "production_pre_training_material_experiment",
             "network_probe_performed": False,
@@ -82,6 +82,8 @@ class ProductionReadinessTest(unittest.TestCase):
                         if name == "bundle_signing_identity" else {}
                         if name != "evaluator_role_separation" else {
                             "agent_and_evaluator_distinct": True,
+                            "provider_hosts_distinct": True,
+                            "models_distinct": True,
                         }
                     ),
                 }
@@ -946,6 +948,23 @@ class ProductionReadinessTest(unittest.TestCase):
                 report["measurements"]["evaluator_independence"]
                     ["same_provider_items"],
                 1,
+            )
+
+    def test_same_endpoint_different_models_cannot_certify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = self.make_history(Path(directory))
+            history["config"]["runtime_provider"]["host"] = (
+                history["config"]["rollout_provider"]["host"]
+            )
+            report = self.certify(history)
+            self.assertFalse(report["gates"]["evaluator_independence"])
+            self.assertEqual(
+                report["measurements"]["evaluator_independence"],
+                {
+                    "same_provider_items": 900,
+                    "total_items": 900,
+                    "same_provider_rate": 1.0,
+                },
             )
 
     def test_invalid_user_simulator_protocol_breaks_certification(self):

@@ -96,8 +96,12 @@ def valid_experiment_contract(
             and all(isinstance(item, str) and item.strip() for item in allowlist)
         ):
             return False
+    agent_provider = configuration["rollout_provider"]
+    evaluator_provider = configuration["runtime_provider"]
     return (
-        HEX64.fullmatch(str(
+        agent_provider["host"] != evaluator_provider["host"]
+        and agent_provider["model"] != evaluator_provider["model"]
+        and HEX64.fullmatch(str(
             configuration.get("bundle_attestation_key_identity_sha256", "")
         )) is not None
         and HEX64.fullmatch(str(configuration.get("source_digest", ""))) is not None

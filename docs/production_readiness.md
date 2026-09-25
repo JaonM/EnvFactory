@@ -25,8 +25,10 @@ EnvFactory 的当前认证边界是 `production_prepared_for_agentic_rl`：证�
   工作区容量，并由循环写入 `production_certification_preflight.json`。实验启动时的
   `production_preflight.json` 仅用于诊断，不能替代认证阶段的新鲜检查。preflight 中规范化后的任务生成、
   Rollout Agent、User/Judge 三个 provider 身份以及签名公钥身份必须逐项匹配冻结实验清单；Rollout Agent
-  和 User/Judge 未单独配置时才逐字段回退到生成模型。任意可用但身份不同的模型配置或另一套自洽密钥
-  不能替代原实验环境。最终 bundle 的 detached signature 也必须使用同一公钥身份。
+  和 User/Judge 未单独配置时才逐字段回退到生成模型。认证 preflight v1.3 要求 Rollout Agent 与
+  User/Judge 同时使用不同 endpoint host 和不同模型；同一服务地址只更换模型名不构成独立评估。
+  任意可用但身份不同的模型配置或另一套自洽密钥不能替代原实验环境。最终 bundle 的 detached
+  signature 也必须使用同一公钥身份。
 
 - 连续 3 个独立留出批次，每批至少 300 个实际生成的新任务；开发阶段和各留出批次之间的 seed、
   任务内容均不重叠。
@@ -243,7 +245,8 @@ policy transition 字段必须与契约精确相等，消息只允许 `role` 与
 
 v16 及后续验证器还会把 preflight 的 generation、Rollout Agent、User/Judge 三个 provider 分别与每个环境中的
 生成 provenance 和 `data_governance.json` 交叉核对；三个各自格式合法但来自不同实验的身份不能拼成合格包。
-认证阶段生成的 preflight v1.2 还会绑定完整冻结实验配置的 SHA-256 与三类响应模型 allowlist；任务配比、门禁阈值、holdout 参数或
+认证阶段生成的 preflight v1.3 还会绑定完整冻结实验配置的 SHA-256、三类响应模型 allowlist 及 evaluator
+endpoint/model 分离证据；任务配比、门禁阈值、holdout 参数或
 其他配置发生变化后，旧 preflight 不能复用。启动阶段的 v1.0 preflight 仅作环境诊断，不构成认证证据。
 导出器会移除 measurements 中的路径字段、把残留绝对路径替换为稳定占位符，并扫描便携认证元数据中的
 凭证与 PII 模式；验证器会独立重扫，即使同步重算普通文件哈希也不能把宿主路径、凭证或 PII 混入训练素材包。

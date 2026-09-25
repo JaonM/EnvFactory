@@ -64,7 +64,7 @@ class ProductionPreflightTest(unittest.TestCase):
             bound = dict(report)
             bound["version"] = "1.1"
             bound["experiment_config_sha256"] = digest_json({"threshold": 8.5})
-            self.assertTrue(valid_production_preflight(
+            self.assertFalse(valid_production_preflight(
                 bound,
                 expected_experiment_config_sha256=digest_json({"threshold": 8.5}),
             ))
@@ -125,6 +125,48 @@ class ProductionPreflightTest(unittest.TestCase):
                     "workspace_capacity",
                 },
             )
+
+    def test_same_endpoint_with_different_models_is_not_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.project(Path(directory))
+            private = root / "private.pem"
+            public = root / "public.pem"
+            private.write_text("private")
+            public.write_text("public")
+            with patch(
+                "env_factory.production_preflight.private_key_public_identity",
+                return_value="a" * 64,
+            ), patch(
+                "env_factory.production_preflight.public_key_identity",
+                return_value="a" * 64,
+            ):
+                report = run_production_preflight(
+                    root, root,
+                    signing_private_key=private,
+                    trusted_public_key=public,
+                    experiment_config={"threshold": 8.0},
+                    environment={
+                        "LLM_API_KEY": "secret-value",
+                        "LLM_MODEL": "agent-model",
+                        "LLM_BASE_URL": "https://shared.example/v1",
+                        "SANDBOX_LLM_MODEL": "judge-model",
+                        "SANDBOX_LLM_BASE_URL": "https://shared.example/v1",
+                    },
+                    runner=self.runner,
+                    which=lambda name: f"/usr/bin/{name}",
+                    disk_usage=lambda path: Usage(),
+                )
+            self.assertIn("evaluator_role_separation", report["failed_checks"])
+            evidence = next(
+                check["evidence"] for check in report["checks"]
+                if check["name"] == "evaluator_role_separation"
+            )
+            self.assertEqual(evidence, {
+                "agent_and_evaluator_distinct": False,
+                "provider_hosts_distinct": False,
+                "models_distinct": True,
+            })
+            self.assertFalse(valid_production_preflight(report))
 
     def test_bound_preflight_rejects_response_model_allowlist_drift(self):
         with tempfile.TemporaryDirectory() as directory:

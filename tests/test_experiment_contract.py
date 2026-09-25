@@ -68,6 +68,12 @@ class ExperimentContractTest(unittest.TestCase):
             build_experiment_contract(config)
         ))
 
+        config = production_config()
+        config["runtime_provider"]["host"] = config["rollout_provider"]["host"]
+        self.assertFalse(valid_experiment_contract(
+            build_experiment_contract(config)
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

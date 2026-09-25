@@ -367,7 +367,7 @@ class MaterialExportTest(unittest.TestCase):
                     },
                 },
                 "production_preflight": {
-                    "version": "1.2",
+                    "version": "1.3",
                     "experiment_config_sha256": experiment_config_sha256,
                     "scope": "production_pre_training_material_experiment",
                     "network_probe_performed": False,
@@ -408,6 +408,8 @@ class MaterialExportTest(unittest.TestCase):
                                 if name == "bundle_signing_identity" else {}
                                 if name != "evaluator_role_separation" else {
                                     "agent_and_evaluator_distinct": True,
+                                    "provider_hosts_distinct": True,
+                                    "models_distinct": True,
                                 }
                             ),
                         }

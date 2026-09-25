@@ -1261,9 +1261,16 @@ def certify(
     provider_identity_consistency = (
         bool(qualified) and provider_bindings_verified == len(qualified)
     )
+    configured_same_provider = (
+        isinstance(expected_agent_provider, Mapping)
+        and isinstance(expected_runtime_provider, Mapping)
+        and expected_agent_provider.get("host")
+            == expected_runtime_provider.get("host")
+    )
     same_provider_evaluator_items = sum(
-        item.get("live_rollout", {}).get("agent_provider_sha256")
-        == item.get("live_rollout", {}).get("runtime_provider_sha256")
+        configured_same_provider
+        or item.get("live_rollout", {}).get("agent_provider_sha256")
+            == item.get("live_rollout", {}).get("runtime_provider_sha256")
         for item in qualified
     )
     same_provider_evaluator_rate = (
