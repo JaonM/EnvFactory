@@ -74,6 +74,47 @@ def provider_identity(base_url: str, model: str) -> dict[str, str]:
     }
 
 
+def valid_provider_binding(
+    rollout: Mapping[str, Any] | Any,
+    calibration: Mapping[str, Any] | Any,
+    governance: Mapping[str, Any] | Any,
+) -> bool:
+    """Bind all live-model evidence to one authorized provider declaration."""
+    if not all(
+        isinstance(value, Mapping)
+        for value in (rollout, calibration, governance)
+    ):
+        return False
+    providers = governance.get("providers")
+    if not isinstance(providers, Mapping):
+        return False
+    agent = providers.get("agent")
+    runtime = providers.get("user_simulator_and_reward")
+
+    def valid_provider(value: Any) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and isinstance(value.get("host"), str)
+            and bool(value["host"].strip())
+            and isinstance(value.get("model"), str)
+            and bool(value["model"].strip())
+            and isinstance(value.get("identity_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", value["identity_sha256"])
+            is not None
+        )
+
+    return (
+        valid_provider(agent)
+        and valid_provider(runtime)
+        and rollout.get("agent_model") == agent.get("model")
+        and rollout.get("agent_provider_sha256") == agent.get("identity_sha256")
+        and rollout.get("runtime_model") == runtime.get("model")
+        and rollout.get("runtime_provider_sha256")
+            == runtime.get("identity_sha256")
+        and calibration.get("evaluator_provider") == runtime
+    )
+
+
 def _walk(value: Any, path: str = "$") -> Iterable[tuple[str, str]]:
     if isinstance(value, str):
         yield path, value

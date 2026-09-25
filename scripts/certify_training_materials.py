@@ -36,6 +36,7 @@ from env_factory.data_governance import (
     SYNTHETIC_ORIGIN,
     sandbox_payloads,
     scan_payloads,
+    valid_provider_binding as valid_governed_provider_binding,
 )
 from env_factory.container_provenance import verify_container_provenance
 from env_factory.execution_provenance import verify_execution_provenance
@@ -583,23 +584,10 @@ def valid_rollout_provenance(item: Mapping[str, Any]) -> bool:
 
 def valid_provider_binding(item: Mapping[str, Any]) -> bool:
     """Bind rollout model identities to the provider governance authorization."""
-    live = item.get("live_rollout")
-    governance = _artifact(item, "data_governance.json")
-    calibration = _artifact(item, "agentic_training_value_live.json")
-    providers = governance.get("providers")
-    if not isinstance(live, Mapping) or not isinstance(providers, Mapping):
-        return False
-    agent = providers.get("agent")
-    runtime = providers.get("user_simulator_and_reward")
-    return (
-        isinstance(agent, Mapping)
-        and isinstance(runtime, Mapping)
-        and live.get("agent_model") == agent.get("model")
-        and live.get("agent_provider_sha256") == agent.get("identity_sha256")
-        and live.get("runtime_model") == runtime.get("model")
-        and live.get("runtime_provider_sha256")
-            == runtime.get("identity_sha256")
-        and calibration.get("evaluator_provider") == runtime
+    return valid_governed_provider_binding(
+        item.get("live_rollout"),
+        _artifact(item, "agentic_training_value_live.json"),
+        _artifact(item, "data_governance.json"),
     )
 
 

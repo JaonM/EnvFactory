@@ -174,7 +174,9 @@ Bundle v10 还包含 `consumer_contract.json`：以 JSON Schema 固定 transitio
 trainer-only 证据边界。验证器使用内置规范与文件逐项比较；即使同时修改契约并重算所有外层哈希，也不能
 把 trainer-only 字段伪装成策略输入。Bundle v10 还要求每个环境携带并校验
 `agentic_training_value_live.json` 的容器执行身份；rollout 与奖励校准都必须匹配同一份 v4 镜像
-provenance。v9 包仍可验证其原有完整性，但缺少这一新语义，不能满足当前生产准备认证。更早版本也只能
+provenance，并重新读取 `data_governance.json` 复核 Agent、User Simulator 与 Reward Judge 的模型和
+provider 摘要授权。仅同步重算文件哈希不能绕过该关系。v9 包仍可验证其原有完整性，但缺少这一新语义，
+不能满足当前生产准备认证。更早版本也只能
 验证各自声明的历史契约，不能满足当前受信发布门禁。
 
 生产发布还要求使用组织持有的 Ed25519 私钥对最终 `bundle_manifest.json` 生成 detached signature，并由

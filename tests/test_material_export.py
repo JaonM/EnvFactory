@@ -145,6 +145,8 @@ class MaterialExportTest(unittest.TestCase):
             "material_visibility_version": "1.0",
             "agent_model": "policy",
             "runtime_model": "simulator",
+            "agent_provider_sha256": "a" * 64,
+            "runtime_provider_sha256": "b" * 64,
             "runtime_execution": {
                 "version": "1.0",
                 "mode": "docker_http",
@@ -175,11 +177,27 @@ class MaterialExportTest(unittest.TestCase):
         (sandbox / "agentic_training_value_live.json").write_text(json.dumps({
             "curriculum_training_ready": True,
             "validation_mode": "live_evaluator",
+            "evaluator_provider": {
+                "host": "runtime.example", "model": "simulator",
+                "identity_sha256": "b" * 64,
+            },
             "runtime_execution": rollout["runtime_execution"],
             "evidence": {"counterfactuals": {
                 "goal_success": {"reward": 1.0},
                 "goal_failure": {"reward": 0.0},
             }},
+        }))
+        (sandbox / "data_governance.json").write_text(json.dumps({
+            "providers": {
+                "agent": {
+                    "host": "agent.example", "model": "policy",
+                    "identity_sha256": "a" * 64,
+                },
+                "user_simulator_and_reward": {
+                    "host": "runtime.example", "model": "simulator",
+                    "identity_sha256": "b" * 64,
+                },
+            },
         }))
         item = {
             "task_path": str(task),
@@ -221,6 +239,7 @@ class MaterialExportTest(unittest.TestCase):
                 "fixture": True,
                 "container_rollout_execution": True,
                 "container_reward_calibration": True,
+                "provider_identity_consistency": True,
             },
             "failed_gates": [],
             "material_verification": {"verified": True},
@@ -440,6 +459,37 @@ class MaterialExportTest(unittest.TestCase):
             self.assertIn(
                 "container_reward_calibration", report["failed_gates"]
             )
+
+    def test_bundle_verifier_rejects_rehashed_reward_provider_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            certification = self.source(root)
+            bundle = root / "bundle"
+            exporter.export_bundle(certification, bundle, ROOT)
+            manifest_path = bundle / "bundle_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            item = manifest["items"][0]
+            calibration_path = (
+                bundle / item["environment_path"]
+                / "agentic_training_value_live.json"
+            )
+            calibration = json.loads(calibration_path.read_text())
+            calibration["evaluator_provider"]["identity_sha256"] = "f" * 64
+            calibration_path.write_text(json.dumps(calibration))
+            relative = str(calibration_path.relative_to(bundle))
+            digest = exporter.file_sha256(calibration_path)
+            item["files_sha256"]["agentic_training_value_live.json"] = digest
+            manifest["files_sha256"][relative] = digest
+            unsigned = {
+                key: value for key, value in manifest.items()
+                if key != "bundle_sha256"
+            }
+            manifest["bundle_sha256"] = digest_json(unsigned)
+            manifest_path.write_text(json.dumps(manifest))
+            report = exporter.verify_bundle(bundle)
+            self.assertFalse(report["verified"])
+            self.assertFalse(report["provider_identity_ready"])
+            self.assertIn("provider_identity_binding", report["failed_gates"])
 
     def test_bundle_verifier_rejects_rehashed_environment_claim(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -38,6 +38,7 @@ from env_factory.execution_provenance import valid_execution_provenance
 from env_factory.task_similarity import task_family_ids
 from env_factory.generation_provenance import valid_generation_provenance
 from env_factory.runtime_provenance import valid_container_rollout_execution
+from env_factory.data_governance import valid_provider_binding
 
 
 def file_sha256(path: Path) -> str:
@@ -403,13 +404,20 @@ def _export_bundle_uncommitted(
                     encoding="utf-8"
                 )
             )
+            governance = json.loads(
+                (source_root / "data_governance.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             if not (
                 calibration.get("curriculum_training_ready") is True
                 and calibration.get("validation_mode") == "live_evaluator"
                 and valid_container_rollout_execution(calibration, source_root)
+                and valid_provider_binding(rollout, calibration, governance)
             ):
                 raise ValueError(
-                    f"reward calibration did not execute in the validated container for {item_id}"
+                    "reward calibration/provider authorization is invalid for "
+                    f"{item_id}"
                 )
             rollout_destination = destination_root / "live_rollout.json"
             rollout_destination.write_text(
@@ -623,6 +631,7 @@ def verify_bundle(
             or {
                 "container_rollout_execution",
                 "container_reward_calibration",
+                "provider_identity_consistency",
             } <= set(portable_certification["gates"])
         )
     ):
@@ -676,6 +685,7 @@ def verify_bundle(
     verified_model_pairs: Counter[tuple[str, str]] = Counter()
     verified_container_rollouts = 0
     verified_container_reward_calibrations = 0
+    verified_provider_bindings = 0
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
             failures.append("bundle_items")
@@ -774,8 +784,14 @@ def verify_bundle(
                         encoding="utf-8"
                     )
                 )
+                governance = json.loads(
+                    (root / environment / "data_governance.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
             except (OSError, json.JSONDecodeError):
                 calibration = {}
+                governance = {}
             calibration_valid = (
                 calibration.get("curriculum_training_ready") is True
                 and calibration.get("validation_mode") == "live_evaluator"
@@ -789,6 +805,10 @@ def verify_bundle(
                 verified_container_reward_calibrations += 1
             else:
                 failures.append("container_reward_calibration")
+            if valid_provider_binding(rollout, calibration, governance):
+                verified_provider_bindings += 1
+            else:
+                failures.append("provider_identity_binding")
         if item.get("episode_count") != len(rollout.get("episodes", [])):
             failures.append("item_episode_count")
         if item.get("transition_count") != len(projected):
@@ -886,6 +906,11 @@ def verify_bundle(
         manifest.get("version") == BUNDLE_VERSION
         and bool(items)
         and verified_container_reward_calibrations == len(items)
+    )
+    provider_identity_ready = (
+        manifest.get("version") == BUNDLE_VERSION
+        and bool(items)
+        and verified_provider_bindings == len(items)
     )
     if (
         len(records) != manifest.get("transition_count")
@@ -1097,6 +1122,7 @@ def verify_bundle(
         "generation_provenance_ready": generation_provenance_ready,
         "container_rollout_ready": container_rollout_ready,
         "container_reward_calibration_ready": container_reward_calibration_ready,
+        "provider_identity_ready": provider_identity_ready,
         "attestation_key_identity_sha256": (
             attestation.get("key_identity_sha256")
             if isinstance(attestation, Mapping) else None
